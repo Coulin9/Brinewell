@@ -1,0 +1,278 @@
+From: brinewell <brinewell@localhost>
+Subject: [PATCH] drm/virtio: add COUNTER_WAIT ioctl for counter waits on
+ host-visible blobs
+
+Adds DRM_VIRTGPU_COUNTER_WAIT: sleep until a 64-bit counter inside a
+mappable host-visible blob reaches a value, or until a 32-bit abort word
+in the same blob goes nonzero.  The kernel memremaps the blob's
+host-visible backing (matching the userspace cached mapping of
+vram_node.start) so the wait does not depend on a userspace mapping;
+the mapping is cached on the BO and dropped on free.
+
+--- a/include/uapi/drm/virtgpu_drm.h	2026-10-03 18:43:16
++++ b/include/uapi/drm/virtgpu_drm.h	2026-11-18 15:38:48
+@@ -48,6 +48,7 @@
+ #define DRM_VIRTGPU_GET_CAPS  0x09
+ #define DRM_VIRTGPU_RESOURCE_CREATE_BLOB 0x0a
+ #define DRM_VIRTGPU_CONTEXT_INIT 0x0b
++#define DRM_VIRTGPU_COUNTER_WAIT 0x0c
+ 
+ #define VIRTGPU_EXECBUF_FENCE_FD_IN	0x01
+ #define VIRTGPU_EXECBUF_FENCE_FD_OUT	0x02
+@@ -231,6 +232,22 @@
+  */
+ #define VIRTGPU_EVENT_FENCE_SIGNALED 0x90000000
+ 
++/* Wait until a 64-bit counter inside a mappable host-visible blob
++ * reaches a value.  The blob must have been created with
++ * VIRTGPU_BLOB_FLAG_USE_MAPPABLE; the kernel memremaps the host-visible
++ * backing so the wait needs no userspace mapping.  waiters_offset and
++ * abort_offset let the producer know a waiter exists and let the host
++ * break the wait, respectively.
++ */
++struct drm_virtgpu_counter_wait {
++	__u32 bo_handle;      /* mappable host-visible blob */
++	__u32 counter_offset; /* u64, 8-aligned */
++	__u32 waiters_offset; /* u32, 4-aligned */
++	__u32 abort_offset;   /* u32, 4-aligned; nonzero => -ENODEV */
++	__u64 value;          /* wait until counter >= value */
++	__s64 timeout_ns;     /* <0 infinite, 0 poll */
++};
++
+ #define DRM_IOCTL_VIRTGPU_MAP \
+ 	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_MAP, struct drm_virtgpu_map)
+ 
+@@ -274,6 +291,10 @@
+ 	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_CONTEXT_INIT,		\
+ 		struct drm_virtgpu_context_init)
+ 
++#define DRM_IOCTL_VIRTGPU_COUNTER_WAIT					\
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_COUNTER_WAIT,	\
++		struct drm_virtgpu_counter_wait)
++
+ #if defined(__cplusplus)
+ }
+ #endif
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h	2026-10-03 18:43:16
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h	2026-11-18 15:50:54
+@@ -134,6 +134,9 @@
+ 	uint32_t map_state;
+ 	uint32_t map_info;
+ 	struct drm_mm_node vram_node;
++	/* cached memremap() of the host-visible backing for
++	 * COUNTER_WAIT; NULL until the first wait, freed with the BO */
++	void *counter_map;
+ };
+ 
+ #define to_virtio_gpu_shmem(virtio_gpu_object) \
+@@ -303,6 +306,12 @@
+ 	spinlock_t resource_export_lock;
+ 	/* protects map state and host_visible_mm */
+ 	spinlock_t host_visible_lock;
++
++	/* waiters blocked in DRM_VIRTGPU_COUNTER_WAIT; woken on every
++	 * config-change interrupt */
++	wait_queue_head_t counter_wq;
++	/* serializes lazy per-BO counter_map creation */
++	struct mutex counter_map_mtx;
+ };
+ 
+ struct virtio_gpu_fpriv {
+@@ -318,7 +327,7 @@
+ };
+ 
+ /* virtgpu_ioctl.c */
+-#define DRM_VIRTIO_NUM_IOCTLS 12
++#define DRM_VIRTIO_NUM_IOCTLS 13
+ extern struct drm_ioctl_desc virtio_gpu_ioctls[DRM_VIRTIO_NUM_IOCTLS];
+ void virtio_gpu_create_context(struct drm_device *dev, struct drm_file *file);
+ 
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c	2026-10-03 18:43:16
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c	2026-11-18 15:24:39
+@@ -144,8 +144,16 @@
+ {
+ 	struct drm_device *dev = vdev->priv;
+ 	struct virtio_gpu_device *vgdev = dev->dev_private;
++	u32 events_read = 0;
+ 
+-	schedule_work(&vgdev->config_changed_work);
++	/* completion-queue waiters are woken on every config interrupt,
++	 * even when the host raised it only for the counter wait */
++	wake_up_all(&vgdev->counter_wq);
++
++	virtio_cread_le(vdev, struct virtio_gpu_config,
++			events_read, &events_read);
++	if (events_read)
++		schedule_work(&vgdev->config_changed_work);
+ }
+ 
+ static struct virtio_device_id id_table[] = {
+--- a/drivers/gpu/drm/virtio/virtgpu_ioctl.c	2026-10-03 18:43:16
++++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c	2026-11-18 15:25:00
+@@ -26,8 +26,11 @@
+  */
+ 
+ #include <linux/file.h>
++#include <linux/io.h>
++#include <linux/jiffies.h>
+ #include <linux/sync_file.h>
+ #include <linux/uaccess.h>
++#include <linux/wait.h>
+ 
+ #include <drm/drm_file.h>
+ #include <drm/virtgpu_drm.h>
+@@ -413,6 +416,123 @@
+ 	return ret;
+ }
+ 
++/*
++ * Wait on a 64-bit counter inside a mappable host-visible blob.  The
++ * kernel memremaps the blob's host-visible backing (matching the
++ * userspace cached mapping of vram_node.start) so the wait does not
++ * depend on a userspace mapping.  A config-change interrupt wakes every
++ * waiter; the host raises it only when a guest waiter exists, and the
++ * waiters/abort words let it know.
++ */
++static int virtio_gpu_counter_wait_ioctl(struct drm_device *dev,
++					 void *data,
++					 struct drm_file *file)
++{
++	struct virtio_gpu_device *vgdev = dev->dev_private;
++	struct drm_virtgpu_counter_wait *args = data;
++	struct drm_gem_object *gobj;
++	struct virtio_gpu_object *bo;
++	struct virtio_gpu_object_vram *vram;
++	u64 *counter;
++	u32 *waiters;
++	u32 *abortp;
++	u8 *map;
++	u64 size;
++	long remaining;
++	int ret = 0;
++
++	if ((args->counter_offset & 7) || (args->waiters_offset & 3) ||
++	    (args->abort_offset & 3))
++		return -EINVAL;
++
++	gobj = drm_gem_object_lookup(file, args->bo_handle);
++	if (!gobj)
++		return -ENOENT;
++
++	bo = gem_to_virtio_gpu_obj(gobj);
++	if (!virtio_gpu_is_vram(bo)) {
++		ret = -EINVAL;
++		goto out;
++	}
++	vram = to_virtio_gpu_vram(bo);
++
++	/* Trigger the deferred host map for mappable blobs, then wait
++	 * for RESOURCE_MAP_BLOB to finish before memremap: the guest
++	 * page tables for the host-visible backing are only valid once
++	 * the host publishes map_state == STATE_OK.  A blob that was
++	 * never mapped (no mappable flag, or the host answered with an
++	 * error) has no node and is rejected, same as upstream
++	 * virtio_gpu_vram_mmap. */
++	virtio_gpu_vram_map_deferred(vram);
++	if (!drm_mm_node_allocated(&vram->vram_node)) {
++		ret = -EINVAL;
++		goto out;
++	}
++	if (vram->map_state == STATE_INITIALIZING)
++		virtio_gpu_notify(vgdev);
++	wait_event(vgdev->resp_wq, vram->map_state != STATE_INITIALIZING);
++	if (vram->map_state != STATE_OK) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	size = gobj->size;
++	if ((u64)args->counter_offset + sizeof(u64) > size ||
++	    (u64)args->waiters_offset + sizeof(u32) > size ||
++	    (u64)args->abort_offset + sizeof(u32) > size) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	mutex_lock(&vgdev->counter_map_mtx);
++	if (!vram->counter_map)
++		vram->counter_map =
++			memremap(vram->vram_node.start, vram->vram_node.size,
++				 MEMREMAP_WB);
++	map = vram->counter_map;
++	mutex_unlock(&vgdev->counter_map_mtx);
++	if (!map) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	counter = (u64 *)(map + args->counter_offset);
++	waiters = (u32 *)(map + args->waiters_offset);
++	abortp = (u32 *)(map + args->abort_offset);
++
++	atomic_inc((atomic_t *)waiters);
++	/* the waiter count must be visible before the counter check so
++	 * the host's publish -> check-waiters -> interrupt order can't
++	 * miss us */
++	smp_mb();
++
++	if (args->timeout_ns == 0) {
++		/* poll */
++	} else if (args->timeout_ns < 0) {
++		if (wait_event_interruptible(
++			    vgdev->counter_wq,
++			    READ_ONCE(*counter) >= args->value ||
++			    READ_ONCE(*abortp)))
++			ret = -ERESTARTSYS;
++	} else {
++		remaining = wait_event_interruptible_timeout(
++			vgdev->counter_wq,
++			READ_ONCE(*counter) >= args->value ||
++			READ_ONCE(*abortp),
++			nsecs_to_jiffies64(args->timeout_ns));
++		if (remaining < 0)
++			ret = -ERESTARTSYS;
++	}
++
++	atomic_dec((atomic_t *)waiters);
++
++	if (!ret && !(READ_ONCE(*counter) >= args->value))
++		ret = READ_ONCE(*abortp) ? -ENODEV : -ETIMEDOUT;
++out:
++	drm_gem_object_put(gobj);
++	return ret;
++}
++
+ static int virtio_gpu_get_caps_ioctl(struct drm_device *dev,
+ 				void *data, struct drm_file *file)
+ {
+@@ -786,4 +890,7 @@
+ 
+ 	DRM_IOCTL_DEF_DRV(VIRTGPU_CONTEXT_INIT, virtio_gpu_context_init_ioctl,
+ 			  DRM_RENDER_ALLOW),
++
++	DRM_IOCTL_DEF_DRV(VIRTGPU_COUNTER_WAIT, virtio_gpu_counter_wait_ioctl,
++			  DRM_RENDER_ALLOW),
+ };
+--- a/drivers/gpu/drm/virtio/virtgpu_kms.c	2026-10-03 18:43:16
++++ b/drivers/gpu/drm/virtio/virtgpu_kms.c	2026-11-18 15:24:39
+@@ -156,6 +156,8 @@
+ 	INIT_LIST_HEAD(&vgdev->cap_cache);
+ 	INIT_WORK(&vgdev->config_changed_work,
+ 		  virtio_gpu_config_changed_work_func);
++	init_waitqueue_head(&vgdev->counter_wq);
++	mutex_init(&vgdev->counter_map_mtx);
+ 
+ 	INIT_WORK(&vgdev->obj_free_work,
+ 		  virtio_gpu_array_put_free_work);
+--- a/drivers/gpu/drm/virtio/virtgpu_object.c	2026-10-03 18:43:16
++++ b/drivers/gpu/drm/virtio/virtgpu_object.c	2026-11-18 15:24:39
+@@ -73,6 +73,9 @@
+ 	} else if (virtio_gpu_is_vram(bo)) {
+ 		struct virtio_gpu_object_vram *vram = to_virtio_gpu_vram(bo);
+ 
++		if (vram->counter_map)
++			memunmap(vram->counter_map);
++
+ 		spin_lock(&vgdev->host_visible_lock);
+ 		if (drm_mm_node_allocated(&vram->vram_node))
+ 			drm_mm_remove_node(&vram->vram_node);

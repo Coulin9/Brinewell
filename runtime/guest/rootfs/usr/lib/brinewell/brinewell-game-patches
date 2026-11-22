@@ -1,0 +1,28 @@
+#!/usr/bin/python3
+# brinewell: apply recorded per-game launch patches before Steam starts.
+# Independent of graphics backend selection; wraps launches only for profiles
+# whose recorded settings still match what Steam currently stores.
+import os
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).parent))
+import game_patch_settings as patches
+
+
+def main():
+    data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    steam = data / "Steam"
+    if not steam.is_dir():
+        return
+    state = Path(os.environ.get("BRINEWELL_GFX_STATE") or data / "brinewell/gfx-path") / "neptune"
+    patches.synchronize(steam, state)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        print("brinewell-game-patches: " + str(error), file=sys.stderr)
+        sys.exit(1)

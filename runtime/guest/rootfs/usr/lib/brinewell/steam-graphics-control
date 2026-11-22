@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""fx.graphics device service: publish ready, apply backend <mode>, ack applied.
+
+Reads bounded lines from the virtio port; on EOF (host closed the port) exits
+nonzero so systemd restarts and re-announces readiness. Overlong lines are
+drained to the newline and rejected without corrupting the pending buffer.
+"""
+
+import os
+import sys
+
+DEVICE = "/dev/virtio-ports/fx.graphics"
+STATE = "/run/brinewell/graphics-backend"
+MODES = {"venus", "neptune", "mullion"}
+MAX_LINE = 4096
+
+
+def _log(message):
+    print(f"steam-graphics-control: {message}", file=sys.stderr)
+
+
+def _write_all(f, data):
+    """FileIO.write on a character device may be partial; keep writing."""
+    view = memoryview(data)
+    while view:
+        written = f.write(view)
+        if written is None or written <= 0:
+            raise OSError("port write returned no progress")
+        view = view[written:]
+
+
+def _apply(mode, f):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as handle:
+        handle.write(mode + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE)
+    _write_all(f, ("applied " + mode + "\n").encode())
+
+
+def serve(f):
+    """ready/backend/applied exchange over one duplex descriptor."""
+    _write_all(f, b"ready\n")
+    while True:
+        try:
+            line = f.readline(MAX_LINE + 2)
+        except OSError as error:
+            _log(f"read failed: {error}")
+            return 1
+        if not line:
+            # Host closed the port; restart to re-announce readiness.
+            return 2
+        if len(line) > MAX_LINE:
+            # Drain the overlong line to its newline, then reject it.
+            while not line.endswith(b"\n"):
+                chunk = f.readline(MAX_LINE + 2)
+                if not chunk:
+                    break
+                line = chunk
+            _log("overlong request rejected")
+            continue
+        try:
+            request = line.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            _log("undecodable request rejected")
+            continue
+        if not request:
+            continue
+        parts = request.split(" ")
+        if len(parts) == 2 and parts[0] == "backend" and parts[1] in MODES:
+            try:
+                _apply(parts[1], f)
+            except OSError as error:
+                _log(f"apply failed: {error}")
+        else:
+            _log(f"unknown request rejected: {parts[0][:32]}")
+
+
+def main(device=DEVICE):
+    try:
+        fd = os.open(device, os.O_RDWR)
+    except OSError as error:
+        _log(f"cannot open {device}: {error}")
+        return 1
+    # Raw FileIO: the port is a character device, not a seekable file.
+    with os.fdopen(fd, "r+b", buffering=0) as f:
+        return serve(f)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

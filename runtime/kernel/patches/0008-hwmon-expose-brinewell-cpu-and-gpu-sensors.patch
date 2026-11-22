@@ -1,0 +1,188 @@
+diff --git a/drivers/hwmon/Makefile b/drivers/hwmon/Makefile
+--- a/drivers/hwmon/Makefile
++++ b/drivers/hwmon/Makefile
+@@ -5,6 +5,7 @@
+ 
+ obj-$(CONFIG_HWMON)		+= hwmon.o
+ obj-$(CONFIG_HWMON_VID)		+= hwmon-vid.o
++obj-y				+= brinewell-telemetry.o
+ 
+ # ACPI drivers
+ obj-$(CONFIG_SENSORS_ACPI_POWER) += acpi_power_meter.o
+diff --git a/drivers/hwmon/brinewell-telemetry.c b/drivers/hwmon/brinewell-telemetry.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/hwmon/brinewell-telemetry.c
+@@ -0,0 +1,172 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Read-only hardware sensors for the Brinewell guest. The guest agent feeds
++ * the latest host snapshot through a root-only device attribute.
++ */
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/hwmon.h>
++#include <linux/init.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/string.h>
++#include <linux/thermal.h>
++
++enum {
++	CPU_TEMP,
++	GPU_TEMP,
++	GPU_POWER,
++	GPU_FREQ,
++	SENSOR_COUNT,
++};
++
++static DEFINE_MUTEX(snapshot_lock);
++static long snapshot[SENSOR_COUNT];
++static unsigned long last_update;
++static bool have_snapshot;
++
++static ssize_t snapshot_store(struct device *dev, struct device_attribute *attr,
++			      const char *buf, size_t count)
++{
++	long values[SENSOR_COUNT];
++	char extra;
++
++	if (sscanf(buf, "%ld %ld %ld %ld %c", &values[CPU_TEMP],
++		   &values[GPU_TEMP], &values[GPU_POWER], &values[GPU_FREQ],
++		   &extra) != SENSOR_COUNT ||
++	    values[CPU_TEMP] < -1 || values[CPU_TEMP] > 200000 ||
++	    values[GPU_TEMP] < -1 || values[GPU_TEMP] > 200000 ||
++	    values[GPU_POWER] < -1 || values[GPU_POWER] > 1000000000 ||
++	    values[GPU_FREQ] < -1 || values[GPU_FREQ] > 20000000000L)
++		return -EINVAL;
++
++	mutex_lock(&snapshot_lock);
++	memcpy(snapshot, values, sizeof(snapshot));
++	last_update = jiffies;
++	have_snapshot = true;
++	mutex_unlock(&snapshot_lock);
++	return count;
++}
++static DEVICE_ATTR_WO(snapshot);
++
++static umode_t sensor_visible(const void *data, enum hwmon_sensor_types type,
++			      u32 attr, int channel)
++{
++	return 0444;
++}
++
++static int read_snapshot(int index, long *val)
++{
++	int ret = -ENODATA;
++
++	mutex_lock(&snapshot_lock);
++	if (have_snapshot && time_before(jiffies, last_update + 3 * HZ) &&
++	    snapshot[index] >= 0) {
++		*val = snapshot[index];
++		ret = 0;
++	}
++	mutex_unlock(&snapshot_lock);
++	return ret;
++}
++
++static int sensor_read(struct device *dev, enum hwmon_sensor_types type,
++		       u32 attr, int channel, long *val)
++{
++	switch (type) {
++	case hwmon_temp:
++		return read_snapshot(GPU_TEMP, val);
++	case hwmon_power:
++		return read_snapshot(GPU_POWER, val);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static ssize_t freq1_input_show(struct device *dev, struct device_attribute *attr,
++				char *buf)
++{
++	long freq;
++	int ret = read_snapshot(GPU_FREQ, &freq);
++
++	return ret ? ret : sysfs_emit(buf, "%ld\n", freq);
++}
++static DEVICE_ATTR_RO(freq1_input);
++
++static struct attribute *gpu_attrs[] = {
++	&dev_attr_freq1_input.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(gpu);
++
++static const struct hwmon_ops sensor_ops = {
++	.is_visible = sensor_visible,
++	.read = sensor_read,
++};
++
++static const struct hwmon_channel_info * const gpu_channels[] = {
++	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT),
++	HWMON_CHANNEL_INFO(power, HWMON_P_AVERAGE),
++	NULL,
++};
++
++static const struct hwmon_chip_info gpu_chip = {
++	.ops = &sensor_ops,
++	.info = gpu_channels,
++};
++
++static int cpu_temp_get(struct thermal_zone_device *zone, int *val)
++{
++	long temp;
++	int ret = read_snapshot(CPU_TEMP, &temp);
++
++	if (!ret)
++		*val = temp;
++	return ret;
++}
++
++static const struct thermal_zone_device_ops cpu_thermal_ops = {
++	.get_temp = cpu_temp_get,
++};
++
++static int __init brinewell_telemetry_init(void)
++{
++	struct platform_device *pdev;
++	struct thermal_zone_device *cpu;
++	struct device *gpu;
++	int ret;
++
++	pdev = platform_device_register_simple("brinewell_telemetry", -1, NULL, 0);
++	if (IS_ERR(pdev))
++		return PTR_ERR(pdev);
++
++	gpu = devm_hwmon_device_register_with_info(&pdev->dev, "brinewell_gpu",
++						  NULL, &gpu_chip, gpu_groups);
++	if (IS_ERR(gpu)) {
++		ret = PTR_ERR(gpu);
++		goto unregister;
++	}
++
++	ret = device_create_file(&pdev->dev, &dev_attr_snapshot);
++	if (ret)
++		goto unregister;
++
++	/* Steam Frame MangoApp reads CPU temperatures from cpuN-thermal zones. */
++	cpu = thermal_tripless_zone_device_register("cpu0-thermal", NULL,
++						    &cpu_thermal_ops, NULL);
++	if (IS_ERR(cpu)) {
++		ret = PTR_ERR(cpu);
++		goto unregister;
++	}
++	ret = thermal_zone_device_enable(cpu);
++	if (!ret)
++		return 0;
++
++	thermal_zone_device_unregister(cpu);
++
++unregister:
++	platform_device_unregister(pdev);
++	return ret;
++}
++device_initcall(brinewell_telemetry_init);

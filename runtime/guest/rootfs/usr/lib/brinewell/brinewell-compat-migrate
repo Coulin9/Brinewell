@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Retire legacy AppleDeck-owned (pre-Brinewell) Proton registrations before Steam reads config.
+
+Runs from the guest Steam service ExecStartPre. Identifies only positively
+AppleDeck-owned tools -- schema1 (registration install_path ".", marker at the
+tool root) or schema2 (install_path "runtimes/<hash>", marker inside that
+runtime) -- maps CompatToolMapping references back to the original base tool
+in one atomic config write, then retires the registration non-destructively.
+Unknown, malformed, or ambiguous entries are left untouched and logged.
+"""
+
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import brinewell_vdf as vdf
+
+DEFAULT_BASE = "steam:4628710"
+OWNER = "appledeck-neptune.json"
+BASE_KEY = re.compile(
+    r"steam:[0-9]{1,10}|ge:ge-proton[0-9][a-z0-9.-]{0,39}:(?:x86_64|aarch64)")
+RUNTIME_HASH = re.compile(r"[0-9a-f]{8,64}")
+
+
+def steam_root():
+    return Path(os.environ.get(
+        "BRINEWELL_STEAM_ROOT", str(Path.home() / ".local/share/Steam")))
+
+
+def tool_dir_name(key):
+    if key == DEFAULT_BASE:
+        return "appledeck-neptune"
+    return "appledeck-neptune-" + key.replace(":", "-")
+
+
+def legacy_tool_id(key):
+    if key == DEFAULT_BASE:
+        return "appledeck_neptune"
+    return "appledeck_neptune_" + key.replace(":", "_")
+
+
+def owned_aliases(key):
+    legacy = legacy_tool_id(key)
+    ids = {legacy}
+    if key.startswith("steam:"):
+        ids.add(legacy + "_proton")
+    return ids
+
+
+def _log(message):
+    print(f"brinewell-compat-migrate: {message}", file=sys.stderr)
+
+
+def _registration(root):
+    """(id, install_path, runtime) or raise; runtime is root for '.'.
+
+    Reads the registration without following symlinks on any component it
+    touches. A '.' install_path is the schema1 layout (marker at root);
+    schema2 requires 'runtimes/<hash>' resolving inside the root.
+    """
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("root")
+    vdf_file = root / "compatibilitytool.vdf"
+    if vdf_file.is_symlink() or not vdf_file.is_file():
+        raise ValueError("registration")
+    values, blocks, _ = vdf.vdf_entries(vdf_file.read_text())
+    entries = [path for path in blocks if len(path) == 3 and path[:2] == vdf.VDF_TOOLS]
+    if len(entries) != 1:
+        raise ValueError("entries")
+    relative = values.get((*entries[0], "install_path"), [None])[0]
+    if not isinstance(relative, str) or not relative:
+        raise ValueError("install_path")
+    if relative == ".":
+        return entries[0][2], relative, root.resolve()
+    parts = Path(relative).parts
+    if (os.path.isabs(relative) or len(parts) != 2
+            or parts[0] != "runtimes" or not RUNTIME_HASH.fullmatch(parts[1])):
+        raise ValueError("install_path")
+    runtime = root / relative
+    for component in (runtime, runtime.parent):
+        if component.is_symlink():
+            raise ValueError("runtime-link")
+    resolved = runtime.resolve()
+    root_resolved = root.resolve()
+    if resolved == root_resolved or root_resolved not in resolved.parents:
+        raise ValueError("runtime-escape")
+    return entries[0][2], relative, resolved
+
+
+def _marker(location):
+    if location.is_symlink() or not location.is_file():
+        return None
+    try:
+        marker = json.loads(location.read_text())
+    except (OSError, ValueError):
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def _registrations(steam):
+    """All registrations incl. '.'/missing install_path and symlinked roots.
+
+    Read-only: ids are used for collision detection, never for retiring a
+    non-AppleDeck tool. Returns {tool_id: [roots]} and {resolved_root: id}.
+    """
+    by_id = {}
+    by_dir = {}
+    base = steam / "compatibilitytools.d"
+    try:
+        dirs = list(base.iterdir())
+    except OSError:
+        return by_id, by_dir
+    for root in dirs:
+        if not root.is_dir():
+            continue
+        try:
+            values, blocks, _ = vdf.vdf_entries(
+                (root / "compatibilitytool.vdf").read_text())
+        except (OSError, ValueError, KeyError):
+            continue
+        for path in blocks:
+            if len(path) != 3 or path[:2] != vdf.VDF_TOOLS:
+                continue
+            by_id.setdefault(path[2], []).append(root)
+            by_dir[root.resolve()] = path[2]
+    return by_id, by_dir
+
+
+def _base_state(base, root):
+    """'ok' | 'gone' | 'bad' for the marker's base path."""
+    if not isinstance(base, str) or not os.path.isabs(base):
+        return "bad"
+    resolved = Path(base).resolve()
+    if str(resolved).startswith(str(root.resolve()) + "/") or resolved == root.resolve():
+        return "bad"
+    if (resolved / "proton").is_file() or (resolved / "files/bin/wine").is_file():
+        return "ok"
+    return "gone"
+
+
+def _schema1_base_id(base, key, by_dir):
+    if key == DEFAULT_BASE:
+        return "proton_11"
+    resolved = Path(base).resolve()
+    if resolved in by_dir:
+        return by_dir[resolved]
+    return None
+
+
+def _owned(steam):
+    """Yield (root, aliases, base_id|None, base_state) for verified tools."""
+    roots = sorted((steam / "compatibilitytools.d").glob("appledeck-neptune*"))
+    by_id, by_dir = _registrations(steam)
+    for root in roots:
+        vdf_file = root / "compatibilitytool.vdf"
+        if not os.path.lexists(vdf_file) and \
+                (root / "compatibilitytool.vdf.appledeck-retired").is_file():
+            continue  # already retired on a previous run
+        try:
+            reg_id, install, runtime = _registration(root)
+        except (OSError, ValueError, KeyError):
+            _log(f"{root.name}: malformed registration, left untouched")
+            continue
+        schema1 = install == "."
+        # schema1 marker lives at the root; schema2 only inside the validated
+        # runtime directory -- never fall back across layouts.
+        marker = _marker(root / OWNER) if schema1 else _marker(runtime / OWNER)
+        if not isinstance(marker, dict):
+            _log(f"{root.name}: no readable marker, left untouched")
+            continue
+        if marker.get("schema") != (1 if schema1 else 2):
+            _log(f"{root.name}: marker schema does not match layout")
+            continue
+        key = marker.get("base_key", DEFAULT_BASE)
+        if not isinstance(key, str) or not BASE_KEY.fullmatch(key):
+            _log(f"{root.name}: marker base_key invalid, left untouched")
+            continue
+        if root.name != tool_dir_name(key):
+            _log(f"{root.name}: root does not match marker base_key, left untouched")
+            continue
+        aliases = owned_aliases(key)
+        if reg_id not in aliases:
+            _log(f"{root.name}: registration id {reg_id!r} is not an owned alias")
+            continue
+        if not schema1:
+            if marker.get("tool_id") != reg_id or marker.get("runtime") != install:
+                _log(f"{root.name}: schema2 marker does not match registration")
+                continue
+            if not isinstance(marker.get("base_id"), str) or not marker["base_id"]:
+                _log(f"{root.name}: schema2 marker lacks base_id, left untouched")
+                continue
+        collision = [r for rid in aliases for r in by_id.get(rid, [])
+                     if r.resolve() != root.resolve()]
+        if collision:
+            _log(f"{root.name}: tool id collides with {collision[0].name}, left untouched")
+            continue
+        base = marker.get("base")
+        state = _base_state(base, root)
+        if state == "bad":
+            _log(f"{root.name}: base {base!r} invalid, left untouched")
+            continue
+        if schema1:
+            base_id = _schema1_base_id(base, key, by_dir) if state == "ok" else None
+            if base_id is None and state == "ok":
+                _log(f"{root.name}: schema1 base registration ambiguous, left untouched")
+                continue
+        else:
+            base_id = marker["base_id"]
+        if state != "ok":
+            base_id = None
+            _log(f"{root.name}: base {base!r} is gone; owned redirects will be removed")
+        yield root, aliases, base_id, state
+
+
+def _rewrite(config, aliases, base_id, state):
+    """Map owned references in ONE atomic write, or remove owned redirects.
+
+    Returns True when the config is in its final state for this tool. A
+    missing/unreadable config keeps the registration from being retired.
+    """
+    if not config.is_file():
+        return True
+    try:
+        old = config.read_text()
+    except OSError:
+        _log("config.vdf unreadable; registration kept")
+        return False
+    values, blocks, _ = vdf.vdf_entries(old)
+    parent = tuple(part.lower() for part in vdf.MAPPING)
+    text = old
+    for path in blocks:
+        if len(path) != len(parent) + 1 or path[:len(parent)] != parent:
+            continue
+        current = values.get((*path, "name"), [None])[0]
+        if current not in aliases:
+            continue
+        appid = path[-1]
+        if state == "ok" and base_id:
+            text = vdf.vdf_set(text, (*vdf.MAPPING, appid, "name"), base_id)
+            _log(f"mapped {appid}: {current} -> {base_id}")
+        else:
+            text = vdf.vdf_remove(text, (*vdf.MAPPING, appid))
+            _log(f"mapped {appid}: {current} -> (removed, base absent)")
+    if text != old:
+        try:
+            vdf.atomic_write(config, text)
+        except OSError:
+            _log("config.vdf update failed; registration kept")
+            return False
+    return True
+
+
+def _retire(root, steam):
+    """Deactivate the registration: rename its vdf, else move the root out."""
+    vdf_file = root / "compatibilitytool.vdf"
+    retired = root / "compatibilitytool.vdf.appledeck-retired"
+    try:
+        if vdf_file.exists():
+            if not retired.exists():
+                os.rename(vdf_file, retired)
+            else:
+                # Retired name taken: move the whole owned root out of the
+                # scanned directory instead of overwriting anything.
+                archive = steam / "appledeck-retired"
+                archive.mkdir(exist_ok=True)
+                dest = archive / root.name
+                index = 0
+                while dest.exists():
+                    index += 1
+                    dest = archive / f"{root.name}.{index}"
+                os.rename(root, dest)
+    except OSError as error:
+        _log(f"{root.name}: retire failed: {error}")
+        return False
+    _log(f"retired {root.name}")
+    return True
+
+
+def main():
+    steam = steam_root()
+    config = steam / "config/config.vdf"
+    for root, aliases, base_id, state in _owned(steam):
+        if not _rewrite(config, aliases, base_id, state):
+            continue
+        _retire(root, steam)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

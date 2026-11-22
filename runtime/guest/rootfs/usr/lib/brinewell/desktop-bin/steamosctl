@@ -1,0 +1,6 @@
+#!/bin/sh
+# brinewell Desktop Mode (PATH of /usr/lib/brinewell/nested-desktop): the nested Plasma
+# session has its own D-Bus session bus; steamos-manager is on the outer one.
+# Return to Gaming Mode (steamos-session-select gamescope) and other SteamOS
+# controls reach it here.
+DBUS_SESSION_BUS_ADDRESS=${BRINEWELL_OUTER_BUS:?not in the brinewell nested desktop} exec /usr/bin/steamosctl "$@"

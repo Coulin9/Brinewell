@@ -1,0 +1,63 @@
+#!/bin/bash
+set -euo pipefail
+runtime=/usr/lib/brinewell/uu-runtime
+state=/home/uu/uu
+# /tmp is public. Never follow a directory supplied by another guest user.
+for directory in /home/uu "$state"; do
+    if [[ -L "$directory" ]]; then
+        echo "Unsafe UU directory: $directory" >&2
+        exit 1
+    fi
+    if [[ -e "$directory" ]]; then
+        mode=$(stat -c %a "$directory")
+        if [[ ! -d "$directory" || $(stat -c %u "$directory") != 0 ]] || (( (8#$mode & 0022) != 0 )); then
+            echo "Unsafe UU directory permissions: $directory" >&2
+            exit 1
+        fi
+    else
+        mkdir -m700 "$directory"
+    fi
+done
+# Disks written by AppleDeck releases keep the old payload directory name.
+if [[ -e "$state/appledeck-payload" && ! -e "$state/brinewell-payload" && ! -L "$state/appledeck-payload" ]]; then
+    mv "$state/appledeck-payload" "$state/brinewell-payload"
+fi
+# A uuplugin.service installed by an AppleDeck release is still in place on
+# upgraded disks: it exports the legacy runtime paths. /usr/lib/appledeck is a
+# compat symlink, so its PATH/LD_LIBRARY_PATH/CURL_CA_BUNDLE resolve, but
+# XTABLES_LIBDIR=/run/appledeck-uu-xtables names a directory this launcher
+# never populates. Export the values matching what is unpacked below so the
+# plugin always sees the live paths, whichever unit started it.
+xtables=/run/brinewell-uu-xtables
+export XTABLES_LIBDIR=$xtables
+export PATH=$runtime/bin:/usr/bin:/usr/sbin:/bin:/sbin
+export LD_LIBRARY_PATH=$runtime/lib
+export CURL_CA_BUNDLE=$runtime/ca-certificates.crt
+for directory in "$state/brinewell-payload" "$state/data" "$state/config" "$state/compat" /tmp/uu "$xtables"; do
+    if [[ -L "$directory" ]]; then
+        echo "Unsafe UU directory: $directory" >&2
+        exit 1
+    fi
+    if [[ -e "$directory" ]]; then
+        mode=$(stat -c %a "$directory")
+        if [[ ! -d "$directory" || $(stat -c %u "$directory") != 0 ]] || (( (8#$mode & 0022) != 0 )); then
+            echo "Unsafe UU directory permissions: $directory" >&2
+            exit 1
+        fi
+    else
+        mkdir -m700 "$directory"
+    fi
+done
+tar -C "$xtables" -xf "$runtime/xtables.tar"
+# Retain the plugin's device identity and state; replace only its program files.
+for name in uuplugin xuplugin-guardian; do
+    [[ -f "$state/brinewell-payload/$name" && ! -L "$state/brinewell-payload/$name" ]] || exit 1
+    [[ ! -L "/tmp/uu/$name" ]] || exit 1
+    install -m755 "$state/brinewell-payload/$name" "/tmp/uu/$name"
+done
+[[ ! -L /tmp/uu/uu.conf ]] || exit 1
+if [[ ! -s /tmp/uu/uu.conf ]]; then
+    install -m600 "$state/brinewell-payload/uu.conf" /tmp/uu/uu.conf
+fi
+cd /tmp/uu
+exec "$runtime/bin/FEX" /tmp/uu/uuplugin /tmp/uu/uu.conf

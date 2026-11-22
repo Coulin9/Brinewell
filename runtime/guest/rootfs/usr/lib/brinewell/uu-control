@@ -1,0 +1,59 @@
+#!/bin/bash
+# Only the host's private virtio-console channel can request these fixed actions.
+set -uo pipefail
+umask 077
+install -d -m 0700 /var/log/brinewell || exit 1
+exec 2>>/var/log/brinewell/uu.log
+chmod 0600 /var/log/brinewell/uu.log || exit 1
+exec 3<>/dev/virtio-ports/fx.uu || exit 1
+
+emit() {
+    printf '%s\n' "$1" >&3 || exit 1
+}
+
+run_installer() {
+    local action=$1 line result=1 reported_error=0 reported_status=0
+    # Keep progress live, while retaining the installer's exit status separately
+    # from the control service so a failed install can be retried.
+    while IFS= read -r line; do
+        if [[ ${#line} -gt 32768 ]]; then
+            printf 'uu-install: discarded oversized status line\n' >&2
+            continue
+        fi
+        case "$line" in
+            '__brinewell_uu_result '*)
+                result=${line#'__brinewell_uu_result '}
+                ;;
+            'progress '*|'binding '*|'qrcode '*|'status absent'|'status absent '*|'status installed'|'status installed '*|'status error'|'status error '*)
+                [[ "$line" == 'status '* ]] && reported_status=1
+                [[ "$line" == 'status error' || "$line" == 'status error '* ]] && reported_error=1
+                emit "$line"
+                ;;
+            '') ;;
+            *) printf 'uu-install: %s\n' "$line" >&2 ;;
+        esac
+    done < <(
+        /usr/lib/brinewell/uu-install "$action"
+        printf '\n__brinewell_uu_result %s\n' "$?"
+    )
+    if [[ "$result" != 0 && "$reported_error" == 0 ]]; then
+        emit 'status error UU 安装操作未完成，请重试或查看虚拟机 /var/log/brinewell/uu.log。'
+    elif [[ "$reported_status" == 0 ]]; then
+        emit 'status error UU 安装服务没有返回状态，请重试。'
+    fi
+}
+
+emit hello
+run_installer status
+while IFS= read -r -n 128 command <&3; do
+    if [[ ${#command} == 128 ]]; then
+        # Drain an oversized request without treating its tail as another action.
+        while IFS= read -r -n 128 fragment <&3 && [[ ${#fragment} == 128 ]]; do :; done
+        emit 'status error 无效的 UU 安装请求。'
+        continue
+    fi
+    case "$command" in
+        status|install) run_installer "$command" ;;
+        *) emit 'status error 无效的 UU 安装请求。' ;;
+    esac
+done

@@ -1,0 +1,538 @@
+--- /dev/null
++++ b/src/brinewell_telemetry.h
+@@ -0,0 +1,72 @@
++#pragma once
++
++#include <cstdint>
++#include <fstream>
++#include <vector>
++#ifdef __linux__
++#include <unistd.h>
++#endif
++
++struct BrinewellTelemetry {
++    struct Core {
++        char tier;
++        unsigned die;
++        unsigned id;
++        int mhz;
++        int busy;
++        int millidegrees;
++    };
++
++    int64_t gpu_busy = -1;
++    int64_t gpu_hz = -1;
++    int64_t gpu_millidegrees = -1;
++    int64_t gpu_microwatts = -1;
++    int64_t gpu_memory_bytes = -1;
++    int64_t cpu_millidegrees = -1;
++    int64_t cpu_microwatts = -1;
++    int64_t cpu_busy = -1;
++    int64_t cpu_mhz = -1;
++    int64_t ram_used_bytes = -1;
++    int64_t ram_total_bytes = -1;
++    std::vector<Core> cores;
++
++    static bool enabled() {
++#ifdef __linux__
++        static const bool present = access("/sys/devices/platform/brinewell_telemetry", F_OK) == 0;
++        return present;
++#else
++        return false;
++#endif
++    }
++
++    static BrinewellTelemetry read() {
++        std::ifstream file("/run/brinewell-telemetry/snapshot");
++        BrinewellTelemetry sample;
++        unsigned version;
++        if (!(file >> version >> sample.gpu_busy >> sample.gpu_hz >> sample.gpu_millidegrees
++                   >> sample.gpu_microwatts >> sample.gpu_memory_bytes >> sample.cpu_millidegrees
++                   >> sample.cpu_microwatts >> sample.cpu_busy >> sample.cpu_mhz
++                   >> sample.ram_used_bytes >> sample.ram_total_bytes) || (version != 1 && version != 2))
++            return {};
++        if (version == 2) {
++            unsigned count;
++            if (!(file >> count) || count > 64)
++                return {};
++            sample.cores.reserve(count);
++            for (unsigned i = 0; i < count; ++i) {
++                Core core{};
++                if (!(file >> core.tier >> core.die >> core.id >> core.mhz >> core.busy >> core.millidegrees))
++                    return {};
++                sample.cores.push_back(core);
++            }
++        }
++        file >> std::ws;
++        if (!file.eof())
++            return {};
++        return sample;
++    }
++
++    static float gibibytes(int64_t bytes) {
++        return bytes < 0 ? -1.0f : bytes / 1073741824.0f;
++    }
++};
+--- a/src/cpu.cpp
++++ b/src/cpu.cpp
+@@ -460,8 +460,20 @@
+     power = (float) powerValue / 1000000.0f;
+ 
+     return true;
++}
++
++void CPUStats::UpdateBrinewellTotals(const BrinewellTelemetry& sample) {
++    m_cpuDataTotal.percent = sample.cpu_busy < 0 ? -1.0f : sample.cpu_busy / 100.0f;
++    m_cpuDataTotal.cpu_mhz = sample.cpu_mhz;
++    m_cpuDataTotal.temp = sample.cpu_millidegrees < 0 ? -1 : sample.cpu_millidegrees / 1000;
++    m_cpuDataTotal.power = sample.cpu_microwatts < 0 ? -1.0f : sample.cpu_microwatts / 1000000.0f;
++    std::atomic_store(&m_brinewellCores, std::make_shared<const std::vector<BrinewellTelemetry::Core>>(sample.cores));
+ }
+ 
++std::shared_ptr<const std::vector<BrinewellTelemetry::Core>> CPUStats::GetBrinewellCores() const {
++    return std::atomic_load(&m_brinewellCores);
++}
++
+ bool CPUStats::UpdateCpuPower() {
+     InitCpuPowerData();
+ 
+--- a/src/cpu.h
++++ b/src/cpu.h
+@@ -162,6 +162,8 @@
+    FILE* powerFile {nullptr};
+ };
+ 
++#include "brinewell_telemetry.h"
++
+ class CPUStats
+ {
+ public:
+@@ -178,6 +180,8 @@
+    bool UpdateCoreMhz();
+    bool UpdateCpuTemp();
+    bool UpdateCpuPower();
++   void UpdateBrinewellTotals(const BrinewellTelemetry& sample);
++   std::shared_ptr<const std::vector<BrinewellTelemetry::Core>> GetBrinewellCores() const;
+    bool ReadcpuTempFile(int& temp);
+    bool GetCpuFile();
+    bool InitCpuPowerData();
+@@ -196,6 +200,7 @@
+    unsigned long long int m_boottime = 0;
+    std::vector<CPUData> m_cpuData;
+    CPUData m_cpuDataTotal {};
++   std::shared_ptr<const std::vector<BrinewellTelemetry::Core>> m_brinewellCores;
+    std::vector<int> m_coreMhz;
+    double m_cpuPeriod = 0;
+    bool m_updatedCPUs = false; // TODO use caching or just update?
+--- a/src/gpu.cpp
++++ b/src/gpu.cpp
+@@ -130,6 +130,9 @@
+     std::string driver = fs::read_symlink(path).string();
+     driver = driver.substr(driver.rfind("/") + 1);
+ 
++    if (driver == "virtio-mmio" && BrinewellTelemetry::enabled())
++        return "brinewell-virtio";
++
+     return driver;
+ }
+ 
+@@ -151,6 +154,16 @@
+     return pci_addr.substr(idx); // 0000:03:00.0
+ }
+ 
++void GPU::sample_brinewell(const BrinewellTelemetry& sample) {
++    metrics.load = sample.gpu_busy < 0 ? -1 : (sample.gpu_busy + 50) / 100;
++    metrics.CoreClock = sample.gpu_hz < 0 ? -1 : sample.gpu_hz / 1000000;
++    metrics.temp = sample.gpu_millidegrees < 0 ? -1 : sample.gpu_millidegrees / 1000;
++    metrics.powerUsage = sample.gpu_microwatts < 0 ? -1.0f : sample.gpu_microwatts / 1000000.0f;
++    metrics.sys_vram_used = BrinewellTelemetry::gibibytes(sample.gpu_memory_bytes);
++    metrics.junction_temp = -1;
++    metrics.memory_temp = -1;
++}
++
+ int GPU::index_in_selected_gpus() {
+     auto selected_gpus = gpus->selected_gpus();
+     auto it = std::find_if(selected_gpus.begin(), selected_gpus.end(),
+--- a/src/gpu.h
++++ b/src/gpu.h
+@@ -16,6 +16,7 @@
+ #include "nvidia.h"
+ #include "gpu_metrics_util.h"
+ #include "gpu_fdinfo.h"
++#include "brinewell_telemetry.h"
+ 
+ class GPU {
+     public:
+@@ -48,6 +49,9 @@
+                     driver == "msm_dpu" || driver == "msm_drm"
+                 )
+                     fdinfo = std::make_unique<GPU_fdinfo>(driver, pci_dev, drm_node);
++
++                if (is_brinewell_virtio())
++                    sample_brinewell({});
+         }
+ 
+         gpu_metrics get_metrics() {
+@@ -63,6 +67,9 @@
+             return metrics;
+         };
+ 
++        bool is_brinewell_virtio() const { return driver == "brinewell-virtio"; }
++        void sample_brinewell(const BrinewellTelemetry& sample);
++
+         std::vector<int> nvidia_pids() {
+ #ifdef HAVE_NVML
+             if (nvidia)
+@@ -158,10 +165,14 @@
+                     gpu->throttling()->update();
+         }
+ 
+-        void get_metrics() {
++        void get_metrics(const BrinewellTelemetry& sample) {
+             std::lock_guard<std::mutex> lock(mutex);
+-            for (auto gpu : available_gpus)
+-                gpu->get_metrics();
++            for (auto& gpu : available_gpus) {
++                if (gpu->is_brinewell_virtio())
++                    gpu->sample_brinewell(sample);
++                else
++                    gpu->get_metrics();
++            }
+         }
+ 
+         std::vector<std::shared_ptr<GPU>> selected_gpus() {
+@@ -200,8 +211,8 @@
+         std::string get_pci_device_address(const std::string& drm_card_path);
+         std::string get_driver(const std::string& node);
+ 
+-        const std::array<std::string, 8> supported_drivers = {
+-            "amdgpu", "nvidia", "i915", "xe", "panfrost", "panthor", "msm_dpu", "msm_drm"
++        const std::array<std::string, 9> supported_drivers = {
++            "amdgpu", "nvidia", "i915", "xe", "panfrost", "panthor", "msm_dpu", "msm_drm", "brinewell-virtio"
+         };
+ };
+ 
+--- a/src/hud_elements.cpp
++++ b/src/hud_elements.cpp
+@@ -289,7 +289,9 @@
+ 
+             ImguiNextColumnOrNewRow();
+             auto text_color = HUDElements.colors.text;
+-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_load_change]){
++            if (gpu->is_brinewell_virtio() && gpu->metrics.load < 0)
++                right_aligned_text(text_color, HUDElements.ralign_width, "--");
++            else if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_load_change]){
+                 struct LOAD_DATA gpu_data = {
+                     HUDElements.colors.gpu_load_low,
+                     HUDElements.colors.gpu_load_med,
+@@ -311,7 +313,8 @@
+                 // ImGui::Text("%s", "%");
+             }
+ 
+-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_temp]){
++            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_temp] &&
++                (!gpu->is_brinewell_virtio() || gpu->metrics.temp >= 0)){
+                 ImguiNextColumnOrNewRow();
+                 if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_temp_fahrenheit])
+                     right_aligned_text(text_color, HUDElements.ralign_width, "%i", HUDElements.convert_to_fahrenheit(gpu->metrics.temp));
+@@ -344,7 +347,7 @@
+                 ImGui::PopFont();
+             }
+ 
+-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_fan] && !gpu->is_apu()){
++            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_fan] && !gpu->is_apu() && !gpu->is_brinewell_virtio()){
+                 ImguiNextColumnOrNewRow();
+                 right_aligned_text(text_color, HUDElements.ralign_width, "%i", gpu->metrics.fan_speed);
+                 ImGui::SameLine(0, 1.0f);
+@@ -360,7 +363,8 @@
+                 ImGui::PopFont();
+             }
+ 
+-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_core_clock]){
++            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_core_clock] &&
++                (!gpu->is_brinewell_virtio() || gpu->metrics.CoreClock >= 0)){
+                 ImguiNextColumnOrNewRow();
+                 right_aligned_text(text_color, HUDElements.ralign_width, "%i", gpu->metrics.CoreClock);
+                 ImGui::SameLine(0, 1.0f);
+@@ -369,7 +373,8 @@
+                 ImGui::PopFont();
+             }
+ 
+-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_power]) {
++            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_power] &&
++                (!gpu->is_brinewell_virtio() || gpu->metrics.powerUsage >= 0)) {
+                 ImguiNextColumnOrNewRow();
+                 char str[16];
+                 snprintf(str, sizeof(str), "%.1f", gpu->metrics.powerUsage);
+@@ -379,14 +384,15 @@
+                     right_aligned_text(text_color, HUDElements.ralign_width, "%.1f", gpu->metrics.powerUsage);
+                 ImGui::SameLine(0, 1.0f);
+                 ImGui::PushFont(HUDElements.sw_stats->font_small);
+-                if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_power_limit])
++                if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_power_limit] && !gpu->is_brinewell_virtio())
+                     HUDElements.TextColored(HUDElements.colors.text, "/%.0fW", gpu->metrics.powerLimit);
+                 else
+                     HUDElements.TextColored(HUDElements.colors.text, "W");
+                 ImGui::PopFont();
+             }
+ 
+-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_efficiency]) {
++            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_efficiency] &&
++                (!gpu->is_brinewell_virtio() || gpu->metrics.powerUsage > 0)) {
+                 ImguiNextColumnOrNewRow();
+                 float efficiency;
+                 const char* efficiency_unit;
+@@ -404,7 +410,7 @@
+                 ImGui::PopFont();
+             }
+ 
+-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_voltage]) {
++            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_voltage] && !gpu->is_brinewell_virtio()) {
+                 ImguiNextColumnOrNewRow();
+                 right_aligned_text(text_color, HUDElements.ralign_width, "%i", gpu->metrics.voltage);
+                 ImGui::SameLine(0, 1.0f);
+@@ -430,7 +436,11 @@
+         HUDElements.TextColored(HUDElements.colors.cpu, "%s", cpu_text);
+         ImguiNextColumnOrNewRow();
+         auto text_color = HUDElements.colors.text;
+-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_load_change]){
++        const bool brinewell = BrinewellTelemetry::enabled();
++        const auto& cpu = cpuStats.GetCPUDataTotal();
++        if (brinewell && cpu.percent < 0)
++            right_aligned_text(text_color, HUDElements.ralign_width, "--");
++        else if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_load_change]){
+             int cpu_load_percent = int(cpuStats.GetCPUDataTotal().percent);
+             struct LOAD_DATA cpu_data = {
+                 HUDElements.colors.cpu_load_low,
+@@ -451,7 +461,7 @@
+             HUDElements.TextColored(HUDElements.colors.text, "%%");
+         }
+ 
+-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_temp]){
++        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_temp] && (!brinewell || cpu.temp >= 0)){
+             ImguiNextColumnOrNewRow();
+             if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_temp_fahrenheit])
+                 right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%i", HUDElements.convert_to_fahrenheit(cpuStats.GetCPUDataTotal().temp));
+@@ -467,7 +477,7 @@
+                     HUDElements.TextColored(HUDElements.colors.text, "°C");
+         }
+ 
+-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_mhz]){
++        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_mhz] && (!brinewell || cpu.cpu_mhz >= 0)){
+             ImguiNextColumnOrNewRow();
+             right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%i", cpuStats.GetCPUDataTotal().cpu_mhz);
+             ImGui::SameLine(0, 1.0f);
+@@ -476,7 +486,7 @@
+             ImGui::PopFont();
+         }
+ 
+-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_power]){
++        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_power] && (!brinewell || cpu.power >= 0)){
+             ImguiNextColumnOrNewRow();
+             char str[16];
+             snprintf(str, sizeof(str), "%.1f", cpuStats.GetCPUDataTotal().power);
+@@ -490,7 +500,7 @@
+             ImGui::PopFont();
+         }
+ 
+-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_efficiency]) {
++        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_efficiency] && (!brinewell || cpu.power > 0)) {
+             ImguiNextColumnOrNewRow();
+             float efficiency;
+             const char* efficiency_unit;
+@@ -514,11 +524,60 @@
+ static float get_core_load_stat(void*,int);
+ static float get_core_load_stat(void *data, int idx){
+     return ((CPUStats *)data)->GetCPUData().at(idx).percent;
++}
++
++static void brinewell_core_load() {
++    const auto cores = cpuStats.GetBrinewellCores();
++    const auto& text_color = HUDElements.colors.text;
++    if (!cores || cores->empty()) {
++        ImguiNextColumnFirstItem();
++        HUDElements.TextColored(HUDElements.colors.cpu, "CPU cores");
++        ImguiNextColumnOrNewRow();
++        HUDElements.TextColored(text_color, "--");
++        return;
++    }
++
++    const bool multiple_dies = std::any_of(cores->begin(), cores->end(), [](const auto& core) { return core.die != 0; });
++    const bool fahrenheit = HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_temp_fahrenheit];
++    ImGui::PushFont(HUDElements.sw_stats->font_small);
++    for (const auto& core : *cores) {
++        ImguiNextColumnFirstItem();
++        const char tier = core.tier == '_' ? ' ' : core.tier;
++        if (multiple_dies)
++            HUDElements.TextColored(HUDElements.colors.cpu, "D%u %c%u", core.die, tier, core.id);
++        else
++            HUDElements.TextColored(HUDElements.colors.cpu, "CPU %c%u", tier, core.id);
++
++        ImguiNextColumnOrNewRow();
++        if (core.busy >= 0)
++            HUDElements.TextColored(text_color, "%d%%", (core.busy + 50) / 100);
++        else
++            HUDElements.TextColored(text_color, "--");
++
++        ImguiNextColumnOrNewRow();
++        if (core.mhz >= 0)
++            HUDElements.TextColored(text_color, "%d MHz", core.mhz);
++        else
++            HUDElements.TextColored(text_color, "-- MHz");
++        ImGui::SameLine();
++        if (core.millidegrees >= 0) {
++            const int celsius = (core.millidegrees + 500) / 1000;
++            const int temp = fahrenheit ? HUDElements.convert_to_fahrenheit(celsius) : celsius;
++            HUDElements.TextColored(text_color, "%d°%c", temp, fahrenheit ? 'F' : 'C');
++        } else {
++            HUDElements.TextColored(text_color, "--°%c", fahrenheit ? 'F' : 'C');
++        }
++    }
++    ImGui::PopFont();
+ }
+ 
+ void HudElements::core_load(){
+     if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_core_load])
+         return;
++    if (BrinewellTelemetry::enabled()) {
++        brinewell_core_load();
++        return;
++    }
+ 
+     if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_core_bars]){
+         ImguiNextColumnFirstItem();
+@@ -648,11 +707,14 @@
+ 
+                 ImguiNextColumnOrNewRow();
+                 // Add gtt_used to vram usage for APUs
+-                if (gpu->is_apu())
++                if (gpu->is_brinewell_virtio() && gpu->metrics.sys_vram_used < 0)
++                    right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "--");
++                else if (gpu->is_apu())
+                     right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.1f", gpu->metrics.sys_vram_used + gpu->metrics.gtt_used);
+                 else
+                     right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.1f", gpu->metrics.sys_vram_used);
+-                if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact]){
++                if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact] &&
++                    (!gpu->is_brinewell_virtio() || gpu->metrics.sys_vram_used >= 0)){
+                     ImGui::SameLine(0,1.0f);
+                     ImGui::PushFont(HUDElements.sw_stats->font_small);
+                     HUDElements.TextColored(HUDElements.colors.text, "GiB");
+@@ -672,7 +734,7 @@
+                         HUDElements.TextColored(HUDElements.colors.text, "°C");
+                 }
+ 
+-                if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_mem_clock]){
++                if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_mem_clock] && !gpu->is_brinewell_virtio()){
+                     ImguiNextColumnOrNewRow();
+                     right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%i", gpu->metrics.MemClock);
+                     ImGui::SameLine(0, 1.0f);
+@@ -752,16 +814,21 @@
+ 
+ void HudElements::ram(){
+ #ifdef __linux__
++    const bool brinewell = BrinewellTelemetry::enabled();
+     if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_ram] ||
+-        HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_ram_temp]) {
++        (!brinewell && HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_ram_temp])) {
+         ImguiNextColumnFirstItem();
+         HUDElements.TextColored(HUDElements.colors.ram, "RAM");
+     }
+ 
+     if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_ram]) {
+         ImguiNextColumnOrNewRow();
+-        right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.1f", memused);
+-        if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact]){
++        const bool ram_available = !brinewell || memused >= 0;
++        if (ram_available)
++            right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.1f", memused);
++        else
++            right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "--");
++        if (ram_available && !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact]){
+             ImGui::SameLine(0, 1.0f);
+             ImGui::PushFont(HUDElements.sw_stats->font_small);
+             HUDElements.TextColored(HUDElements.colors.text, "GiB");
+@@ -769,7 +836,8 @@
+         }
+     }
+ 
+-    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_ram] && HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_swap]){
++    if (!brinewell && HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_ram] &&
++        HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_swap]){
+         ImguiNextColumnOrNewRow();
+         right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.1f", swapused);
+         ImGui::SameLine(0, 1.0f);
+@@ -778,7 +846,7 @@
+         ImGui::PopFont();
+     }
+ 
+-    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_ram_temp]) {
++    if (!brinewell && HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_ram_temp]) {
+         ImguiNextColumnOrNewRow();
+         if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_temp_fahrenheit])
+             right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%i", HUDElements.convert_to_fahrenheit(mem_temp));
+@@ -1593,7 +1661,7 @@
+         if (!gpu)
+             return;
+ 
+-        HUDElements.max = gpu->metrics.memoryTotal;
++        HUDElements.max = gpu->is_brinewell_virtio() ? FLT_MAX : gpu->metrics.memoryTotal;
+         HUDElements.min = 0;
+         HUDElements.TextColored(HUDElements.colors.engine, "%s", "VRAM");
+     }
+--- a/src/overlay.cpp
++++ b/src/overlay.cpp
+@@ -102,23 +102,32 @@
+ void update_hw_info(const struct overlay_params& params, uint32_t vendorID)
+ {
+    auto real_params = get_params();
++   const bool brinewell = BrinewellTelemetry::enabled();
++   const auto sample = brinewell ? BrinewellTelemetry::read() : BrinewellTelemetry{};
+    if (real_params->enabled[OVERLAY_PARAM_ENABLED_fan])
+       update_fan();
+    if (real_params->enabled[OVERLAY_PARAM_ENABLED_cpu_stats] || logger->is_active()) {
+-      cpuStats.UpdateCPUData();
++#ifdef __linux__
++      if (brinewell) {
++         cpuStats.UpdateBrinewellTotals(sample);
++      } else
++#endif
++      {
++         cpuStats.UpdateCPUData();
+ 
+ #ifdef __linux__
+-      if (real_params->enabled[OVERLAY_PARAM_ENABLED_core_load] || real_params->enabled[OVERLAY_PARAM_ENABLED_cpu_mhz] || logger->is_active())
+-         cpuStats.UpdateCoreMhz();
+-      if (real_params->enabled[OVERLAY_PARAM_ENABLED_cpu_temp] || logger->is_active() || real_params->enabled[OVERLAY_PARAM_ENABLED_graphs])
+-         cpuStats.UpdateCpuTemp();
+-      if (real_params->enabled[OVERLAY_PARAM_ENABLED_cpu_power] || logger->is_active())
+-         cpuStats.UpdateCpuPower();
++         if (real_params->enabled[OVERLAY_PARAM_ENABLED_core_load] || real_params->enabled[OVERLAY_PARAM_ENABLED_cpu_mhz] || logger->is_active())
++            cpuStats.UpdateCoreMhz();
++         if (real_params->enabled[OVERLAY_PARAM_ENABLED_cpu_temp] || logger->is_active() || real_params->enabled[OVERLAY_PARAM_ENABLED_graphs])
++            cpuStats.UpdateCpuTemp();
++         if (real_params->enabled[OVERLAY_PARAM_ENABLED_cpu_power] || logger->is_active())
++            cpuStats.UpdateCpuPower();
+ #endif
++      }
+    }
+    if (real_params->enabled[OVERLAY_PARAM_ENABLED_gpu_stats] || logger->is_active()) {
+       if (gpus)
+-         gpus->get_metrics();
++         gpus->get_metrics(sample);
+    }
+ 
+ #ifdef __linux__
+@@ -132,7 +141,11 @@
+    }
+    if (real_params->enabled[OVERLAY_PARAM_ENABLED_ram] || real_params->enabled[OVERLAY_PARAM_ENABLED_swap] || logger->is_active())
+       update_meminfo();
+-   if (real_params->enabled[OVERLAY_PARAM_ENABLED_ram_temp])
++   if (brinewell) {
++      memused = BrinewellTelemetry::gibibytes(sample.ram_used_bytes);
++      memmax = BrinewellTelemetry::gibibytes(sample.ram_total_bytes);
++   }
++   if (!brinewell && real_params->enabled[OVERLAY_PARAM_ENABLED_ram_temp])
+       update_mem_temp();
+    if (real_params->enabled[OVERLAY_PARAM_ENABLED_procmem])
+       update_procmem();

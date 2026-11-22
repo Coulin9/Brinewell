@@ -1,0 +1,322 @@
+import AppKit
+import Foundation
+import IOSurface
+import Metal
+@preconcurrency import MetalKit
+import SwiftUI
+
+/// A frame the renderer can display.
+///
+/// `.surface` carries a CPU-visible BGRA IOSurface (the virtio-gpu fallback
+/// path). `.metal` carries a native GPU texture handed over by libkrun, which
+/// the renderer samples directly with no CPU pixel copy.
+public enum DisplayFrame: Sendable {
+    case surface(IOSurfaceFrame)
+    case metal(MetalFrame)
+
+    public var pixelSize: (width: Int, height: Int) {
+        switch self {
+        case .surface(let frame):
+            (IOSurfaceGetWidth(frame.surface), IOSurfaceGetHeight(frame.surface))
+        case .metal(let frame):
+            (frame.width, frame.height)
+        }
+    }
+
+    public var sequenceNumber: UInt64 {
+        switch self {
+        case .surface(let frame): frame.sequenceNumber
+        case .metal(let frame): frame.sequenceNumber
+        }
+    }
+
+    /// Marks the frame as no longer read by the GPU. Native frames release
+    /// their producer lease here; the texture stays valid through this frame's
+    /// own strong reference until the frame is deallocated.
+    public func finish() {
+        if case .metal(let frame) = self {
+            frame.finish()
+        }
+    }
+}
+
+/// A CPU-readable copy of the frame currently bound to the renderer.
+public struct FrameSnapshot {
+    public let width: Int
+    public let height: Int
+    /// True when the pixels are BGRA and the caller must swap red and blue.
+    public let swapRedBlue: Bool
+    public let pixels: [UInt8]
+
+    public init(width: Int, height: Int, swapRedBlue: Bool, pixels: [UInt8]) {
+        self.width = width
+        self.height = height
+        self.swapRedBlue = swapRedBlue
+        self.pixels = pixels
+    }
+}
+
+/// Owns one display view at a time. Keep the renderer alive for the view's
+/// lifetime; do not attach the same renderer to multiple views concurrently.
+@MainActor
+public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
+    public private(set) var lastError: String?
+
+    private let device: any MTLDevice
+    private let queue: any MTLCommandQueue
+    private let pipeline: any MTLRenderPipelineState
+    private let textureDescriptor: MTLTextureDescriptor
+    private weak var view: MTKView?
+    private var frame: DisplayFrame?
+    private var texture: (any MTLTexture)?
+
+    public init(device: (any MTLDevice)? = MTLCreateSystemDefaultDevice()) throws {
+        guard let device else {
+            throw DisplayError.noMetalDevice
+        }
+        guard let queue = device.makeCommandQueue() else {
+            throw DisplayError.commandQueueUnavailable
+        }
+        let library: any MTLLibrary
+        do {
+            library = try device.makeLibrary(source: Self.shaderSource, options: nil)
+        } catch {
+            throw DisplayError.shaderLibrary(error.localizedDescription)
+        }
+        guard let vertex = library.makeFunction(name: "displayVertex"),
+              let fragment = library.makeFunction(name: "displayFragment") else {
+            throw DisplayError.pipeline("Shader functions are unavailable.")
+        }
+        let pipelineDescriptor = MTLRenderPipelineDescriptor()
+        pipelineDescriptor.vertexFunction = vertex
+        pipelineDescriptor.fragmentFunction = fragment
+        pipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        let pipeline: any MTLRenderPipelineState
+        do {
+            pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+        } catch {
+            throw DisplayError.pipeline(error.localizedDescription)
+        }
+        let descriptor = MTLTextureDescriptor()
+        descriptor.textureType = .type2D
+        descriptor.pixelFormat = .bgra8Unorm
+        descriptor.usage = .shaderRead
+        descriptor.storageMode = .shared
+        self.device = device
+        self.queue = queue
+        self.pipeline = pipeline
+        self.textureDescriptor = descriptor
+        super.init()
+    }
+
+    /// Binds the supplied frame. For an IOSurface this creates a texture view
+    /// over the surface; for a native frame the GPU texture is sampled as is.
+    /// No pixel data is copied by the CPU in either case.
+    public func present(_ frame: DisplayFrame) throws {
+        switch frame {
+        case .surface(let surfaceFrame):
+            textureDescriptor.width = IOSurfaceGetWidth(surfaceFrame.surface)
+            textureDescriptor.height = IOSurfaceGetHeight(surfaceFrame.surface)
+            guard let texture = device.makeTexture(
+                descriptor: textureDescriptor, iosurface: surfaceFrame.surface, plane: 0
+            ) else {
+                lastError = DisplayError.textureUnavailable.localizedDescription
+                throw DisplayError.textureUnavailable
+            }
+            self.texture = texture
+        case .metal(let metalFrame):
+            self.texture = metalFrame.texture
+        }
+        self.frame = frame
+        lastError = nil
+        let size = frame.pixelSize
+        FrameTimingLog.shared.log(
+            "arrive", seq: frame.sequenceNumber, width: size.width, height: size.height,
+            drawable: view?.drawableSize ?? .zero,
+            fullScreen: view?.window?.styleMask.contains(.fullScreen)
+        )
+        view?.needsDisplay = true
+    }
+
+    /// Drops the current lease and requests a black frame. In-flight GPU work
+    /// retains its own lease until its command buffer completes.
+    public func clear() {
+        frame = nil
+        texture = nil
+        lastError = nil
+        view?.needsDisplay = true
+    }
+
+    /// Copies the currently bound frame into CPU-readable memory. This is a
+    /// diagnostic path (frame dumps); the display path never calls it.
+    public func readback() throws -> FrameSnapshot {
+        guard let texture else {
+            throw DisplayError.textureUnavailable
+        }
+        let width = texture.width
+        let height = texture.height
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: texture.pixelFormat, width: width, height: height, mipmapped: false
+        )
+        descriptor.usage = .shaderRead
+        descriptor.storageMode = .shared
+        guard let destination = device.makeTexture(descriptor: descriptor) else {
+            throw DisplayError.textureUnavailable
+        }
+        guard let commandBuffer = queue.makeCommandBuffer() else {
+            throw DisplayError.commandBufferUnavailable
+        }
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else {
+            throw DisplayError.renderEncoderUnavailable
+        }
+        blit.copy(
+            from: texture, sourceSlice: 0, sourceLevel: 0,
+            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+            sourceSize: MTLSize(width: width, height: height, depth: 1),
+            to: destination, destinationSlice: 0, destinationLevel: 0,
+            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+        )
+        blit.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            throw DisplayError.gpu(error.localizedDescription)
+        }
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        pixels.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            destination.getBytes(
+                base, bytesPerRow: bytesPerRow,
+                from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0
+            )
+        }
+        let swap = texture.pixelFormat == .bgra8Unorm || texture.pixelFormat == .bgra8Unorm_srgb
+        return FrameSnapshot(width: width, height: height, swapRedBlue: swap, pixels: pixels)
+    }
+
+    fileprivate func attach(_ view: MTKView) {
+        precondition(self.view == nil || self.view === view, "A renderer supports one view at a time")
+        self.view = view
+        view.device = device
+        view.colorPixelFormat = .bgra8Unorm
+        view.clearColor = MTLClearColorMake(0, 0, 0, 1)
+        view.isPaused = true
+        view.enableSetNeedsDisplay = true
+        // Diagnostic: BRINEWELL_DISPLAY_SYNC=0 lets presents skip the host
+        // display refresh, separating a vsync stall from a GPU stall.
+        (view.layer as? CAMetalLayer)?.displaySyncEnabled =
+            ProcessInfo.processInfo.environment["BRINEWELL_DISPLAY_SYNC"] != "0"
+        view.delegate = self
+        view.needsDisplay = true
+    }
+
+    fileprivate func detach(_ view: MTKView) {
+        if self.view === view {
+            view.delegate = nil
+            self.view = nil
+        }
+    }
+
+    public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        view.needsDisplay = true
+    }
+
+    public func draw(in view: MTKView) {
+        // A hidden or occluded window may have no drawable; this is not an error.
+        guard let pass = view.currentRenderPassDescriptor,
+              let drawable = view.currentDrawable else { return }
+        guard let commandBuffer = queue.makeCommandBuffer() else {
+            lastError = DisplayError.commandBufferUnavailable.localizedDescription
+            return
+        }
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+            lastError = DisplayError.renderEncoderUnavailable.localizedDescription
+            return
+        }
+        let currentFrame = frame
+        if let currentFrame {
+            let size = currentFrame.pixelSize
+            FrameTimingLog.shared.log(
+                "draw", seq: currentFrame.sequenceNumber, width: size.width, height: size.height,
+                drawable: view.drawableSize,
+                fullScreen: view.window?.styleMask.contains(.fullScreen)
+            )
+        }
+        if let texture, currentFrame != nil {
+            let width = Double(view.drawableSize.width)
+            let height = Double(view.drawableSize.height)
+            let scale = min(width / Double(texture.width), height / Double(texture.height))
+            let displayWidth = Double(texture.width) * scale
+            let displayHeight = Double(texture.height) * scale
+            encoder.setViewport(MTLViewport(
+                originX: (width - displayWidth) / 2,
+                originY: (height - displayHeight) / 2,
+                width: displayWidth, height: displayHeight, znear: 0, zfar: 1
+            ))
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setFragmentTexture(texture, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        }
+        encoder.endEncoding()
+        commandBuffer.present(drawable)
+        commandBuffer.addCompletedHandler { [currentFrame] buffer in
+            // The lease (and the producer's handle) lives at least until the
+            // GPU has finished sampling it; release it as soon as that is true.
+            currentFrame?.finish()
+            if let currentFrame {
+                let size = currentFrame.pixelSize
+                FrameTimingLog.shared.log(
+                    "gpuDone", seq: currentFrame.sequenceNumber,
+                    width: size.width, height: size.height
+                )
+            }
+            withExtendedLifetime(currentFrame) {}
+            if let error = buffer.error {
+                let message = DisplayError.gpu(error.localizedDescription).localizedDescription
+                Task { @MainActor [weak self] in
+                    self?.lastError = message
+                }
+            }
+        }
+        commandBuffer.commit()
+    }
+
+    private static let shaderSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    struct VertexOut { float4 position [[position]]; float2 uv; };
+    vertex VertexOut displayVertex(uint id [[vertex_id]]) {
+        const float2 positions[] = { float2(-1, -1), float2(3, -1), float2(-1, 3) };
+        const float2 uvs[] = { float2(0, 1), float2(2, 1), float2(0, -1) };
+        return { float4(positions[id], 0, 1), uvs[id] };
+    }
+    fragment float4 displayFragment(VertexOut in [[stage_in]], texture2d<float> image [[texture(0)]]) {
+        constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+        return image.sample(s, in.uv);
+    }
+    """
+}
+
+/// A SwiftUI host for a renderer. One renderer must only be hosted by one view.
+public struct IOSurfaceDisplay: NSViewRepresentable {
+    private let renderer: IOSurfaceRenderer
+
+    public init(renderer: IOSurfaceRenderer) {
+        self.renderer = renderer
+    }
+
+    public func makeNSView(context: Context) -> MTKView {
+        let view = MTKView(frame: .zero)
+        renderer.attach(view)
+        return view
+    }
+
+    public func updateNSView(_ view: MTKView, context: Context) {
+        renderer.attach(view)
+    }
+
+    public static func dismantleNSView(_ view: MTKView, coordinator: ()) {
+        (view.delegate as? IOSurfaceRenderer)?.detach(view)
+    }
+}

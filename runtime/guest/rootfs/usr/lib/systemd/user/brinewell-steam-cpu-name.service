@@ -1,0 +1,7 @@
+[Unit]
+Description=Show the host CPU name in Steam Game Mode
+PartOf=steam.service
+After=steam.service
+
+[Service]
+ExecStart=/usr/lib/brinewell/steam-cpu-info --display-model

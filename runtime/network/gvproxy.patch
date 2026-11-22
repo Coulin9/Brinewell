@@ -1,0 +1,198 @@
+diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
+index 710edc2..b13b0c8 100644
+--- a/cmd/gvproxy/config.go
++++ b/cmd/gvproxy/config.go
+@@ -1,6 +1,8 @@
+ package main
+ 
+ import (
++	network "brinewell/network"
++	"encoding/json"
+ 	"errors"
+ 	"flag"
+ 	"fmt"
+@@ -27,6 +29,7 @@ const (
+ 
+ type GvproxyArgs struct {
+ 	config             string
++	outboundConfig     string
+ 	endpoints          arrayFlags
+ 	debug              bool
+ 	mtu                int
+@@ -108,11 +111,32 @@ func GvproxyInit() (*GvproxyConfig, error) {
+ 		}
+ 	}
+ 
+-	// Pass it to the testable function
+-	return GvproxyConfigure(&config, &args, version.String())
++	// Configure the virtual stack before opening any network listeners.
++	configured, err := GvproxyConfigure(&config, &args, version.String())
++	if err != nil {
++		return nil, err
++	}
++	if args.outboundConfig != "" {
++		data, err := os.ReadFile(args.outboundConfig)
++		if err != nil {
++			return nil, fmt.Errorf("read outbound configuration: %w", err)
++		}
++		var outbound network.Config
++		if err := json.Unmarshal(data, &outbound); err != nil {
++			return nil, errors.New("invalid outbound configuration JSON")
++		}
++		dialer, err := network.New(outbound)
++		if err != nil {
++			return nil, fmt.Errorf("outbound configuration: %w", err)
++		}
++		configured.Stack.DialContext = dialer.DialContext
++		configured.Stack.Resolver = dialer.Resolver()
++	}
++	return configured, nil
+ }
+ 
+ func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*GvproxyArgs, error) {
++	flagSet.StringVar(&args.outboundConfig, "outbound-config", "", "Brinewell outbound network configuration file")
+ 	flagSet.StringVar(&args.config, "config", "", "Use configuration file with command line override")
+ 	flagSet.Var(&args.endpoints, "listen", "control endpoint")
+ 	flagSet.BoolVar(&args.debug, "debug", false, "Print debug info")
+diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
+index ae18ada..5fd9996 100644
+--- a/pkg/services/forwarder/tcp.go
++++ b/pkg/services/forwarder/tcp.go
+@@ -17,7 +17,7 @@ import (
+ 
+ const linkLocalSubnet = "169.254.0.0/16"
+ 
+-func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool) *tcp.Forwarder {
++func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, dialContext func(context.Context, string, string) (net.Conn, error)) *tcp.Forwarder {
+ 	return tcp.NewForwarder(s, 0, 10, func(r *tcp.ForwarderRequest) {
+ 		localAddress := r.ID().LocalAddress
+ 
+@@ -26,12 +26,20 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			return
+ 		}
+ 
++		dial := dialContext
++		if dial == nil {
++			dial = (&net.Dialer{}).DialContext
++		}
+ 		natLock.Lock()
+ 		if replaced, ok := nat[localAddress]; ok {
+ 			localAddress = replaced
++			// The host alias is a local service, not Internet egress.
++			if replaced == tcpip.AddrFrom4([4]byte{127, 0, 0, 1}) {
++				dial = (&net.Dialer{}).DialContext
++			}
+ 		}
+ 		natLock.Unlock()
+-		outbound, err := net.Dial("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)))
++		outbound, err := dial(context.Background(), "tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)))
+ 		if err != nil {
+ 			log.Tracef("net.Dial() = %v", err)
+ 			r.Complete(true)
+@@ -42,6 +50,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 		ep, tcpErr := r.CreateEndpoint(&wq)
+ 		r.Complete(false)
+ 		if tcpErr != nil {
++			outbound.Close()
+ 			if _, ok := tcpErr.(*tcpip.ErrConnectionRefused); ok {
+ 				// transient error
+ 				log.Debugf("r.CreateEndpoint() = %v", tcpErr)
+diff --git a/pkg/services/forwarder/udp.go b/pkg/services/forwarder/udp.go
+index 7b00312..b1d13ed 100644
+--- a/pkg/services/forwarder/udp.go
++++ b/pkg/services/forwarder/udp.go
+@@ -1,6 +1,7 @@
+ package forwarder
+ 
+ import (
++	"context"
+ 	"net"
+ 	"strconv"
+ 	"sync"
+@@ -14,7 +15,7 @@ import (
+ 	"gvisor.dev/gvisor/pkg/waiter"
+ )
+ 
+-func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool) *udp.Forwarder {
++func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, dialContext func(context.Context, string, string) (net.Conn, error)) *udp.Forwarder {
+ 	return udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
+ 		localAddress := r.ID().LocalAddress
+ 
+@@ -22,9 +23,17 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			return
+ 		}
+ 
++		dial := dialContext
++		if dial == nil {
++			dial = (&net.Dialer{}).DialContext
++		}
+ 		natLock.Lock()
+ 		if replaced, ok := nat[localAddress]; ok {
+ 			localAddress = replaced
++			// The host alias is a local service, not Internet egress.
++			if replaced == tcpip.AddrFrom4([4]byte{127, 0, 0, 1}) {
++				dial = (&net.Dialer{}).DialContext
++			}
+ 		}
+ 		natLock.Unlock()
+ 
+@@ -41,7 +50,7 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 		}
+ 
+ 		p, _ := NewUDPProxy(&autoStoppingListener{underlying: gonet.NewUDPConn(&wq, ep)}, func() (net.Conn, error) {
+-			return net.Dial("udp", net.JoinHostPort(localAddress.String(), strconv.Itoa(int(r.ID().LocalPort))))
++			return dial(context.Background(), "udp", net.JoinHostPort(localAddress.String(), strconv.Itoa(int(r.ID().LocalPort))))
+ 		})
+ 		go func() {
+ 			p.Run()
+diff --git a/pkg/types/configuration.go b/pkg/types/configuration.go
+index cf56dc3..5bae9bc 100644
+--- a/pkg/types/configuration.go
++++ b/pkg/types/configuration.go
+@@ -1,11 +1,16 @@
+ package types
+ 
+ import (
++	"context"
+ 	"net"
+ 	"regexp"
+ )
+ 
+ type Configuration struct {
++	// Brinewell owns outbound routing; host forwards remain local.
++	DialContext func(context.Context, string, string) (net.Conn, error) `yaml:"-"`
++	Resolver    *net.Resolver                                           `yaml:"-"`
++
+ 	// Print packets on stderr
+ 	Debug bool `yaml:"debug,omitempty"`
+ 
+diff --git a/pkg/virtualnetwork/services.go b/pkg/virtualnetwork/services.go
+index 57c5daf..e474ba9 100644
+--- a/pkg/virtualnetwork/services.go
++++ b/pkg/virtualnetwork/services.go
+@@ -24,9 +24,9 @@ func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap
+ 	var natLock sync.Mutex
+ 	translation := parseNATTable(configuration)
+ 
+-	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess)
++	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess, configuration.DialContext)
+ 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
+-	udpForwarder := forwarder.UDP(s, translation, &natLock, configuration.Ec2MetadataAccess)
++	udpForwarder := forwarder.UDP(s, translation, &natLock, configuration.Ec2MetadataAccess, configuration.DialContext)
+ 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
+ 
+ 	dnsMux, err := dnsServer(configuration, s)
+@@ -77,7 +77,12 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
+ 		return nil, err
+ 	}
+ 
+-	server, err := dns.New(udpConn, tcpLn, configuration.DNS)
++	var server *dns.Server
++	if configuration.Resolver != nil {
++		server, err = dns.NewWithUpstreamResolver(udpConn, tcpLn, configuration.DNS, configuration.Resolver)
++	} else {
++		server, err = dns.New(udpConn, tcpLn, configuration.DNS)
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}

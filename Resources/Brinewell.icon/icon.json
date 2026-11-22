@@ -1,0 +1,141 @@
+{
+  "fill-specializations": [
+    {
+      "value": {
+        "linear-gradient": [
+          "srgb:0.03922,0.24706,0.36078,1.00000",
+          "srgb:0.10196,0.55686,0.61961,1.00000"
+        ],
+        "orientation": {
+          "start": {
+            "x": 0,
+            "y": 0
+          },
+          "stop": {
+            "x": 1,
+            "y": 1
+          }
+        }
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "linear-gradient": [
+          "srgb:0.02353,0.16471,0.23922,1.00000",
+          "srgb:0.06667,0.40784,0.47843,1.00000"
+        ],
+        "orientation": {
+          "start": {
+            "x": 0,
+            "y": 0
+          },
+          "stop": {
+            "x": 1,
+            "y": 1
+          }
+        }
+      }
+    },
+    {
+      "appearance": "tinted",
+      "value": {
+        "solid": "srgb:0.24314,0.37255,0.41961,1.00000"
+      }
+    }
+  ],
+  "groups": [
+    {
+      "name": "核心标记",
+      "blend-mode": "normal",
+      "lighting": "combined",
+      "specular": false,
+      "blur-material": 0,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      },
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.08
+      },
+      "layers": [
+        {
+          "name": "01 圆环",
+          "image-name": "01-ring.svg",
+          "glass": false,
+          "hidden": false,
+          "opacity": 1,
+          "fill-specializations": [
+            {
+              "value": "automatic"
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "srgb:1.00000,1.00000,1.00000,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "srgb:0.95686,0.98039,0.98431,1.00000"
+              }
+            }
+          ]
+        },
+        {
+          "name": "02 落日",
+          "image-name": "02-sun.svg",
+          "glass": false,
+          "hidden": false,
+          "opacity": 1,
+          "fill-specializations": [
+            {
+              "value": "automatic"
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "srgb:1.00000,1.00000,1.00000,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": "automatic"
+            }
+          ]
+        },
+        {
+          "name": "03 海浪",
+          "image-name": "03-waves.svg",
+          "glass": false,
+          "hidden": false,
+          "opacity": 1,
+          "fill-specializations": [
+            {
+              "value": "automatic"
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "srgb:1.00000,1.00000,1.00000,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "srgb:0.95686,0.98039,0.98431,1.00000"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+--- a/src/app/main.cpp
++++ b/src/app/main.cpp
+@@ -10,6 +10,7 @@
+ #include "imgui_impl_glfw.h"
+ #include "imgui_impl_opengl3.h"
+ #include <stdio.h>
++#include <chrono>
+ #include <thread>
+ #include <unistd.h>
+ #include "../overlay.h"
+@@ -400,7 +401,15 @@
+     XChangeProperty(x11_display, x11_window, noFocusAtom, XA_CARDINAL, 32,
+                     PropModeReplace, (unsigned char *)&value, 1);
+     // Main loop
++    // Pace only overlay drawing. msg_read_thread still records every game frame,
++    // independently of this clock, and the last overlay buffer stays visible.
++    using redraw_clock = std::chrono::steady_clock;
++    constexpr auto redraw_interval = std::chrono::nanoseconds(33333334);
++    auto next_redraw = redraw_clock::now();
+     while (!glfwWindowShouldClose(window)){
++        std::this_thread::sleep_until(next_redraw);
++        // Do not catch up with extra redraws after a slow frame or hidden period.
++        next_redraw = redraw_clock::now() + redraw_interval;
+         real_params = get_params();
+         check_keybinds(*real_params);
+         if (!real_params->no_display && new_frame){

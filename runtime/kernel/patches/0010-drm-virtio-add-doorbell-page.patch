@@ -1,0 +1,227 @@
+From: brinewell <brinewell@localhost>
+Subject: [PATCH] drm/virtio: add DOORBELL_CREATE ioctl mapping a per-context
+ MMIO doorbell page
+
+Probes shared-memory region 2 (VIRTIO_GPU_SHM_ID_DOORBELL) and adds
+DRM_VIRTGPU_DOORBELL_CREATE: for a context-initialized file it returns
+an anon-inode fd whose single-page mmap is a non-cached
+io_remap_pfn_range of that context's 64 KiB doorbell slot (slot index
+== vfpriv->ctx_id, the id the host sees).  A 32-bit store of a ring id
+at offset 0 of the mapping traps straight to the VMM, bypassing the
+execbuffer path.
+
+The mapping is deliberately not a GEM object: ioctls that take a bo
+handle run gem_to_virtio_gpu_obj() on it, and a fake object would make
+them read past the allocation (RESOURCE_INFO, the TRANSFER ioctls,
+execbuffer bo lists, COUNTER_WAIT's virtio_gpu_is_vram) and turn the
+values into host commands.  An fd keeps the doorbell out of the GEM
+handle space entirely.
+
+diff -ruN linux-7.2.9/drivers/gpu/drm/virtio/virtgpu_drv.h newtree/drivers/gpu/drm/virtio/virtgpu_drv.h
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h	2026-11-18 22:31:36
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h	2026-11-18 22:32:17
+@@ -287,7 +287,9 @@
+ 	bool has_host_visible;
+ 	bool has_context_init;
+ 	bool has_blob_alignment;
++	bool has_doorbell;
+ 	struct virtio_shm_region host_visible_region;
++	struct virtio_shm_region doorbell_region;
+ 	struct drm_mm host_visible_mm;
+ 
+ 	struct work_struct config_changed_work;
+@@ -327,7 +329,7 @@
+ };
+ 
+ /* virtgpu_ioctl.c */
+-#define DRM_VIRTIO_NUM_IOCTLS 13
++#define DRM_VIRTIO_NUM_IOCTLS 14
+ extern struct drm_ioctl_desc virtio_gpu_ioctls[DRM_VIRTIO_NUM_IOCTLS];
+ void virtio_gpu_create_context(struct drm_device *dev, struct drm_file *file);
+ 
+diff -ruN linux-7.2.9/drivers/gpu/drm/virtio/virtgpu_ioctl.c newtree/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+--- a/drivers/gpu/drm/virtio/virtgpu_ioctl.c	2026-11-18 22:31:36
++++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c	2026-11-18 22:41:33
+@@ -25,6 +25,7 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++#include <linux/anon_inodes.h>
+ #include <linux/file.h>
+ #include <linux/io.h>
+ #include <linux/jiffies.h>
+@@ -517,6 +518,89 @@
+ 	return ret;
+ }
+ 
++#define VIRTGPU_DOORBELL_SLOT_SHIFT 16 /* 64 KiB per context id */
++#define VIRTGPU_DOORBELL_MAX_CTX   256
++
++struct virtio_gpu_doorbell {
++	phys_addr_t phys;
++};
++
++static int virtio_gpu_doorbell_mmap(struct file *filp,
++				    struct vm_area_struct *vma)
++{
++	struct virtio_gpu_doorbell *db = filp->private_data;
++	unsigned long size = vma->vm_end - vma->vm_start;
++
++	if (vma->vm_pgoff != 0 || size > PAGE_SIZE)
++		return -EINVAL;
++
++	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
++	vma->vm_page_prot = pgprot_noncached(vm_get_page_prot(vma->vm_flags));
++
++	return io_remap_pfn_range(vma, vma->vm_start,
++				  db->phys >> PAGE_SHIFT, size,
++				  vma->vm_page_prot);
++}
++
++static int virtio_gpu_doorbell_release(struct inode *inode,
++				       struct file *filp)
++{
++	kfree(filp->private_data);
++	return 0;
++}
++
++static const struct file_operations virtio_gpu_doorbell_fops = {
++	.mmap = virtio_gpu_doorbell_mmap,
++	.release = virtio_gpu_doorbell_release,
++	.llseek = noop_llseek,
++};
++
++/*
++ * Hand the calling context its MMIO doorbell slot as an anon-inode fd:
++ * a 32-bit store of a ring id at offset 0 of the mapping traps
++ * straight to the VMM.  An fd (rather than a GEM handle) keeps the
++ * doorbell out of every ioctl that runs gem_to_virtio_gpu_obj() on a
++ * handle.  The slot index is the context id the host sees
++ * (vfpriv->ctx_id is what CONTEXT_CREATE reported).
++ */
++static int virtio_gpu_doorbell_create_ioctl(struct drm_device *dev,
++					    void *data,
++					    struct drm_file *file)
++{
++	struct virtio_gpu_device *vgdev = dev->dev_private;
++	struct virtio_gpu_fpriv *vfpriv = file->driver_priv;
++	struct drm_virtgpu_doorbell_create *args = data;
++	struct virtio_gpu_doorbell *db;
++
++	if (!vgdev->has_doorbell)
++		return -ENODEV;
++
++	db = kzalloc(sizeof(*db), GFP_KERNEL);
++	if (!db)
++		return -ENOMEM;
++
++	mutex_lock(&vfpriv->context_lock);
++	if (!vfpriv->context_created ||
++	    vfpriv->ctx_id >= VIRTGPU_DOORBELL_MAX_CTX) {
++		mutex_unlock(&vfpriv->context_lock);
++		kfree(db);
++		return -EINVAL;
++	}
++	db->phys = vgdev->doorbell_region.addr +
++		   ((phys_addr_t)vfpriv->ctx_id << VIRTGPU_DOORBELL_SLOT_SHIFT);
++	mutex_unlock(&vfpriv->context_lock);
++
++	args->fd = anon_inode_getfd("virtgpu-doorbell",
++				    &virtio_gpu_doorbell_fops,
++				    db, O_RDWR | O_CLOEXEC);
++	if (args->fd < 0) {
++		kfree(db);
++		return args->fd;
++	}
++
++	return 0;
++}
++
+ static int virtio_gpu_get_caps_ioctl(struct drm_device *dev,
+ 				void *data, struct drm_file *file)
+ {
+@@ -892,5 +976,9 @@
+ 			  DRM_RENDER_ALLOW),
+ 
+ 	DRM_IOCTL_DEF_DRV(VIRTGPU_COUNTER_WAIT, virtio_gpu_counter_wait_ioctl,
++			  DRM_RENDER_ALLOW),
++
++	DRM_IOCTL_DEF_DRV(VIRTGPU_DOORBELL_CREATE,
++			  virtio_gpu_doorbell_create_ioctl,
+ 			  DRM_RENDER_ALLOW),
+ };
+diff -ruN linux-7.2.9/drivers/gpu/drm/virtio/virtgpu_kms.c newtree/drivers/gpu/drm/virtio/virtgpu_kms.c
+--- a/drivers/gpu/drm/virtio/virtgpu_kms.c	2026-11-18 22:31:36
++++ b/drivers/gpu/drm/virtio/virtgpu_kms.c	2026-11-18 22:32:17
+@@ -200,6 +200,14 @@
+ 			    (unsigned long)vgdev->host_visible_region.len);
+ 	}
+ 
++	if (virtio_get_shm_region(vgdev->vdev, &vgdev->doorbell_region,
++				  VIRTIO_GPU_SHM_ID_DOORBELL)) {
++		DRM_INFO("MMIO doorbell window: 0x%lx +0x%lx\n",
++			 (unsigned long)vgdev->doorbell_region.addr,
++			 (unsigned long)vgdev->doorbell_region.len);
++		vgdev->has_doorbell = true;
++	}
++
+ 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CONTEXT_INIT))
+ 		vgdev->has_context_init = true;
+ 
+diff -ruN linux-7.2.9/include/uapi/drm/virtgpu_drm.h newtree/include/uapi/drm/virtgpu_drm.h
+--- a/include/uapi/drm/virtgpu_drm.h	2026-11-18 22:31:36
++++ b/include/uapi/drm/virtgpu_drm.h	2026-11-18 22:32:40
+@@ -49,6 +49,7 @@
+ #define DRM_VIRTGPU_RESOURCE_CREATE_BLOB 0x0a
+ #define DRM_VIRTGPU_CONTEXT_INIT 0x0b
+ #define DRM_VIRTGPU_COUNTER_WAIT 0x0c
++#define DRM_VIRTGPU_DOORBELL_CREATE 0x0d
+ 
+ #define VIRTGPU_EXECBUF_FENCE_FD_IN	0x01
+ #define VIRTGPU_EXECBUF_FENCE_FD_OUT	0x02
+@@ -232,6 +233,17 @@
+  */
+ #define VIRTGPU_EVENT_FENCE_SIGNALED 0x90000000
+ 
++/* Returns an fd (not a GEM handle) whose single-page mmap at offset 0
++ * maps the MMIO doorbell slot for the calling context (non-cached PFN
++ * mapping; a 32-bit store of a ring id traps straight to the VMM).
++ * The fd may be closed once mapped.  Requires an initialized context;
++ * unsupported when the device has no doorbell region (-ENODEV) or the
++ * context id exceeds the slot count (-EINVAL). */
++struct drm_virtgpu_doorbell_create {
++	__s32 fd;
++	__u32 pad;
++};
++
+ /* Wait until a 64-bit counter inside a mappable host-visible blob
+  * reaches a value.  The blob must have been created with
+  * VIRTGPU_BLOB_FLAG_USE_MAPPABLE; the kernel memremaps the host-visible
+@@ -294,6 +306,10 @@
+ #define DRM_IOCTL_VIRTGPU_COUNTER_WAIT					\
+ 	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_COUNTER_WAIT,	\
+ 		struct drm_virtgpu_counter_wait)
++
++#define DRM_IOCTL_VIRTGPU_DOORBELL_CREATE				\
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_DOORBELL_CREATE,	\
++		struct drm_virtgpu_doorbell_create)
+ 
+ #if defined(__cplusplus)
+ }
+diff -ruN linux-7.2.9/include/uapi/linux/virtio_gpu.h newtree/include/uapi/linux/virtio_gpu.h
+--- a/include/uapi/linux/virtio_gpu.h	2026-10-03 18:43:16
++++ b/include/uapi/linux/virtio_gpu.h	2026-11-18 22:32:17
+@@ -132,7 +132,12 @@
+ 	 * VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB
+ 	 * VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB
+ 	 */
+-	VIRTIO_GPU_SHM_ID_HOST_VISIBLE = 1
++	VIRTIO_GPU_SHM_ID_HOST_VISIBLE = 1,
++	/*
++	 * MMIO doorbell slots: one 64 KiB slot per context id; guest
++	 * writes trap to the VMM instead of touching memory.
++	 */
++	VIRTIO_GPU_SHM_ID_DOORBELL = 2
+ };
+ 
+ #define VIRTIO_GPU_FLAG_FENCE         (1 << 0)

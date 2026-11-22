@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""pressure-vessel bwrap delegate applying the selected Brinewell graphics backend.
+
+steam-gfx-env sets PRESSURE_VESSEL_BWRAP to this script as a per-launch default
+only when the inherited/user configuration does not already name a delegate.
+The recognized game boundary is `--args FD pv-adverb ... -- [FEXCompatTool]
+<tool>/proton <verb> ...`: bwrap's parse_args_recurse continues the outer argv
+after the nested argfile list, so injected options go between `--args FD` and
+the pv-adverb tail; the original argv and fd are never read or rewritten. Any
+launch that is not a validated Proton game under an exact STEAM_COMPAT_TOOL_PATHS
+tool root executes the delegate with byte-identical arguments.
+"""
+
+import array
+import fcntl
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import brinewell_graphics as graphics
+
+PAYLOAD = graphics.PAYLOAD
+CONTAINER_PAYLOAD = graphics.CONTAINER_PAYLOAD
+# Opt-in development payload with the same layout as PAYLOAD; used instead of
+# the packaged payload when it contains payload.json (fast iteration).
+DEV_PAYLOAD = Path.home() / ".local/share/brinewell/neptune-dev"
+GRAPHICS_DLLS = graphics.GRAPHICS_DLLS
+SRT_BWRAP_REL = "libexec/steam-runtime-tools-0/srt-bwrap"
+
+
+def _log(message):
+    print(f"brinewell-graphics-wrap: {message}", file=sys.stderr)
+
+
+def _mode():
+    try:
+        mode = Path("/run/brinewell/graphics-backend").read_text().strip()
+        if mode in ("venus", "neptune", "mullion"):
+            return mode
+    except OSError:
+        pass
+    return "venus"
+
+
+def _backend(mode):
+    """neptune = D3DMetal; mullion carries its own backend name."""
+    return "mullion" if mode == "mullion" else "d3dmetal"
+
+
+def _slr_srt_bwrap(root):
+    candidate = Path(root) / "pressure-vessel-arm64" / SRT_BWRAP_REL
+    return str(candidate) if candidate.is_file() else None
+
+
+def _cmdline_words(pid):
+    try:
+        data = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [w.decode("utf-8", "surrogateescape") for w in data.split(b"\0") if w]
+
+
+def _delegate(exe=None):
+    """The trusted srt-bwrap of the actual invoking Steam Linux Runtime.
+
+    exe is the resolved /proc/<ppid>/exe (a parameter only for tests). The
+    delegate is always found inside a real SLR installation; argv-provided
+    paths are never trusted.
+    """
+    if exe is None:
+        try:
+            exe = Path(f"/proc/{os.getppid()}/exe").resolve()
+        except OSError:
+            return None
+    else:
+        exe = Path(exe).resolve()
+    pv_like = exe.name == "pressure-vessel-wrap"
+    if pv_like:
+        # <SLR>/pressure-vessel-arm64/bin/pressure-vessel-wrap -> sibling libexec
+        found = exe.parents[1] / SRT_BWRAP_REL
+        if found.is_file():
+            return str(found)
+    else:
+        # Intermediary (e.g. the FEX python entry): the SLR is the tool root
+        # named in the caller's own cmdline, validated against TOOL_PATHS.
+        tools = {Path(os.path.realpath(t))
+                 for t in os.environ.get("STEAM_COMPAT_TOOL_PATHS", "").split(":") if t}
+        for word in _cmdline_words(os.getppid()):
+            if Path(word).name != "_v2-entry-point":
+                continue
+            root = Path(os.path.realpath(word)).parent
+            if root not in tools:
+                continue
+            found = _slr_srt_bwrap(root)
+            if found:
+                return found
+        # Ordinary probe/unrecognized caller: any validated SLR's delegate.
+        for root in sorted(tools):
+            found = _slr_srt_bwrap(root)
+            if found:
+                return found
+    if pv_like:
+        # A real game launch must not silently switch to a different bwrap.
+        return None
+    distro = Path("/usr/bin/bwrap")
+    if distro.is_file():
+        return str(distro)
+    return None
+
+
+EXT2_IOC_GETFLAGS = 0x80086601
+EXT2_IOC_SETFLAGS = 0x40086602
+EXT4_CASEFOLD_FL = 0x40000000
+
+
+def _set_casefold(path):
+    """Best-effort EXT4_CASEFOLD_FL on a just-created empty directory,
+    mirroring Proton's set_dir_casefold_bit (all errors ignored)."""
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        flags = array.array("I", [0])
+        fcntl.ioctl(fd, EXT2_IOC_GETFLAGS, flags, True)
+        flags[0] |= EXT4_CASEFOLD_FL
+        fcntl.ioctl(fd, EXT2_IOC_SETFLAGS, flags)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _payload():
+    """(root, container_root, extra_binds) for the active Neptune payload.
+
+    The dev payload is bound at its own path so it is visible inside the
+    container whether or not the home directory is shared.
+    """
+    if (DEV_PAYLOAD / "payload.json").is_file():
+        return DEV_PAYLOAD, DEV_PAYLOAD, \
+            ["--ro-bind", str(DEV_PAYLOAD), str(DEV_PAYLOAD)]
+    return PAYLOAD, CONTAINER_PAYLOAD, []
+
+
+def _ensure_prefix_nptunix(compat, arch, root):
+    """Keep <compat>/pfx/drive_c/windows/system32/nptunix.dll byte-identical
+    to the payload copy. Wine only loads a builtin that also has a file inside
+    the prefix, so nptunix=b fails (c0000135) without it. On a prefix Proton
+    has not created yet the directory chain is made here (Proton's copy_pfx
+    tolerates pre-existing dirs and files). False means the prefix could not
+    be made safe and Neptune must not be injected.
+    """
+    node = Path(compat)
+    if not node.is_dir():
+        _log(f"compatdata {compat} is not a directory: passing through")
+        return False
+    try:
+        for name in ("pfx", "drive_c", "windows", "system32"):
+            node = node / name
+            if node.is_symlink():
+                _log(f"prefix component {node} is a symlink: passing through")
+                return False
+            if not node.exists():
+                os.mkdir(node, 0o755)
+                if name == "drive_c":
+                    # Proton sets casefold right after creating drive_c; it
+                    # only works on an empty directory, so do it now.
+                    _set_casefold(node)
+            elif not node.is_dir():
+                _log(f"prefix component {node} is not a directory: passing through")
+                return False
+    except OSError as error:
+        _log(f"cannot create prefix dirs under {compat}: {error}")
+        return False
+    system32 = node
+    try:
+        payload = (root / f"{arch}-windows/nptunix.dll").read_bytes()
+        target = system32 / "nptunix.dll"
+        if not target.is_symlink() and target.is_file() \
+                and target.read_bytes() == payload:
+            return True
+        fd, temp = tempfile.mkstemp(dir=system32)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+            os.chmod(temp, 0o755)
+            # os.replace renames over any existing entry, symlink included.
+            os.replace(temp, target)
+        except BaseException:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            raise
+        return True
+    except OSError as error:
+        _log(f"cannot sync prefix nptunix.dll under {compat}: {error}")
+        return False
+
+
+def _injection(mode, cmd, env):
+    """Extra bwrap options for a recognized Proton game launch, else []."""
+    info = graphics.proton_invocation(cmd, env)
+    if not info:
+        return []
+    tool, _ = info
+    if graphics.graphics_overridden(env):
+        return []
+    fex = Path(cmd[0]).name == "FEXCompatTool"
+    arch = graphics.select_arch(tool, env, fex)
+    inject = []
+    if mode not in ("neptune", "mullion"):
+        return inject
+    backend = _backend(mode)
+    if arch is None or (backend == "d3dmetal" and arch != "x86_64"):
+        return inject
+    root, container_root, extra_binds = _payload()
+    if root != PAYLOAD:
+        _log(f"using dev Neptune payload {root}")
+    bridge = root / "bridge" / arch
+    # A missing payload is a broken install, not an unsafe launch.
+    if not (bridge.joinpath("nptunix.dll").is_file()
+            and bridge.joinpath("nptunix.so").is_file()):
+        return inject
+    providers = {"d3d11": "dxvk", "dxgi": "dxvk", "d3d12": "vkd3d-proton"}
+    binds = []
+    unsafe = False
+    for name in GRAPHICS_DLLS:
+        source = root / f"{arch}-windows" / f"{name}.dll"
+        dll_dir = tool / "files/lib/wine" / providers[name] / f"{arch}-windows"
+        target = dll_dir / f"{name}.dll"
+        if not (source.is_file() and dll_dir.is_dir() and target.is_file()):
+            return inject
+        if Path(os.path.realpath(dll_dir)) != Path(os.path.abspath(dll_dir)):
+            unsafe = True
+            break
+        target_real = Path(os.path.realpath(target))
+        if target_real != Path(os.path.abspath(target)) and \
+                not str(target_real).startswith(str(tool) + "/"):
+            unsafe = True
+            break
+        binds += ["--ro-bind", str(source), str(target)]
+    if unsafe:
+        _log(f"unsafe bind target under {tool}: passing through")
+        return []
+    if not _ensure_prefix_nptunix(env["STEAM_COMPAT_DATA_PATH"], arch, root):
+        return inject
+    inject += extra_binds + binds
+    dll_path = env.get("WINEDLLPATH")
+    dll_path = f"{container_root}/bridge/{arch}" + (":" + dll_path if dll_path else "")
+    inject += ["--setenv", "WINEDLLPATH", dll_path]
+    overrides = env.get("WINEDLLOVERRIDES", "")
+    native = ";".join(f"{name}=n" for name in GRAPHICS_DLLS)
+    merged = ";".join(part for part in (overrides, native, "nptunix=b") if part)
+    inject += ["--setenv", "WINEDLLOVERRIDES", merged]
+    perf = graphics.npt_perf(env.get("NPT_PERF"))
+    if perf is not None:
+        inject += ["--setenv", "NPT_PERF", perf]
+    inject += ["--setenv", "BRINEWELL_NEPTUNE_BACKEND", backend]
+    return inject
+
+
+def main(argv):
+    delegate = _delegate()
+    if delegate is None:
+        print('brinewell: could not locate bubblewrap', file=sys.stderr)
+        return 126
+    extra = []
+    if (len(argv) > 4 and argv[0] == '--args' and argv[1].isdecimal()
+            and Path(argv[2]).name == 'pv-adverb' and '--' in argv[3:]):
+        command = argv[argv.index('--', 3) + 1:]
+        extra = _injection(_mode(), command, os.environ)
+    args = argv[:2] + extra + argv[2:] if extra else argv
+    os.execv(delegate, [delegate, *args])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

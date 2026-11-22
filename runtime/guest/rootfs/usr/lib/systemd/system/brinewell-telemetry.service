@@ -1,0 +1,14 @@
+[Unit]
+Description=Brinewell hardware telemetry
+ConditionPathExists=/dev/virtio-ports/fx.telemetry
+
+[Service]
+ExecStart=/usr/bin/brinewell-agent telemetry
+RuntimeDirectory=power-monitor/power brinewell-telemetry
+Restart=on-failure
+RestartSec=2
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateNetwork=yes

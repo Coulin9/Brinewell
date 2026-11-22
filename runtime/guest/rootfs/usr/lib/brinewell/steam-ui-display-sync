@@ -1,0 +1,48 @@
+#!/usr/bin/python3
+"""Let the Steam UI follow gamescope's native output instead of its 1920px cap.
+
+Runs before steam.service starts, while Steam does not own config.vdf. Gamescope
+already resizes Xwayland server 0 when its DRM output changes. Enabling Steam's
+native-external-resolution setting lets that size survive Steam's own display
+policy. Game resolution overrides and UI scale preferences are independent.
+"""
+from pathlib import Path
+import sys
+
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).parent))
+import brinewell_vdf as vdf
+
+SETTING = ("InstallConfigStore", "Gamescope", "EnableSteamNativeExternalResolution")
+EMPTY = '"InstallConfigStore"\n{\n}\n'
+
+
+def enable_native_resolution(text):
+    values, _, _ = vdf.vdf_entries(text)
+    current = values.get(tuple(part.lower() for part in SETTING))
+    if current is not None and current[0] == "1":
+        return text
+    return vdf.vdf_set(text, SETTING, "1")
+
+
+def configure(config):
+    text = config.read_text() if config.exists() else EMPTY
+    changed = enable_native_resolution(text)
+    if changed != text:
+        vdf.atomic_write(config, changed)
+    return changed != text
+
+
+def main():
+    changed = configure(Path.home() / ".local/share/Steam/config/config.vdf")
+    action = "enabled" if changed else "already enabled"
+    print("steam-ui-display-sync: native Steam UI resolution " + action, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        print("steam-ui-display-sync: leaving config.vdf: " + str(error), file=sys.stderr)
+        sys.exit(1)

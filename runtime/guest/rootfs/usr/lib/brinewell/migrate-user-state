@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Rename persisted AppleDeck user state to its Brinewell paths (idempotent).
+
+Disks written before the AppleDeck->Brinewell rename keep the old names in the
+user's home. The AppleDeck-era writers used fixed $HOME paths
+(~/.config/appledeck, ~/.local/share/appledeck, the Steam marker files) plus
+two XDG lookups (steam-fex-eac under XDG_STATE_HOME, the generated WirePlumber
+drop-in under XDG_CONFIG_HOME); the Brinewell readers use the same fixed
+locations, so both the fixed paths and the XDG paths are migrated.
+
+Runs once per boot from brinewell-migrate-user-state.service, ordered (Wants +
+After, so a failure cannot brick the session) before every consumer:
+steam.service, wireplumber.service, brinewell-progress.service (whose agent
+drives desktop-keyboard) and brinewell-nested-desktop.service (Desktop Mode
+runs mac-clock-format directly). Each entry is renamed only when the new name
+is absent; when both exist both are kept (a human resolves them).
+
+Dev payload invariant: a neptune-dev payload installed by an AppleDeck release
+must never become the active payload of the new release. Payloads are
+quarantined INSIDE the legacy directory before the parent rename, so an
+interruption can never leave a live legacy payload under brinewell/. Before
+quarantining, each payload directory is marked (.appledeck-legacy); on every
+run a live payload under brinewell/ carrying that marker (e.g. one whose
+quarantine was interrupted after the parent had already been renamed) is
+quarantined too, while a genuine new push without the marker stays active.
+"""
+import os
+from pathlib import Path
+import sys
+
+# Dropped into a dev payload found under the legacy data directory before its
+# quarantine: durable proof that the payload is migrated-legacy, wherever the
+# directory sits afterwards.
+LEGACY_PAYLOAD_MARK = ".appledeck-legacy"
+
+
+def _log(message):
+    print(f"migrate-user-state: {message}", file=sys.stderr)
+
+
+def _move(old, new):
+    """old -> new when new is absent; returns True when old is gone."""
+    if not old.exists() and not old.is_symlink():
+        return False
+    if new.exists() or new.is_symlink():
+        _log(f"keeping both {old} and {new}; remove one to finish migrating")
+        return False
+    try:
+        old.rename(new)
+    except OSError as error:
+        _log(f"cannot rename {old} to {new}: {error}")
+        return False
+    _log(f"moved {old} -> {new}")
+    return True
+
+
+def _quarantine_dev_payloads(directory, only_marked=False):
+    """Quarantine live dev payloads in <directory> to a unique disabled name.
+
+    With only_marked=False every live neptune-dev/neptune-dev.new is first
+    marked as legacy and then renamed; with only_marked=True only payloads
+    already carrying the mark are renamed (a payload freshly pushed by this
+    release keeps working). Returns True only when nothing that had to be
+    quarantined is still live in <directory>; the caller must not rename the
+    parent directory while a live payload remains inside it.
+    """
+    clean = True
+    for name in ("neptune-dev", "neptune-dev.new"):
+        dev = directory / name
+        if not dev.exists() and not dev.is_symlink():
+            continue
+        if only_marked and not (dev / LEGACY_PAYLOAD_MARK).exists():
+            continue
+        if not only_marked:
+            try:
+                (dev / LEGACY_PAYLOAD_MARK).touch()
+            except OSError as error:
+                _log(f"cannot mark legacy payload {dev}: {error}")
+                clean = False
+        target = dev.with_name(name + ".legacy-disabled")
+        counter = 1
+        while target.exists() or target.is_symlink():
+            target = dev.with_name(f"{name}.legacy-disabled.{counter}")
+            counter += 1
+        if not _move(dev, target):
+            clean = False
+    return clean
+
+
+def _migrate_data_dir(base):
+    """base/appledeck -> base/brinewell, with dev-payload quarantine first."""
+    # Rename the parent only once no live payload remains inside it: renaming
+    # over an unquarantined neptune-dev would activate the legacy payload
+    # under brinewell/.
+    clean = _quarantine_dev_payloads(base / "appledeck")
+    if clean and _move(base / "appledeck", base / "brinewell"):
+        # The parent was just renamed; anything still live inside came from the
+        # legacy directory by definition, so it is quarantined as well.
+        _quarantine_dev_payloads(base / "brinewell")
+    else:
+        if not clean:
+            _log(f"keeping {base / 'appledeck'}: a live dev payload could not be quarantined")
+        # brinewell/ already existed or the rename failed: only payloads proven
+        # to be migrated-legacy by their mark are quarantined.
+        _quarantine_dev_payloads(base / "brinewell", only_marked=True)
+
+
+def _disable_generated_wireplumber(config_dir):
+    # The generated WirePlumber file kept its .conf name: move it out of the
+    # drop-in search path so audio-layout can regenerate 99-brinewell-audio.conf.
+    # A file not carrying the generator's header is a user file and stays.
+    legacy = config_dir / "wireplumber/wireplumber.conf.d/99-appledeck-audio.conf"
+    if legacy.is_file() and not legacy.is_symlink():
+        try:
+            generated = legacy.read_text().startswith(
+                "# Generated by appledeck audio-layout")
+        except OSError:
+            generated = False
+        if generated:
+            _move(legacy, legacy.with_name(legacy.name + ".legacy-disabled"))
+
+
+def migrate(home, config_home, data_home, state_home):
+    # Fixed paths the AppleDeck-era writers used, plus the XDG variants used by
+    # audio-layout (XDG_CONFIG_HOME) and steam-fex-eac (XDG_STATE_HOME).
+    for base in dict.fromkeys((home / ".config", config_home)):
+        _move(base / "appledeck", base / "brinewell")
+        _disable_generated_wireplumber(base)
+    for base in dict.fromkeys((home / ".local/state", state_home)):
+        _move(base / "appledeck", base / "brinewell")
+    for base in dict.fromkeys((home / ".local/share", data_home)):
+        _migrate_data_dir(base)
+
+    steam_config = home / ".local/share/Steam/config"
+    _move(steam_config / "appledeck-shader-defaults",
+          steam_config / "brinewell-shader-defaults")
+    _move(steam_config / "appledeck-idle-screensaver",
+          steam_config / "brinewell-idle-screensaver")
+
+
+def main():
+    home = Path.home()
+    migrate(home,
+            Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config"),
+            Path(os.environ.get("XDG_DATA_HOME") or home / ".local/share"),
+            Path(os.environ.get("XDG_STATE_HOME") or home / ".local/state"))
+
+
+if __name__ == "__main__":
+    main()

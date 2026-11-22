@@ -1,0 +1,18 @@
+[Unit]
+Description=Brinewell progress reporter
+PartOf=gamescope-session.target plasma-session.target
+After=gamescope-session.service
+# The agent drives the desktop-keyboard/clock helpers, which read the migrated
+# ~/.config/brinewell state; in a desktop session Steam may never run first.
+# Wants (not Requires): a failed migration must not keep the agent down.
+Wants=brinewell-migrate-user-state.service
+After=brinewell-migrate-user-state.service
+
+[Service]
+Type=simple
+Slice=session.slice
+ExecStart=/usr/bin/brinewell-agent
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=3
+Nice=5

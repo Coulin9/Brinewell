@@ -1,0 +1,28 @@
+Third-party components bundled by Brinewell
+
+gvproxy v0.8.9 (built from source with Brinewell network changes) - Apache-2.0 - https://github.com/containers/gvisor-tap-vsock
+macmon v0.11.0 - MIT - https://github.com/vladkens/macmon
+  See macmon-MIT.txt.
+MangoApp from MangoHud v0.8.4 - MIT - https://github.com/flightlessmango/MangoHud
+  See /usr/share/licenses/brinewell-mangoapp/LICENSE in the guest layer.
+FEX FEX-2611.1 - MIT - https://github.com/FEX-Emu/FEX
+  Dedicated UU runtime, with private curl, iproute2, nftables, iptables and dependencies.
+  See /usr/share/licenses/brinewell-uu-runtime/ in the guest layer for licenses and package versions.
+  The UU plugin itself is downloaded from NetEase on installation and is not bundled.
+FEX eac-2610.5 (StonkGuy/FEX, FEX-2610 with Easy Anti-Cheat fidelity patches) - MIT - https://github.com/StonkGuy/FEX/tree/eac-2610
+  Installed into Steam's FEX-Emu compatibility tool in the guest.
+  See /usr/share/licenses/brinewell-fex-eac/ in the guest layer for licenses.
+MoltenVK 1.4.2 - Apache-2.0 - https://github.com/KhronosGroup/MoltenVK
+Native full-screen camera-area integration, adapted from UTM - Apache-2.0 - https://github.com/utmapp/UTM
+  Copyright 2026 Turing Software, LLC. See UTM-Apache-2.0.txt.
+libepoxy 1.5.10 - MIT - https://github.com/anholt/libepoxy
+Mullion, based on DXMT - LGPL-2.1-or-later - https://github.com/dttdrv/mullion
+  See mullion/Mullion.txt, mullion/dxmt.txt, and mullion/dxmt-mit.txt.
+LLVM 15.0.7 (linked into Mullion) - Apache-2.0 WITH LLVM-exception - https://github.com/llvm/llvm-project
+  See mullion/LLVM.txt.
+busybox-static 1.37.0 - GPL-2.0 - https://busybox.net/
+dosfstools 4.2 - GPL-3.0-or-later - https://github.com/dosfstools/dosfstools
+e2fsprogs 1.47.2 - GPL-2.0 - https://e2fsprogs.sourceforge.net/
+btrfs-progs 6.14 - GPL-2.0 - https://btrfs.readthedocs.io/
+Mesa / virglrenderer / libkrun sources are built from their repositories.
+KosmicKrisp is built from upstream Mesa 26.3 commit ce576c29ed; SPIRV-Tools is bundled with it.

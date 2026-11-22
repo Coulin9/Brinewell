@@ -1,0 +1,12 @@
+[Unit]
+Description=Brinewell Gamescope clipboard
+PartOf=gamescope-session.target
+BindsTo=gamescope-session.service
+# gamescope-onready imports DISPLAY and STEAM_GAME_DISPLAY_0 before notifying readiness.
+After=gamescope-session.service
+ConditionPathExists=/dev/virtio-ports/fx.clipboard
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/brinewell/brinewell-clipboard --gamescope
+Slice=session.slice

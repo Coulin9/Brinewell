@@ -1,0 +1,13 @@
+[Unit]
+Description=Brinewell graphics backend control (fx.graphics)
+ConditionPathExists=/dev/virtio-ports/fx.graphics
+
+[Service]
+ExecStartPre=-/usr/lib/brinewell/steam-graphics-seed
+ExecStart=/usr/lib/brinewell/steam-graphics-control
+Restart=always
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

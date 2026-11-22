@@ -1,0 +1,31 @@
+[Unit]
+Description=UU accelerator plugin managed by Brinewell
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=HOME=/home/uu/uu
+Environment=XDG_DATA_HOME=/home/uu/uu/data
+Environment=XDG_CONFIG_HOME=/home/uu/uu/config
+Environment=STEAM_COMPAT_DATA_PATH=/home/uu/uu/compat
+Environment=FEX_APP_CONFIG_LOCATION=/home/uu/uu/config
+Environment=FEX_ROOTFS=/
+Environment=FEX_SERVERSOCKETPATH=brinewell-uu
+Environment=FEX_DISABLETELEMETRY=1
+Environment=PATH=/usr/lib/brinewell/uu-runtime/bin:/usr/bin:/usr/sbin:/bin:/sbin
+Environment=LD_LIBRARY_PATH=/usr/lib/brinewell/uu-runtime/lib
+Environment=XTABLES_LIBDIR=/run/brinewell-uu-xtables
+Environment=CURL_CA_BUNDLE=/usr/lib/brinewell/uu-runtime/ca-certificates.crt
+ExecStart=/usr/lib/brinewell/uu-launch
+ExecStop=/usr/lib/brinewell/uu-stop ${MAINPID}
+TimeoutStopSec=60
+KillMode=control-group
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

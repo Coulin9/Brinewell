@@ -1,0 +1,12 @@
+[Unit]
+Description=Brinewell UU installer control
+ConditionPathExists=/dev/virtio-ports/fx.uu
+After=local-fs.target uuplugin.service
+RequiresMountsFor=/home /var/log
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/brinewell/uu-control
+Restart=on-failure
+RestartSec=2
+UMask=0077

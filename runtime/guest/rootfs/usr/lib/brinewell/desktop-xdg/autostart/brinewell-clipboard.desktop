@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Brinewell Clipboard
+Exec=/usr/lib/brinewell/brinewell-clipboard
+Terminal=false
+Type=Application
+OnlyShowIn=KDE;

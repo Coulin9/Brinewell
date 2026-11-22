@@ -1,0 +1,90 @@
+--- a/src/app/main.cpp
++++ b/src/app/main.cpp
+@@ -166,6 +166,16 @@
+     HUDElements.gamescope_debug_latency.push_back(latency_ms);
+     if (HUDElements.gamescope_debug_latency.size() > 200)
+         HUDElements.gamescope_debug_latency.erase(HUDElements.gamescope_debug_latency.begin());
++}
++
++static EngineTypes steam_engine_type(const std::string& name) {
++    if (name == "DXVK") return DXVK;
++    if (name == "vkd3d") return VKD3D;
++    if (name == "mesa zink") return ZINK;
++    if (name == "Damavand") return DAMAVAND;
++    if (name == "Feral3D") return FERAL3D;
++    if (name == "gamescope") return GAMESCOPE;
++    return VULKAN;
+ }
+ 
+ static void msg_read_thread(){
+@@ -220,6 +230,14 @@
+ 
+                     if (msg_size > offsetof(mangoapp_msg_v1, latency_ns))
+                         gamescope_frametime(mangoapp_v1->app_frametime_ns, mangoapp_v1->latency_ns);
++
++                    // msgrcv reports bytes after msg_type. Older senders end at outputHeight.
++                    if (!steam_focused && msg_size >= sizeof(*mangoapp_v1) - sizeof(hdr->msg_type)) {
++                        const auto& engine = mangoapp_v1->engineName;
++                        sw_stats.engine = steam_engine_type(std::string(engine, strnlen(engine, sizeof(engine))));
++                    } else if (!steam_focused) {
++                        sw_stats.engine = GAMESCOPE;
++                    }
+ 
+                     if (should_new_frame)
+                     {
+--- a/src/app/mangoapp_proto.h
++++ b/src/app/mangoapp_proto.h
+@@ -17,6 +17,10 @@
+     uint64_t latency_ns;
+     uint32_t outputWidth;
+     uint32_t outputHeight;
++    // Optional fields appended by the SteamOS Gamescope sender.
++    uint16_t displayRefresh;
++    uint8_t flags;
++    char engineName[40];
+     // WARNING: Always ADD fields, never remove or repurpose fields
+ } __attribute__((packed));
+ 
+--- a/src/overlay_params.cpp
++++ b/src/overlay_params.cpp
+@@ -23,6 +23,7 @@
+ #include <vulkan/vulkan_core.h>
+ 
+ #include "overlay_params.h"
++#include "brinewell_telemetry.h"
+ #include "overlay.h"
+ #include "config.h"
+ #include "string_utils.h"
+@@ -1330,6 +1331,8 @@
+          add_to_options(params, "cpu_power", "1");
+          add_to_options(params, "battery_watt", "1");
+          add_to_options(params, "battery_time", "1");
++         if (BrinewellTelemetry::enabled())
++            add_to_options(params, "debug", "0");
+          break;
+ 
+       case 3:
+@@ -1371,13 +1374,20 @@
+          add_to_options(params, "debug", "1");
+          add_to_options(params, "version", "0");
+          add_to_options(params, "frame_timing_detailed", "1");
+-         add_to_options(params, "network", "1");
++         if (BrinewellTelemetry::enabled()) {
++            add_to_options(params, "width", "390");
++            add_to_options(params, "core_load", "1");
++         } else {
++            add_to_options(params, "network", "1");
++         }
+          add_to_options(params, "present_mode", "0");
+          add_to_options(params, "proc_vram", "0");
+          add_to_options(params, "procmem", "0");
+          add_to_options(params, "display_server", "0");
+-         add_to_options(params, "gpu_efficiency", "0");
+-         add_to_options(params, "cpu_efficiency", "0");
++         if (!BrinewellTelemetry::enabled()) {
++            add_to_options(params, "gpu_efficiency", "0");
++            add_to_options(params, "cpu_efficiency", "0");
++         }
+ 
+          // Disable some options if steamdeck / other known handhelds
+          if (!gpus)

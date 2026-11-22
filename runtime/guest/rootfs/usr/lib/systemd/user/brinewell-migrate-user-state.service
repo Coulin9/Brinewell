@@ -1,0 +1,12 @@
+# Rename persisted AppleDeck user state to the Brinewell paths, once per boot,
+# before any helper that consumes those paths runs. Pulled in with Wants= by
+# the consumers (steam.service, wireplumber.service, brinewell-progress.service,
+# brinewell-nested-desktop.service) so a migration failure cannot block the
+# session, while After= still guarantees the rename finished first.
+[Unit]
+Description=Migrate AppleDeck-era user state to Brinewell paths
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/brinewell/migrate-user-state

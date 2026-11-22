@@ -1,0 +1,107 @@
+#!/usr/bin/python3
+"""Supply the host's CPU details to the ARM64 Steam client and its settings page."""
+import asyncio
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+from urllib.parse import parse_qs, urlsplit
+
+
+def host_cpu_info(cmdline):
+    args = dict(word.split("=", 1) for word in cmdline.split() if "=" in word)
+    encoded_model = args.get("brinewell.cpu_model_b64", "")
+    try:
+        model = base64.b64decode(encoded_model, validate=True).decode("utf-8")
+    except ValueError:
+        model = ""
+    if not (model.isprintable() and model.strip() and len(model.encode("utf-8")) <= 127):
+        model = ""
+
+    frequency = args.get("brinewell.cpu_max_mhz", "")
+    if not re.fullmatch(r"[0-9]{1,5}", frequency) or not 1 <= int(frequency) <= 20_000:
+        frequency = ""
+    return model, frequency
+
+
+def atomic_write(path, data):
+    fd, temp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(data)
+        os.replace(temp, path)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+
+
+def configure_frequency(frequency, environment):
+    if frequency:
+        contents = f"CPU_MHZ={frequency}\n".encode("ascii")
+        if not environment.exists() or environment.read_bytes() != contents:
+            atomic_write(environment, contents)
+    else:
+        environment.unlink(missing_ok=True)
+
+
+async def display_model(model):
+    import aiohttp
+
+    script = Path(__file__).with_name("steam-cpu-name.js").read_text(encoding="utf-8")
+    source = f"({script})({json.dumps(model + ' (host)')})"
+    endpoint = "127.0.0.1:8080"
+    timeout = aiohttp.ClientTimeout(total=4)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            try:
+                async with session.get(f"http://{endpoint}/json/list", allow_redirects=False) as response:
+                    response.raise_for_status()
+                    pages = await response.json()
+                target = gamepad_target(pages)
+                if target:
+                    async with session.ws_connect(f"ws://{endpoint}/devtools/page/{target}") as socket:
+                        await socket.send_json({
+                            "id": 1,
+                            "method": "Page.addScriptToEvaluateOnNewDocument",
+                            "params": {"source": source, "runImmediately": True},
+                        })
+                        result = await socket.receive(timeout=4)
+                        if result.type == aiohttp.WSMsgType.TEXT:
+                            error = result.json().get("error")
+                            if error:
+                                raise RuntimeError(f"Steam UI refused the model fallback: {error}")
+                            # Keep the script registered for reloads and reattach after a client update.
+                            async for _ in socket:
+                                pass
+            except (aiohttp.ClientError, TimeoutError):
+                pass
+            await asyncio.sleep(1)
+
+
+def gamepad_target(pages):
+    for page in pages:
+        target = page.get("id", "")
+        if page.get("type") != "page" or not re.fullmatch(r"[0-9A-Fa-f]{32}", target):
+            continue
+        url = urlsplit(page.get("url", ""))
+        if url.scheme != "about" or url.path != "blank":
+            continue
+        options = parse_qs(url.query)
+        if options.get("browserType") == ["4"] and options.get("useragent") == ["Valve Steam Gamepad"]:
+            return target
+    return None
+
+
+if __name__ == "__main__" and os.uname().machine == "aarch64":
+    try:
+        model, frequency = host_cpu_info(Path("/proc/cmdline").read_text())
+        if sys.argv[1:] == ["--display-model"]:
+            if model:
+                asyncio.run(display_model(model))
+        else:
+            configure_frequency(frequency, Path(os.environ["XDG_RUNTIME_DIR"]) / "brinewell-steam-cpu.env")
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"steam-cpu-info: {error}", file=sys.stderr)
+        sys.exit(1)

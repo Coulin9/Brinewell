@@ -1,0 +1,16 @@
+#!/bin/bash
+# brinewell: seed /run/brinewell/graphics-backend from the immutable boot
+# cmdline brinewell.graphics=<mode>. Used only until the first fx.graphics
+# acknowledgement; the kernel cmdline is never the authority for live routing.
+set -u
+install -d -m 755 /run/brinewell
+[ -e /run/brinewell/graphics-backend ] && exit 0
+mode=""
+for p in $(cat /proc/cmdline); do
+    case "$p" in brinewell.graphics=*) mode="${p#brinewell.graphics=}";; esac
+done
+case "$mode" in venus|neptune|mullion) ;; *) mode=venus;; esac
+tmp="$(mktemp /run/brinewell/.graphics-backend.XXXXXX)" || exit 0
+printf '%s\n' "$mode" > "$tmp"
+chmod 644 "$tmp"
+mv -f "$tmp" /run/brinewell/graphics-backend

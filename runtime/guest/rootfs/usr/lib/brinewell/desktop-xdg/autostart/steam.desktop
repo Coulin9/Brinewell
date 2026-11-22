@@ -1,0 +1,11 @@
+[Desktop Entry]
+# brinewell Desktop Mode: shadows the stock /etc/xdg/autostart/steam.desktop
+# (/usr/lib/brinewell/nested-desktop puts this directory first in XDG_CONFIG_DIRS)
+# so the autostarted Steam keeps the client selected in the launcher; see
+# /usr/lib/brinewell/steam-client --desktop.
+Name=Steam
+Exec=/usr/lib/brinewell/steam-client --desktop %U
+Icon=steam
+Terminal=false
+Type=Application
+OnlyShowIn=KDE

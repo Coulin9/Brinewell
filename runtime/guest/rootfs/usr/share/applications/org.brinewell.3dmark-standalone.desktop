@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=3DMark Standalone (Neptune)
+Exec=/usr/lib/brinewell/3dmark-standalone
+Icon=applications-games
+Categories=Game;
+Terminal=false

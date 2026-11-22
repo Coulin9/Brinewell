@@ -1,0 +1,11 @@
+#!/bin/bash
+set -euo pipefail
+if [[ $# != 1 || ( "$1" != status && "$1" != install ) ]]; then
+    echo 'status error 不支持的 UU 操作'
+    exit 2
+fi
+if ! command -v python3 >/dev/null; then
+    echo 'status error SteamOS 缺少 Python 3，请修复系统后重试'
+    exit 1
+fi
+exec python3 /usr/lib/brinewell/uu-install.py "$1"

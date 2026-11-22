@@ -1,0 +1,15 @@
+[Unit]
+Description=Brinewell virtual gamepad
+ConditionPathExists=/dev/virtio-ports/fx.pad
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/brinewell-agent pad
+Restart=on-failure
+RestartSec=2
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes

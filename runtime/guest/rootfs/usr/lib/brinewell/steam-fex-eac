@@ -1,0 +1,209 @@
+#!/usr/bin/python3
+# Keep Steam's FEX-Emu compat tool (Steam app 3127680) on the Brinewell
+# Easy Anti-Cheat-capable FEX build, re-patching it whenever a Steam tool
+# update puts a different build back.
+#   steam-fex-eac [apply]   install the payload into the tool (default)
+#   steam-fex-eac restore   put the backed-up Valve build back and disable
+#   steam-fex-eac enable    clear the disabled marker, then apply
+#   steam-fex-eac status    print installed/payload describes and state
+# Test overrides: BRINEWELL_STEAM_ROOT, BRINEWELL_FEX_EAC_PAYLOAD,
+# BRINEWELL_FEX_EAC_STATE.
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+BINS = ("FEX", "FEXBash", "FEXGetConfig", "FEXOfflineCompiler", "FEXServer", "FEXServerManager", "FEXpidof")
+FILES = [Path("usr/bin") / name for name in BINS] + [Path(name) for name in
+        ("FEXCompatTool", "VERSIONS.txt", "ConfigTemplate.json")]
+
+
+def steam_root():
+    return Path(os.environ.get("BRINEWELL_STEAM_ROOT") or Path.home() / ".local/share/Steam")
+
+
+def tool_dir():
+    return steam_root() / "steamapps/common/FEX-Emu"
+
+
+def payload_dir():
+    return Path(os.environ.get("BRINEWELL_FEX_EAC_PAYLOAD") or "/usr/lib/brinewell/fex-eac")
+
+
+def state_dir():
+    override = os.environ.get("BRINEWELL_FEX_EAC_STATE")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state"
+    return Path(xdg) / "brinewell/fex-eac"
+
+
+def describe(root):
+    versions = root / "VERSIONS.txt"
+    if not versions.is_file():
+        return ""
+    for line in versions.read_text().splitlines():
+        if line.startswith("FEX describe\t"):
+            return line.split("\t", 1)[1]
+    return ""
+
+
+def complete(root):
+    return all((root / name).is_file() and (root / name).stat().st_size > 0 for name in FILES)
+
+
+def installed_bytes(source, name):
+    """Bytes that should be installed for a payload file. The base config
+    template gains the Vulkan thunk (the x86 rootfs only ships freedreno
+    ICDs); every other file installs verbatim."""
+    data = (source / name).read_bytes()
+    if name == Path("ConfigTemplate.json") and source == payload_dir():
+        config = json.loads(data)
+        config.setdefault("ThunksDB", {}).setdefault("Vulkan", "1")
+        data = (json.dumps(config, indent=4) + "\n").encode()
+    return data
+
+
+def identical(source, dst, name):
+    return dst.is_file() and dst.read_bytes() == installed_bytes(source, name)
+
+
+def all_installed(payload, tool):
+    return all(identical(payload, tool / name, name) for name in FILES)
+
+
+def process_running(name):
+    result = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True, check=False)
+    for pid in result.stdout.split():
+        try:
+            state = Path("/proc", pid, "stat").read_text().rpartition(")")[2].split()[0]
+        except (OSError, IndexError):
+            continue
+        if state != "Z":
+            return True
+    return False
+
+
+def steam_busy():
+    for name in ("steam", "FEXServer"):
+        if process_running(name):
+            return name
+    return None
+
+
+def report(message):
+    state_dir().mkdir(parents=True, exist_ok=True)
+    temporary = state_dir() / "status.new"
+    temporary.write_text(message + "\n")
+    temporary.replace(state_dir() / "status")
+    print("steam-fex-eac: " + message)
+
+
+def fail(message):
+    report(message)
+    sys.exit(1)
+
+
+def swap_in(source, tool):
+    for name in FILES:
+        src = source / name
+        dst = tool / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        temporary = dst.with_name("." + dst.name + ".new")
+        temporary.write_bytes(installed_bytes(source, name))
+        shutil.copymode(src, temporary)
+        temporary.replace(dst)
+    for name in FILES:
+        if not identical(source, tool / name, name):
+            fail("install incomplete: " + str(tool / name) + " does not match the payload")
+
+
+def refresh_backup(tool, backup):
+    temporary = backup.with_name("backup.tmp")
+    shutil.rmtree(temporary, ignore_errors=True)
+    for name in FILES:
+        src = tool / name
+        dst = temporary / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    shutil.rmtree(backup, ignore_errors=True)
+    temporary.replace(backup)
+
+
+def apply():
+    if (state_dir() / "disabled").exists():
+        report("disabled; leaving the FEX-Emu tool untouched")
+        return
+    tool = tool_dir()
+    if not complete(tool):
+        report("Steam FEX tool not installed")
+        return
+    running = steam_busy()
+    if running:
+        report(running + " is running; leaving the FEX-Emu tool untouched")
+        return
+    payload = payload_dir()
+    if all_installed(payload, tool):
+        report("installed: " + describe(tool))
+        return
+    if not complete(payload):
+        fail("payload incomplete: " + str(payload))
+    backup = state_dir() / "backup"
+    if not describe(tool).startswith("eac-"):
+        # Valve's build (also after a Steam tool update): keep a copy to restore.
+        refresh_backup(tool, backup)
+    swap_in(payload, tool)
+    report("installed: " + describe(tool))
+
+
+def restore():
+    running = steam_busy()
+    if running:
+        fail(running + " is running; cannot restore the FEX-Emu tool")
+    tool = tool_dir()
+    backup = state_dir() / "backup"
+    if not complete(backup):
+        fail("no Valve build backed up")
+    if not complete(tool):
+        fail("Steam FEX tool not installed")
+    swap_in(backup, tool)
+    (state_dir() / "disabled").touch()
+    report("restored: " + describe(tool))
+
+
+def enable():
+    (state_dir() / "disabled").unlink(missing_ok=True)
+    apply()
+
+
+def status():
+    tool = tool_dir()
+    print("installed: " + (describe(tool) if complete(tool) else "(tool missing or incomplete)"))
+    payload = payload_dir()
+    print("payload:   " + (describe(payload) if complete(payload) else "(payload missing or incomplete)"))
+    print("disabled:  " + ("yes" if (state_dir() / "disabled").exists() else "no"))
+    status_file = state_dir() / "status"
+    print("status:    " + (status_file.read_text().strip() if status_file.exists() else "(none)"))
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) == 2 else "apply" if len(sys.argv) == 1 else "invalid"
+    if action == "apply":
+        apply()
+    elif action == "restore":
+        restore()
+    elif action == "enable":
+        enable()
+    elif action == "status":
+        status()
+    else:
+        raise ValueError("usage: steam-fex-eac [apply|restore|enable|status]")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        fail("failed: " + str(error))

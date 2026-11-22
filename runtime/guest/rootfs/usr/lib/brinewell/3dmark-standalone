@@ -1,0 +1,313 @@
+#!/usr/bin/python3
+"""Install and run the official 3DMark standalone application under Neptune."""
+import argparse
+import base64
+import fcntl
+import hashlib
+import http.client
+from io import BytesIO
+import os
+from pathlib import Path
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+
+sys.dont_write_bytecode = True
+from game_patches import ensure_compiler, three_dmark_arguments, three_dmark_env
+
+
+METRICS_KEY = r"HKCU\Control Panel\Desktop\WindowMetrics"
+METRIC_DEFAULTS = {"CaptionHeight": 25, "SmCaptionHeight": 17, "MenuHeight": 18}
+NEPTUNE = Path("/usr/lib/brinewell/neptune")
+MODE_FILE = Path("/run/brinewell/graphics-backend")
+MODE_TAG = {"neptune": "d3dmetal", "mullion": "mullion"}
+BROWSER_ID = "org.chromium.Chromium"
+
+
+def repair_window_metrics(wine, env=None):
+    query = subprocess.run([*wine, "reg.exe", "query", METRICS_KEY],
+                           capture_output=True, text=True, env=env)
+    if query.returncode:
+        return
+    # A failed Wine font measurement can save stack garbage as window
+    # metrics. X11 dimensions are limited to 16 bits; normal custom values
+    # and negative Wine twips both belong to the user and stay intact.
+    for name, default in METRIC_DEFAULTS.items():
+        match = re.search(rf"^[ \t]*{name}[ \t]+REG_SZ[ \t]+([0-9]+)[ \t]*$", query.stdout, re.M)
+        if match and int(match[1]) > 32767:
+            subprocess.run([*wine, "reg.exe", "add", METRICS_KEY, "/v", name,
+                            "/t", "REG_SZ", "/d", str(default), "/f"], check=True, env=env)
+
+
+def local_certificate(jar):
+    with zipfile.ZipFile(jar) as archive:
+        data = BytesIO(archive.read("keystore.jks"))
+
+    def take(n):
+        value = data.read(n)
+        if len(value) != n:
+            raise ValueError("Invalid 3DMark local certificate store")
+        return value
+
+    def integer(n=4):
+        return int.from_bytes(take(n), "big")
+
+    def utf():
+        return take(integer(2))
+
+    # The UL Windows installer ships a one-entry JKS key store. Skip the
+    # encrypted key; only the public certificate is needed for loopback TLS.
+    if integer() != 0xFEEDFEED or integer() != 2 or integer() != 1 or integer() != 1:
+        raise ValueError("Unsupported 3DMark local certificate store")
+    utf()
+    take(8)
+    take(integer())
+    if integer() != 1 or utf() != b"X.509":
+        raise ValueError("Unsupported 3DMark local certificate chain")
+    return take(integer())
+
+
+def copy_if_changed(source, target):
+    content = source.read_bytes()
+    if not target.is_symlink() and target.is_file() and target.read_bytes() == content:
+        return
+    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as staged:
+        temporary = Path(staged.name)
+        try:
+            staged.write(content)
+            staged.close()
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def proton_root(steam):
+    """The official x86-64 Proton 11.0 depot, located by its appmanifest."""
+    manifest = steam / "steamapps/appmanifest_4628710.acf"
+    if manifest.is_file():
+        for line in manifest.read_text(errors="replace").splitlines():
+            if '"installdir"' in line:
+                tool = steam / "steamapps/common" / line.split('"')[-2]
+                if ((tool / "proton").is_file()
+                        and (tool / "files/bin/wine").is_file()
+                        and (tool / "files/lib/wine/x86_64-windows").is_dir()):
+                    return tool
+    raise ValueError(
+        "Install official Proton 11.0 (app 4628710) in the default Steam library first.")
+
+
+def live_backend():
+    try:
+        return MODE_TAG.get(MODE_FILE.read_text().strip())
+    except OSError:
+        return None
+
+
+def wine_command(root):
+    steam = Path(os.environ.get("BRINEWELL_STEAM_ROOT") or Path.home() / ".local/share/Steam")
+    common = steam / "steamapps/common"
+    fex = common / "FEX-Emu/fex-compat-tool"
+    runtime = common / "SteamLinuxRuntime_4/_v2-entry-point"
+    if not fex.is_file() or not runtime.is_file():
+        raise ValueError("Install Steam Linux Runtime 4 and FEX-Emu in the default Steam library first.")
+    backend = live_backend()
+    if backend is None:
+        raise ValueError("Select a Neptune graphics backend in Brinewell before starting 3DMark.")
+    bridge = NEPTUNE / "bridge/x86_64"
+    if not (NEPTUNE / "x86_64-unix/nptunix.so").is_file() or not (bridge / "nptunix.dll").is_file():
+        raise ValueError("The Neptune payload is not installed on this system.")
+    proton = proton_root(steam) / "files"
+    env = dict(os.environ)
+    env.update(
+        WINEPREFIX=str(root / "pfx"), STEAM_COMPAT_DATA_PATH=str(root / "compat"),
+        WINEDEBUG="-all",
+        WINEDLLPATH="/run/host" + str(bridge) + ":" + str(proton / "lib/wine"),
+        LD_LIBRARY_PATH=f"{proton}/lib/x86_64-linux-gnu:{proton}/lib",
+        WINEDLLOVERRIDES="d3d12,dxgi,d3d11=n;nptunix=b", PROTON_USE_ARM64="0",
+        BRINEWELL_NEPTUNE_BACKEND=backend,
+        FEX_NEEDSSECCOMP="1",
+    )
+    fex_cfg = env.get("STEAM_COMPAT_FEX_CONFIG", "")
+    if "ThunksDB_Vulkan" not in fex_cfg:
+        env["STEAM_COMPAT_FEX_CONFIG"] = fex_cfg + ("," if fex_cfg else "") + "ThunksDB_Vulkan:1"
+    env = three_dmark_env(env)
+    for name in ("SteamAppId", "SteamGameId", "STEAM_COMPAT_APP_ID"):
+        env.pop(name, None)
+    return [str(fex), "waitforexitandrun", "--", str(runtime), "--verb=run", "--",
+            str(proton / "bin/wine")], env
+
+
+def browser_command():
+    chromium = shutil.which("chromium")
+    if chromium:
+        return [chromium]
+    if shutil.which("flatpak") and not subprocess.run(
+            ["flatpak", "info", BROWSER_ID], capture_output=True).returncode:
+        return ["flatpak", "run", BROWSER_ID]
+    raise ValueError(f"Install Chromium from Discover or run: flatpak install --user flathub {BROWSER_ID}")
+
+
+def running(game):
+    for process in Path("/proc").glob("[0-9]*"):
+        try:
+            if (process / "cwd").resolve(strict=True) == game and (
+                    process / "comm").read_text().strip() == "3DMark.exe":
+                return True
+        except (OSError, RuntimeError):
+            pass
+    return False
+
+
+def ready_port(port_file, context, der):
+    try:
+        port = int(port_file.read_text())
+        if not 0 < port < 65536:
+            return None
+        server = http.client.HTTPSConnection("127.0.0.1", port, timeout=2, context=context)
+        try:
+            server.connect()
+            if server.sock.getpeercert(binary_form=True) != der:
+                return None
+            server.request("GET", "/view.html")
+            if server.getresponse().status == 200:
+                return port
+        finally:
+            server.close()
+    except (OSError, ValueError, http.client.HTTPException):
+        pass
+    return None
+
+
+def open_desktop(root, game, wine, env, browser):
+    der = local_certificate(game / "choros.jar")
+    pem = ssl.DER_cert_to_PEM_cert(der)
+    context = ssl.create_default_context(cadata=pem)
+    pubkey = subprocess.run(["openssl", "x509", "-pubkey", "-noout"], input=pem.encode(),
+                            capture_output=True, check=True).stdout
+    spki = subprocess.run(["openssl", "pkey", "-pubin", "-outform", "DER"], input=pubkey,
+                          capture_output=True, check=True).stdout
+    pin = base64.b64encode(hashlib.sha256(spki).digest()).decode()
+    users = root / "pfx/drive_c/users"
+    # Before the first successful boot the backend hashes the application
+    # files under emulation. Subsequent launches reuse the generated manifest.
+    first_launch = not any(users.glob("*/AppData/Local/UL/3DMark/port.state"))
+    compiler = game / "d3dcompiler_47.dll"
+    timespy = root / "pfx/drive_c/ProgramData/UL/3DMark/chops/dlc/time-spy-test/bin/x64"
+    ensure_compiler(compiler, timespy / compiler.name, root / "game-patch-files")
+
+    if not running(game):
+        repair_window_metrics(wine, env)
+        system32 = root / "pfx/drive_c/windows/system32"
+        payload = NEPTUNE / "x86_64-windows"
+        for name in ("d3d11.dll", "d3d12.dll", "dxgi.dll", "nptunix.dll"):
+            copy_if_changed(payload / name, system32 / name)
+        with (root / "launch.log").open("wb") as log:
+            child = subprocess.Popen([*wine, "./3DMark.exe", *three_dmark_arguments([])], cwd=game,
+                                     stdin=subprocess.DEVNULL, stdout=log,
+                                     stderr=subprocess.STDOUT, start_new_session=True, env=env)
+    else:
+        child = None
+
+    deadline = time.monotonic() + (600 if first_launch else 60)
+    while time.monotonic() < deadline:
+        port_files = users.glob("*/AppData/Local/UL/3DMark/port.state") if running(game) else ()
+        for port_file in port_files:
+            port = ready_port(port_file, context, der)
+            if not port:
+                continue
+            profile = root / "chromium-profile"
+            if browser[:2] == ["flatpak", "run"]:
+                profile = Path.home() / ".var/app" / BROWSER_ID / "config/3dmark"
+            return [*browser, f"--user-data-dir={profile}", "--ozone-platform=x11", "--disable-gpu",
+                    "--disable-background-networking", "--no-proxy-server",
+                    "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+                    f"--ignore-certificate-errors-spki-list={pin}",
+                    f"--app=https://127.0.0.1:{port}/view.html"]
+        if child and child.poll() not in (None, 0):
+            break
+        time.sleep(1)
+    raise ValueError(f"3DMark did not start. See {root / 'launch.log'}.")
+
+
+def install_app(root, game, installer, wine, env):
+    if game.exists():
+        raise ValueError(f"3DMark's application folder already exists: {game}")
+    log_path = root / "install.log"
+    windows_path = "Z:" + str(installer).replace("/", "\\")
+    windows_log = "Z:" + str(log_path).replace("/", "\\")
+    # The MSI's administrative mode extracts the vendor files and exits.
+    # A normal install can hang in 3DMarkCmd after importing every DLC.
+    with tempfile.TemporaryDirectory(dir=root / "pfx/drive_c") as stage:
+        target = "TARGETDIR=C:\\" + Path(stage).name
+        with (root / "install-wine.log").open("wb") as log:
+            install = subprocess.run([*wine, "msiexec.exe", "/a", windows_path, "/qn",
+                                      target, "/L*v", windows_log], cwd=installer.parent,
+                                     env=env, stdout=log, stderr=subprocess.STDOUT)
+        extracted = Path(stage) / "UL/3DMark"
+        if install.returncode or not all((extracted / name).is_file()
+                                         for name in ("3DMark.exe", "choros.jar")):
+            raise ValueError(f"3DMark installation did not finish. See {log_path}.")
+        game.parent.mkdir(parents=True, exist_ok=True)
+        extracted.rename(game)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--install", type=Path, metavar="DATA_X64.MSI",
+                        help="install 3DMark from the official Windows 64-bit MSI")
+    args = parser.parse_args()
+    if not os.environ.get("DISPLAY") or os.environ.get("XDG_CURRENT_DESKTOP") != "KDE":
+        raise ValueError("Open this launcher in SteamOS Desktop Mode.")
+    if live_backend() is None:
+        raise ValueError("Select a Neptune graphics backend in Brinewell before launching 3DMark.")
+    os.umask(0o077)
+    root = Path.home() / "3dmark-standalone"
+    game = root / "pfx/drive_c/Program Files/UL/3DMark"
+    installer = args.install
+    if not installer and not (game / "3DMark.exe").is_file():
+        if sys.stderr.isatty() or not shutil.which("kdialog"):
+            raise ValueError("Extract the official Windows ZIP first, then run: "
+                             "/usr/lib/brinewell/3dmark-standalone --install /path/to/data_x64.msi")
+        selected = subprocess.run(["kdialog", "--title", "Select 3DMark data_x64.msi",
+                                   "--getopenfilename", str(Path.home() / "Downloads"), "*.msi"],
+                                  text=True, capture_output=True)
+        if selected.returncode or not selected.stdout.strip():
+            return
+        installer = Path(selected.stdout.strip())
+    if installer:
+        installer = installer.resolve(strict=True)
+        if not installer.is_file() or installer.suffix.lower() != ".msi":
+            raise ValueError("Choose data_x64.msi from the official 3DMark Windows ZIP.")
+
+    browser = browser_command() if not args.install else None
+    root.mkdir(exist_ok=True)
+    with (root / "desktop-start.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        wine, env = wine_command(root)
+        if installer:
+            if not (root / "pfx/drive_c").is_dir():
+                subprocess.run([*wine, "wineboot.exe", "--init"], env=env, check=True)
+            install_app(root, game, installer, wine, env)
+            print("3DMark installed. Open 3DMark Standalone (Neptune) from the desktop menu.")
+            if args.install:
+                return
+            subprocess.Popen(["kdialog", "--title", "3DMark Standalone", "--passivepopup",
+                              "3DMark is preparing the first launch. This can take several minutes.", "10"])
+        command = open_desktop(root, game, wine, env, browser)
+    os.execvp(command[0], command)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError, KeyError, zipfile.BadZipFile) as error:
+        message = str(error)
+        print(f"3dmark-standalone: {message}", file=sys.stderr)
+        if not sys.stderr.isatty() and os.environ.get("DISPLAY") and shutil.which("kdialog"):
+            subprocess.run(["kdialog", "--title", "3DMark Standalone", "--error", message])
+        raise SystemExit(1)

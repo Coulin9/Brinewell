@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.brinewell.render-context</string>
+    <key>BundleProgram</key>
+    <string>Contents/Helpers/virgl_render_server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>virgl_render_server</string>
+        <string>--work-context-service</string>
+    </array>
+    <key>MachServices</key>
+    <dict><key>org.brinewell.render-context</key><true/></dict>
+    <key>ProcessType</key>
+    <string>Adaptive</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <array><string>org.brinewell.Brinewell</string></array>
+</dict>
+</plist>

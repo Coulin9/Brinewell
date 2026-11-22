@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Let UU and its guardian remove networking rules before cgroup teardown."""
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+
+def is_uu_main(arguments):
+    return (arguments[0] == b'/tmp/uu/uuplugin'
+            or (len(arguments) > 1 and arguments[0].rsplit(b'/', 1)[-1] == b'FEX'
+                and arguments[1] == b'/tmp/uu/uuplugin'))
+
+
+def main():
+    # ExecStop still runs after the main process exits, when MAINPID is unset.
+    # UU moves its main process to its own cgroup; the guardian stays in this
+    # service's group. Keep the explicit MAINPID separate from the guardian scope.
+    cgroup = Path('/proc/self/cgroup').read_text()
+    try:
+        pid = int(sys.argv[1]) if len(sys.argv) > 1 else None
+    except ValueError:
+        pid = None
+    if pid is not None and pid > 1:
+        try:
+            arguments = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+            if is_uu_main(arguments):
+                os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, FileNotFoundError):
+            pass
+    deadline = time.monotonic() + 50
+    while time.monotonic() < deadline:
+        remaining = False
+        for proc in Path('/proc').iterdir():
+            if not proc.name.isdecimal() or int(proc.name) == os.getpid():
+                continue
+            try:
+                command = (proc / 'cmdline').read_bytes()
+                arguments = command.split(b'\0')
+                is_main = int(proc.name) == pid and is_uu_main(arguments)
+                is_guardian = any(value.rsplit(b'/', 1)[-1] == b'xuplugin-guardian' for value in arguments[:3])
+                if is_main or (is_guardian and (proc / 'cgroup').read_text() == cgroup):
+                    remaining = True
+                    break
+            except OSError:
+                pass
+        if not remaining:
+            break
+        time.sleep(0.2)
+
+
+if __name__ == '__main__':
+    main()

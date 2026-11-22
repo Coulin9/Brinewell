@@ -1,0 +1,45 @@
+#!/bin/sh
+# Recovery images are attached read-only as vdb; only the explicitly named
+# new disk may be formatted. Reuse the normal provisioning/boot layout.
+recovery_setup() {
+    P_DISK_GUID=$(getarg brinewell.target_guid | tr 'A-F' 'a-f')
+    prov_is_uuid "$P_DISK_GUID" || prov_fail "invalid target disk GUID"
+    [ "$ESP_DEV" = /dev/vda1 ] || prov_fail "target esp is not vda1"
+    [ "$(prov_disk_guid /dev/vda)" = "$P_DISK_GUID" ] || prov_fail "target disk GUID mismatch"
+    P_MACHINE_ID=$(echo "$P_DISK_GUID" | tr -d -)
+    P_HOSTNAME=brinewell
+    P_PASSWORD_HASH=
+    P_STEAMOS_BRANCH=
+    _part=1
+    for _name in $PROV_NAMES; do
+        [ "$(part_dev "$_name")" = "/dev/vda$_part" ] || prov_fail "unexpected target partition $_name"
+        _uuid=$(part_field "$_name" PARTUUID | tr 'A-F' 'a-f')
+        prov_is_uuid "$_uuid" || prov_fail "invalid target partition UUID"
+        eval "P_PARTUUID_$(prov_key "$_name")=\$_uuid"
+        _part=$((_part + 1))
+    done
+    [ "$(cat /sys/class/block/vdb/ro)" = 1 ] || prov_fail "installer disk is not read-only"
+    [ -b /dev/vdb3 ] || prov_fail "installer has no root filesystem"
+    [ "$(cat /sys/class/block/vdb3/size)" -le "$(cat /sys/class/block/vda4/size)" ] \
+        || prov_fail "installer root filesystem is too large"
+    rm -rf "$PROV_TMP"
+    mkdir -p "$PROV_TMP/source" "$PROV_TMP/mnt" "$PROV_TMP/payload"
+    mount -t btrfs -o ro /dev/vdb3 "$PROV_TMP/source" || prov_fail "cannot read installer root filesystem"
+    _release=$PROV_TMP/source/usr/lib/os-release
+    [ "$(sed -n 's/^ID=//p' "$_release" | tr -d '\"')" = steamos ] || prov_fail "installer is not SteamOS"
+    P_STEAMOS_BUILDID=$(sed -n 's/^BUILD_ID=//p' "$_release" | tr -d '\"')
+    P_STEAMOS_VERSION=$(sed -n 's/^VERSION_ID=//p' "$_release" | tr -d '\"')
+    [ -n "$P_STEAMOS_BUILDID" ] || prov_fail "installer has no build ID"
+    _bootconf=$PROV_TMP/source/usr/lib/steamos-efi/steamos-bootconf
+    [ -x "$_bootconf" ] && [ -f "$PROV_TMP/source/etc/shadow" ] || prov_fail "incomplete SteamOS installer"
+    [ "$(od -An -tu2 -j18 -N2 "$_bootconf" | tr -d ' ')" = 183 ] || prov_fail "installer must be ARM64"
+    umount "$PROV_TMP/source" || prov_fail "cannot unmount installer"
+}
+
+recovery_copy() {
+    prov_say "0 Installing SteamOS"
+    prov_cmd dd if=/dev/vdb3 of=/dev/vda4 bs=4M || prov_fail "cannot copy rootfs-A"
+    prov_cmd dd if=/dev/vdb3 of=/dev/vda5 bs=4M || prov_fail "cannot copy rootfs-B"
+    # The source stays attached, so the new filesystem needs its own identity.
+    prov_cmd btrfstune -f -u /dev/vda4 || prov_fail "cannot assign rootfs-A filesystem ID"
+}

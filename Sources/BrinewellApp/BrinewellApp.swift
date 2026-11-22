@@ -1,0 +1,797 @@
+import AppKit
+import BrinewellCore
+import SwiftUI
+
+@MainActor
+final class AppModel: ObservableObject {
+    let host: HostCapabilities
+    let vm = VMProcess()
+    let deployment = DiskDeployment()
+    @Published var showDeployment = false
+    @Published private(set) var hasUsableDisk = false
+    @Published private(set) var diskUsage: SystemDiskUsage?
+    @Published private(set) var diskResizing = false
+    @Published private(set) var diskResizeError: String?
+    @Published var configuration: VMConfiguration {
+        didSet {
+            if configuration.diskImagePath != oldValue.diskImagePath { refreshDiskAvailability() }
+            // Automatic adaptation (for example a host display change) must not
+            // persist over a blocked migration or a broken stored configuration:
+            // the save would overwrite the user's file and clear loadError.
+            // User-initiated edits keep the normal save path.
+            let automaticWhileBlocked = applyingAutomaticChange
+                && (migrationBlocked || loadError != nil)
+            if configuration != oldValue && !isReloading && !automaticWhileBlocked {
+                save()
+            }
+        }
+    }
+    @Published private(set) var displayCapabilities: HostDisplayCapabilities?
+    @Published private(set) var store: ConfigurationStore?
+    @Published private(set) var loadError: String?
+    @Published private(set) var saveError: String?
+    private var isReloading = false
+    /// Set while a non-user-initiated mutation is applied to `configuration`
+    /// so didSet can keep it in memory only when persistence is unsafe.
+    private var applyingAutomaticChange = false
+    private var commandLineStartPending = CommandLine.arguments.dropFirst().contains("--start-vm")
+    private var starting = false
+    let migrationReport: LegacyInstallationMigration.Report?
+    private var migrationBlocked: Bool { migrationReport?.needsAttention == true }
+    private var migrationAlertPresented = false
+    /// Shared gate for every automatic onboarding presentation: a blocked
+    /// migration or an unloadable configuration means this launch must not
+    /// behave like a fresh install.
+    private var canAutoPresentOnboarding: Bool { !migrationBlocked && loadError == nil }
+
+    init(migrationReport: LegacyInstallationMigration.Report? = nil) {
+        self.migrationReport = migrationReport
+        host = HostCapabilities.detect()
+        configuration = .defaults(for: host)
+        reload()
+        deployment.onInstalled = { [weak self] url in self?.useDisk(url, startAfterSelection: true) }
+        vm.onSettled = { [weak self] in
+            self?.refreshDiskAvailability()
+            self?.finishPendingDiskShrink()
+        }
+    }
+    func refreshDisplayCapabilities() {
+        let launcherScreen = NSApplication.shared.windows.first(where: { $0.title == "Brinewell" })?.screen
+        let id = vm.hostDisplayID ?? launcherScreen.flatMap { HostDisplayCapabilities.screenID($0) }
+        displayCapabilities = HostDisplayCapabilities.detect(displayID: id)
+        if let mode = displayCapabilities?.preferredMode(for: configuration.display) {
+            applyingAutomaticChange = true
+            configuration.display = mode
+            applyingAutomaticChange = false
+        }
+    }
+    var configurationPath: String { store?.url.path ?? String(localized: "Configuration path unavailable") }
+    private var diskIsUsable: Bool {
+        guard let path = configuration.diskImagePath,
+              FileManager.default.isWritableFile(atPath: path) else { return false }
+        return (try? SteamOSDisk.validateSystem(at: URL(fileURLWithPath: path))) != nil
+    }
+    func refreshDiskAvailability() {
+        let wasAvailable = hasUsableDisk
+        hasUsableDisk = diskIsUsable
+        if let path = configuration.diskImagePath, hasUsableDisk {
+            diskUsage = try? SteamOSDisk.systemDiskUsage(at: URL(fileURLWithPath: path))
+        } else { diskUsage = nil }
+        if wasAvailable && !hasUsableDisk && !vm.busy && !deployment.busy && !diskResizing
+            && canAutoPresentOnboarding {
+            showDeployment = true
+        }
+    }
+    func offerDeploymentIfNeeded() {
+        guard canAutoPresentOnboarding else { return }
+        refreshDiskAvailability()
+        if !vm.busy && !hasUsableDisk { showDeployment = true }
+    }
+    private var startAfterDiskResize = false
+    func start() {
+        guard !vm.busy, !deployment.busy, !starting else { return }
+        if pendingDiskShrink?.bootStarted == true {
+            // The guest already shrank its file system on the previous boot;
+            // finish the host-side shrink before the disk can be used again.
+            if !diskResizing {
+                startAfterDiskResize = true
+                finishPendingDiskShrink()
+            }
+            return
+        }
+        guard !diskResizing else { return }
+        refreshDiskAvailability()
+        guard hasUsableDisk, configuration.diskImagePath != nil else { showDeployment = true; return }
+        starting = true
+        defer { starting = false }
+        var shrinkHomeKiB: UInt64?
+        var markBootStarted: (() -> Void)?
+        // While a migration failure is unresolved the guest must not receive a
+        // shrink request: the matching host-side finalize stays disabled.
+        if !migrationBlocked, let pending = pendingDiskShrink, !pending.bootStarted {
+            do {
+                shrinkHomeKiB = try SteamOSDisk.homeShrinkTargetKiB(
+                    at: URL(fileURLWithPath: pending.diskImagePath),
+                    toCapacityGiB: pending.capacityGiB, expected: pending.identity)
+                markBootStarted = { [weak self] in
+                    self?.configuration.pendingDiskShrink =
+                        PendingDiskShrink(diskImagePath: pending.diskImagePath,
+                                          capacityGiB: pending.capacityGiB,
+                                          bootStarted: true, identity: pending.identity)
+                }
+            } catch {
+                configuration.pendingDiskShrink = nil
+                diskResizeError = error.localizedDescription
+            }
+        }
+        // willLaunch runs after every pre-launch check passed, so bootStarted
+        // is persisted only when the guest actually gets the shrink request.
+        vm.start(configuration: configuration, host: host, display: displayCapabilities,
+                 shrinkHomeKiB: shrinkHomeKiB, willLaunch: markBootStarted)
+    }
+
+    func startFromCommandLineIfRequested() {
+        guard commandLineStartPending else { return }
+        guard canAutoPresentOnboarding else { return }
+        if pendingDiskShrink?.bootStarted == true {
+            finishPendingDiskShrink()
+            return
+        }
+        commandLineStartPending = false
+        start()
+    }
+    private func useDisk(_ url: URL, startAfterSelection: Bool) {
+        configuration.pendingDiskShrink = nil
+        configuration.diskImagePath = url.path
+        guard saveError == nil, loadError == nil else { return }
+        if startAfterSelection {
+            showDeployment = false
+            start()
+        }
+    }
+    func reload() {
+        guard !vm.busy, !deployment.busy else { return }
+        isReloading = true
+        defer { isReloading = false }
+        saveError = nil
+        do {
+            let store = ConfigurationStore(url: try ConfigurationStore.defaultURL())
+            self.store = store
+            let loaded = try store.load(for: host)
+            configuration = loaded
+            loadError = nil
+        } catch {
+            if let store, let stored = try? store.decode() {
+                configuration = stored
+            }
+            loadError = String(localized: "Could not load configuration (\(configurationPath)): \(error.localizedDescription)")
+        }
+        refreshDisplayCapabilities()
+        refreshDiskAvailability()
+        finishPendingDiskShrink()
+    }
+    private func save() {
+        guard !vm.busy, let store else { return }
+        do {
+            guard let displayCapabilities else { throw DisplayUnavailable() }
+            try displayCapabilities.validate(configuration.display)
+            try store.save(configuration, for: host)
+            loadError = nil
+            saveError = nil
+        } catch { saveError = String(localized: "Could not save configuration (\(store.url.path)): \(error.localizedDescription)") }
+    }
+
+    func setGameHUD(level: GameHUDLevel? = nil, position: GameHUDPosition? = nil) {
+        guard !deployment.busy else { return }
+        var updated = configuration
+        if let level { updated.gameHUDLevel = level }
+        if let position { updated.gameHUDPosition = position }
+        configuration = updated
+        vm.setGameHUD(level: updated.gameHUDLevel, position: updated.gameHUDPosition)
+        guard vm.busy, let store else { return }
+        do {
+            try store.setGameHUD(level: updated.gameHUDLevel, position: updated.gameHUDPosition, for: host)
+            saveError = nil
+        } catch { saveError = String(localized: "Could not save configuration (\(store.url.path)): \(error.localizedDescription)") }
+    }
+
+    /// Backend selection stays editable while the VM runs: it only changes the
+    /// preference used by the next game launch, never boot-only settings.
+    func setGraphicsBackend(_ backend: GraphicsBackend) {
+        guard !deployment.busy else { return }
+        if vm.busy {
+            // While running (or transitioning) the live runtime must accept the
+            // backend before it is persisted; keep the previous config on
+            // refusal so the stored choice still matches reality.
+            guard vm.state == .running, vm.setGraphicsBackend(backend) else { return }
+        }
+        configuration.graphicsBackend = backend
+        guard let store else { return }
+        do {
+            try store.setGraphicsBackend(backend, for: host)
+            saveError = nil
+        } catch { saveError = String(localized: "Could not save configuration (\(store.url.path)): \(error.localizedDescription)") }
+    }
+
+    /// Hard migration failures mean the user's data did not move cleanly;
+    /// explain where it actually is instead of letting this launch behave
+    /// like a fresh install.
+    func presentMigrationAlertIfNeeded() {
+        guard let report = migrationReport, report.needsAttention, !migrationAlertPresented else { return }
+        migrationAlertPresented = true
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        switch report.status {
+        case .conflict:
+            alert.messageText = String(localized: "Brinewell found both an AppleDeck and a Brinewell data folder")
+            alert.informativeText = String(localized: "Your previous data is at \(report.legacySupportURL.path), but \(report.supportURL.path) already exists, so nothing was moved. Review both folders and remove the one you do not need. Automatic startup is disabled for this launch.")
+        case .pathOccupied:
+            alert.messageText = String(localized: "Brinewell could not move your AppleDeck data")
+            alert.informativeText = String(localized: "The path \(report.legacySupportURL.path) exists but is not a folder, so nothing was moved. Remove or rename it, then relaunch Brinewell. Automatic startup is disabled for this launch.")
+        case .movedButConfigNeedsRepair:
+            let configurationPath = report.supportURL.appendingPathComponent("configuration.json").path
+            alert.messageText = report.movedData
+                ? String(localized: "Brinewell moved your AppleDeck data but the configuration needs attention")
+                : String(localized: "Brinewell could not use your saved configuration")
+            if report.unreadableConfiguration {
+                // A permission or I/O problem; deleting the file would not help.
+                alert.informativeText = report.movedData
+                    ? String(localized: "Your data was moved to \(report.supportURL.path), but the configuration file at \(configurationPath) could not be read. \(report.failureDescription ?? "") Check that the file is readable, then relaunch Brinewell. Automatic startup is disabled for this launch.")
+                    : String(localized: "The configuration file at \(configurationPath) could not be read. \(report.failureDescription ?? "") Check that the file is readable, then relaunch Brinewell. Automatic startup is disabled for this launch.")
+            } else if report.invalidConfiguration {
+                alert.informativeText = report.movedData
+                    ? String(localized: "Your data was moved to \(report.supportURL.path), but the configuration file at \(configurationPath) could not be decoded and was left unchanged. Repair or remove it, then relaunch Brinewell. Automatic startup is disabled for this launch.")
+                    : String(localized: "The configuration file at \(configurationPath) could not be decoded and was left unchanged. Repair or remove it, then relaunch Brinewell. Automatic startup is disabled for this launch.")
+            } else {
+                alert.informativeText = report.movedData
+                    ? String(localized: "Your data was moved to \(report.supportURL.path), but the configuration file could not be updated and was left unchanged. \(report.failureDescription ?? "") Automatic startup is disabled for this launch.")
+                    : String(localized: "The configuration file at \(configurationPath) could not be updated and was left unchanged. \(report.failureDescription ?? "") Automatic startup is disabled for this launch.")
+            }
+        default:
+            alert.messageText = String(localized: "Brinewell could not move your AppleDeck data")
+            alert.informativeText = String(localized: "Your data is still at \(report.legacySupportURL.path). \(report.failureDescription ?? "") Automatic startup is disabled for this launch.")
+        }
+        alert.runModal()
+    }
+
+    private struct DisplayUnavailable: LocalizedError {
+        var errorDescription: String? { String(localized: "Could not read the available display modes for the host display.") }
+    }
+    func chooseD3DMetalFramework() {
+        guard !vm.busy, !deployment.busy else { return }
+        let panel = NSOpenPanel()
+        panel.title = String(localized: "Select D3DMetal.framework")
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        configuration.d3dMetalFrameworkPath = url.path
+    }
+
+    func chooseSharedFolder() {
+        guard !vm.busy, !deployment.busy else { return }
+        let panel = NSOpenPanel()
+        panel.title = String(localized: "Choose Shared Folder")
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let folder = VMSharedFolder(path: url.path)
+        do {
+            _ = try folder.resolvedPath()
+            configuration.sharedFolder = folder
+        } catch { saveError = error.localizedDescription }
+    }
+
+    func chooseDisk(startAfterSelection: Bool = false) {
+        guard !vm.busy, !deployment.busy, !diskResizing else { return }
+        let panel = NSOpenPanel()
+        panel.title = String(localized: "Choose Existing System Disk")
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try SteamOSDisk.validateSystem(at: url)
+            guard FileManager.default.isWritableFile(atPath: url.path) else {
+                saveError = String(localized: "The selected system disk is not writable.")
+                return
+            }
+            useDisk(url, startAfterSelection: startAfterSelection)
+        } catch { saveError = error.localizedDescription }
+    }
+
+    private var diskResizeTask: Task<Void, Never>?
+    var onDiskResizeFinished: (() -> Void)?
+
+    var pendingDiskShrink: PendingDiskShrink? {
+        guard let pending = configuration.pendingDiskShrink,
+              pending.diskImagePath == configuration.diskImagePath else { return nil }
+        return pending
+    }
+
+    /// Grow applies on the host immediately; shrink is scheduled for the next
+    /// boot so the guest can reduce its home file system first.
+    func applyDiskCapacity(_ newCapacityGiB: Int) {
+        guard !vm.busy, !deployment.busy, !diskResizing,
+              let usage = diskUsage, let path = configuration.diskImagePath,
+              newCapacityGiB >= usage.minimumCapacityGiB,
+              newCapacityGiB <= usage.maximumCapacityGiB else { return }
+        let newBytes = UInt64(newCapacityGiB) * 1_073_741_824
+        guard newBytes != usage.capacityBytes else { return }
+        let url = URL(fileURLWithPath: path)
+        diskResizeError = nil
+        if newBytes > usage.capacityBytes {
+            configuration.pendingDiskShrink = nil
+            diskResizing = true
+            diskResizeTask = Task {
+                do {
+                    try await Task.detached { try SteamOSDisk.growSystem(at: url, toCapacityGiB: newCapacityGiB) }.value
+                } catch {
+                    diskResizeError = error.localizedDescription
+                }
+                diskResizing = false
+                refreshDiskAvailability()
+                let done = onDiskResizeFinished
+                onDiskResizeFinished = nil
+                done?()
+            }
+        } else {
+            do {
+                _ = try SteamOSDisk.homeShrinkTargetKiB(at: url, toCapacityGiB: newCapacityGiB,
+                                                        expected: usage.identity)
+                configuration.pendingDiskShrink = PendingDiskShrink(
+                    diskImagePath: path, capacityGiB: newCapacityGiB, identity: usage.identity)
+            } catch {
+                diskResizeError = error.localizedDescription
+            }
+        }
+    }
+
+    func cancelDiskShrink() {
+        guard !vm.busy, !diskResizing else { return }
+        configuration.pendingDiskShrink = nil
+    }
+
+    /// Disk errors that can succeed on retry keep the scheduled shrink; any
+    /// other failure clears it and is shown to the user.
+    private static let retryableDiskErrors: Set<String> = [
+        String(localized: "The SteamOS disk is in use. Shut down the virtual machine first."),
+        String(localized: "Could not lock the system disk for resizing."),
+        String(localized: "Could not lock the staged disk image."),
+    ]
+
+    /// Host-side second phase of a scheduled shrink. Runs at app launch, before
+    /// the next VM start, and on VM exit paths that return (the in-process VM
+    /// terminates the app on a normal guest shutdown).
+    private func finishPendingDiskShrink() {
+        guard !vm.busy, !deployment.busy, !diskResizing, !migrationBlocked,
+              let pending = pendingDiskShrink, pending.bootStarted,
+              let path = configuration.diskImagePath else { return }
+        let url = URL(fileURLWithPath: path)
+        diskResizing = true
+        diskResizeError = nil
+        diskResizeTask = Task {
+            do {
+                try await Task.detached {
+                    try SteamOSDisk.shrinkSystem(at: url, toCapacityGiB: pending.capacityGiB,
+                                                 expected: pending.identity)
+                }.value
+                configuration.pendingDiskShrink = nil
+            } catch {
+                let message = error.localizedDescription
+                diskResizeError = String(localized: "The disk could not be shrunk. \(message)")
+                if !Self.retryableDiskErrors.contains(message) {
+                    configuration.pendingDiskShrink = nil
+                }
+            }
+            diskResizing = false
+            refreshDiskAvailability()
+            let done = onDiskResizeFinished
+            onDiskResizeFinished = nil
+            done?()
+            let relaunch = startAfterDiskResize
+            startAfterDiskResize = false
+            if relaunch { start() }
+            startFromCommandLineIfRequested()
+        }
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var vm: VMProcess?
+    var deployment: DiskDeployment?
+    var model: AppModel?
+    private var quitting = false
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSApplication.shared.setActivationPolicy(.regular)
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if let model, model.diskResizing {
+            if !quitting {
+                quitting = true
+                model.onDiskResizeFinished = { [weak self, weak sender] in
+                    self?.quitting = false
+                    sender?.reply(toApplicationShouldTerminate: true)
+                }
+            }
+            return .terminateLater
+        }
+        if let deployment, deployment.busy {
+            if !quitting {
+                quitting = true
+                Task { @MainActor in
+                    await deployment.cancel()
+                    sender.reply(toApplicationShouldTerminate: true)
+                }
+            }
+            return .terminateLater
+        }
+        guard let vm, vm.busy else { return .terminateNow }
+        if quitting { return .terminateLater }
+        let alert = NSAlert()
+        alert.messageText = String(localized: "The virtual machine is still running")
+        alert.informativeText = String(localized: "Shut down the virtual machine before quitting Brinewell?")
+        alert.addButton(withTitle: String(localized: "Shut Down and Quit"))
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        guard vm.busy else { return .terminateNow }
+        quitting = true
+        vm.onExit = { [weak self, weak sender] in
+            // A pending disk-shrink finalize may start just before this exit
+            // callback fires; wait for it before letting the app quit.
+            if self?.model?.diskResizing == true {
+                self?.model?.onDiskResizeFinished = { [weak self, weak sender] in
+                    self?.quitting = false
+                    sender?.reply(toApplicationShouldTerminate: true)
+                }
+            } else {
+                self?.quitting = false
+                sender?.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        vm.stop()
+        return .terminateLater
+    }
+}
+
+@main
+@MainActor
+struct BrinewellApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @StateObject private var model: AppModel
+
+    // Runs before AppModel is created, so the configuration load, disk-shrink
+    // finalize and language preference all see the migrated locations.
+    init() {
+        let report = LegacyInstallationMigration.migrateIfNeeded()
+        _model = StateObject(wrappedValue: AppModel(migrationReport: report))
+    }
+    var body: some Scene {
+        Window("Brinewell", id: "main") {
+            MainView(model: model, vm: model.vm, deployment: model.deployment) {
+                delegate.vm = model.vm
+                delegate.deployment = model.deployment
+                delegate.model = model
+            }
+        }.defaultSize(width: 540, height: 620)
+        .defaultLaunchBehavior(.presented)
+        Settings {
+            SettingsView(model: model, vm: model.vm, deployment: model.deployment)
+                .frame(width: 660, height: 680)
+        }
+    }
+}
+
+private struct MainView: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var vm: VMProcess
+    @ObservedObject var deployment: DiskDeployment
+    @State private var confirmForce = false
+    let bindDelegate: () -> Void
+
+    var body: some View {
+        Form {
+            Section("SteamOS") {
+                LabeledContent("Status", value: vm.state.title)
+                if let error = vm.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+                if let warning = vm.workContextWarning {
+                    Text(warning).foregroundStyle(.orange).textSelection(.enabled)
+                }
+                HStack {
+                    Button("Start") { model.start() }
+                        .disabled(vm.busy || deployment.busy || model.loadError != nil || model.diskResizing)
+                    Button("Shut Down") { vm.stop() }.disabled(!vm.busy || vm.state == .stopping)
+                    Button("Force Stop") { confirmForce = true }.disabled(!vm.busy)
+                    SettingsLink { Text("Open Settings") }
+                }
+                if let path = vm.runDirectory?.path { LabeledContent("Run Directory", value: path).textSelection(.enabled) }
+                if let path = vm.logPath { LabeledContent("Host Log", value: path).textSelection(.enabled) }
+            }
+            UUPluginView(vm: vm)
+            Section("Host") {
+                LabeledContent("Architecture", value: model.host.architecture)
+                LabeledContent("Logical CPUs", value: "\(model.host.logicalCPUCount)")
+                LabeledContent("Unified Memory", value: ByteCountFormatter.string(fromByteCount: Int64(model.host.physicalMemoryBytes), countStyle: .memory))
+                LabeledContent("GPU", value: model.host.metalDeviceName ?? String(localized: "Unavailable"))
+            }
+            Section("Configuration") {
+                LabeledContent("Disk", value: model.hasUsableDisk ? (model.configuration.diskImagePath ?? "") : String(localized: "No usable system disk")).textSelection(.enabled)
+                if !model.hasUsableDisk {
+                    Button("Choose System Disk or Install SteamOS") { model.showDeployment = true }.disabled(vm.busy || model.diskResizing)
+                }
+                if let error = model.loadError {
+                    Text(error).foregroundStyle(.red).textSelection(.enabled)
+                    Button("Reload Configuration") { model.reload() }.disabled(vm.busy)
+                }
+                if let error = model.saveError { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear {
+            bindDelegate()
+            model.presentMigrationAlertIfNeeded()
+            model.refreshDisplayCapabilities()
+            model.offerDeploymentIfNeeded()
+            model.startFromCommandLineIfRequested()
+        }
+        .sheet(isPresented: $model.showDeployment) {
+            DiskDeploymentView(model: model, deployment: deployment)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeScreenNotification)) { _ in model.refreshDisplayCapabilities() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in model.refreshDisplayCapabilities() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.refreshDiskAvailability() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in model.refreshDiskAvailability() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in model.refreshDiskAvailability() }
+        .onChange(of: vm.hostDisplayID) { model.refreshDisplayCapabilities() }
+        .confirmationDialog("Force stopping may corrupt guest data.", isPresented: $confirmForce) {
+            Button("Force Stop Virtual Machine", role: .destructive) { vm.forceStop() }
+            Button("Cancel", role: .cancel) { }
+        }
+    }
+}
+
+private struct SettingsView: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var vm: VMProcess
+    @ObservedObject var deployment: DiskDeployment
+    @State private var language = AppLanguage.selected
+    @State private var requestedGiB: Int?
+    @State private var confirmApply = false
+
+    private var capacityValid: Bool {
+        guard let request = requestedGiB, let usage = model.diskUsage else { return false }
+        return UInt64(request) * 1_073_741_824 != usage.capacityBytes
+            && request >= usage.minimumCapacityGiB
+            && request <= usage.maximumCapacityGiB
+    }
+
+    private func capacityLabel(_ bytes: UInt64) -> String {
+        let gib = Double(bytes) / 1_073_741_824
+        if bytes % 1_073_741_824 == 0 {
+            return String(localized: "\(Int(gib)) GB")
+        }
+        return String(localized: "\(gib.formatted(.number.precision(.fractionLength(1)))) GB")
+    }
+
+    private var applyMessage: String {
+        guard let request = requestedGiB, let usage = model.diskUsage else { return "" }
+        let currentGiB = Int(usage.capacityBytes / 1_073_741_824)
+        if request > currentGiB {
+            return String(localized: "Expand the system disk from \(currentGiB) GB to \(request) GB?")
+        }
+        return String(localized: "The disk will be shrunk to \(request) GB the next time the virtual machine starts. SteamOS reduces its home file system during startup, which may take several minutes; the image is reduced after the virtual machine shuts down.")
+    }
+
+    private func applyCapacityChange() {
+        guard let request = requestedGiB, let usage = model.diskUsage,
+              request >= usage.minimumCapacityGiB,
+              request <= usage.maximumCapacityGiB else { return }
+        model.applyDiskCapacity(request)
+    }
+
+    private var resolutionSelection: Binding<DisplayResolution> {
+        Binding(get: { model.configuration.display.resolution }, set: { resolution in
+            var requested = model.configuration.display
+            requested.resolution = resolution
+            if let mode = model.displayCapabilities?.preferredMode(for: requested) {
+                model.configuration.display = mode
+            }
+        })
+    }
+
+    private var displayError: String? {
+        do {
+            guard let capabilities = model.displayCapabilities else { return String(localized: "Could not read the available display modes for the host display.") }
+            try capabilities.validate(model.configuration.display)
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("Language", selection: $language) {
+                    Text("Follow System").tag(AppLanguage.system)
+                    Text(verbatim: "English").tag(AppLanguage.english)
+                    Text(verbatim: "简体中文").tag(AppLanguage.simplifiedChinese)
+                }
+                .onChange(of: language) { _, selection in selection.save() }
+                if language != AppLanguage.atLaunch {
+                    Text("Quit and reopen Brinewell to apply a language change.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            Section("Guest Disk") {
+                if let path = model.configuration.diskImagePath {
+                    Text(path).textSelection(.enabled)
+                    if let usage = model.diskUsage {
+                        LabeledContent("Current Capacity", value: capacityLabel(usage.capacityBytes))
+                        LabeledContent("Used on Mac", value: ByteCountFormatter.string(fromByteCount: Int64(usage.allocatedBytes), countStyle: .file))
+                        if let pending = model.pendingDiskShrink {
+                            Text(pending.bootStarted
+                                 ? String(localized: "Shrinking to \(pending.capacityGiB) GB will finish the next time Brinewell opens or before the next startup.")
+                                 : String(localized: "Shrinking to \(pending.capacityGiB) GB is scheduled for the next startup."))
+                                .font(.callout).foregroundStyle(.secondary)
+                            Button("Cancel Shrink") { model.cancelDiskShrink() }
+                        } else {
+                            HStack {
+                                TextField("New Capacity", value: $requestedGiB, format: .number)
+                                Text("GB").foregroundStyle(.secondary)
+                            }
+                            Text("Between \(usage.minimumCapacityGiB) and \(usage.maximumCapacityGiB) GB.")
+                                .font(.callout).foregroundStyle(.secondary)
+                            Button("Apply…") { confirmApply = true }
+                                .disabled(!capacityValid || vm.busy || deployment.busy || model.diskResizing)
+                        }
+                    }
+                    if model.diskResizing {
+                        HStack {
+                            ProgressView().controlSize(.small)
+                            Text("Resizing the system disk…")
+                        }
+                    }
+                    if let error = model.diskResizeError {
+                        Text(error).foregroundStyle(.red).textSelection(.enabled)
+                    }
+                    Button("Clear Disk Path") {
+                        model.configuration.pendingDiskShrink = nil
+                        model.configuration.diskImagePath = nil
+                    }
+                } else { Text("No disk selected").foregroundStyle(.secondary) }
+                Button("Choose Existing File") { model.chooseDisk() }
+            }.disabled(vm.busy || model.diskResizing)
+            Section("Shared Folder") {
+                if let folder = model.configuration.sharedFolder {
+                    Text(folder.path).textSelection(.enabled)
+                    Toggle("Read Only", isOn: Binding(
+                        get: { model.configuration.sharedFolder?.readOnly ?? true },
+                        set: { model.configuration.sharedFolder?.readOnly = $0 }
+                    ))
+                    Text("After the next boot, open /run/brinewell/shared in SteamOS.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Button(model.configuration.sharedFolder == nil ? String(localized: "Choose Folder") : String(localized: "Change Folder")) {
+                        model.chooseSharedFolder()
+                    }
+                    if model.configuration.sharedFolder != nil {
+                        Button("Remove Share") { model.configuration.sharedFolder = nil }
+                    }
+                }
+            }.disabled(vm.busy)
+            Section("Network") {
+                Toggle("Enable Proxy", isOn: $model.configuration.network.proxyEnabled)
+                TextField("Proxy Address", text: $model.configuration.network.proxyURL,
+                          prompt: Text("socks5://127.0.0.1:7890"))
+                Text("SOCKS5, HTTP, and HTTPS are supported. Include a port in the address. With the proxy off, traffic goes directly through the Mac’s physical network interface and bypasses TUN.")
+                    .font(.callout).foregroundStyle(.secondary)
+                Text("HTTP and HTTPS proxies do not support UDP. Games and services that rely on UDP may fail to connect. Use a SOCKS5 proxy with UDP support if needed.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }.disabled(vm.busy)
+            Section("Resources") {
+                Stepper("CPU: \(model.configuration.cpuCount)", value: $model.configuration.cpuCount, in: 1...model.host.maximumCPUs)
+                Stepper("Memory: \(model.configuration.memoryGiB) GiB", value: $model.configuration.memoryGiB, in: 1...model.host.maximumMemoryGiB)
+            }.disabled(vm.busy)
+            Section("Virtual Machine Display") {
+                if let capabilities = model.displayCapabilities {
+                    LabeledContent("Host Display", value: capabilities.name)
+                    Picker("Resolution", selection: resolutionSelection) {
+                        ForEach(capabilities.resolutions, id: \.self) { resolution in
+                            Text(verbatim: resolution.label).tag(resolution)
+                        }
+                    }
+                    Picker("Refresh Rate", selection: $model.configuration.display.refreshRate) {
+                        ForEach(capabilities.refreshRates(for: model.configuration.display.resolution), id: \.self) { rate in
+                            Text("\(rate) Hz").tag(rate)
+                        }
+                    }
+                    Text("Up to \(capabilities.maximumResolution.label) at \(capabilities.maximumRefreshRate) Hz. Available modes depend on the current host display.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                Text("The Steam interface follows the display resolution. The window scales proportionally and stays within the limits of the current display.")
+                    .font(.callout).foregroundStyle(.secondary)
+                if let error = displayError { Text(error).foregroundStyle(.red) }
+            }.disabled(vm.busy)
+            Section("Graphics Backend") {
+                Picker("Backend", selection: Binding(
+                    get: { model.configuration.graphicsBackend },
+                    set: { model.setGraphicsBackend($0) }
+                )) {
+                    Text("Neptune / D3DMetal").tag(GraphicsBackend.neptune)
+                    Text("Neptune / Mullion").tag(GraphicsBackend.mullion)
+                    Text("Venus Only").tag(GraphicsBackend.venus)
+                }
+                if vm.state == .running {
+                    Text("Backend changes apply to the next game launch; the framework, aperture, and multi-ring settings still only apply at boot.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    if let applied = vm.graphicsApplied {
+                        Text("Active: \(applied.title)").font(.callout).foregroundStyle(.secondary)
+                    }
+                    if let error = vm.graphicsError { Text(error).foregroundStyle(.red) }
+                }
+                Group {
+                    if model.configuration.graphicsBackend == .neptune {
+                        LabeledContent("D3DMetal") {
+                            Text(model.configuration.d3dMetalFrameworkPath ?? String(localized: "None selected"))
+                                .textSelection(.enabled)
+                        }
+                        HStack {
+                            Button("Choose Framework") { model.chooseD3DMetalFramework() }
+                            if model.configuration.d3dMetalFrameworkPath != nil {
+                                Button("Clear") { model.configuration.d3dMetalFrameworkPath = nil }
+                            }
+                        }
+                    }
+                    if model.configuration.graphicsBackend != .venus {
+                        Stepper("Neptune aperture: \(model.configuration.neptuneApertureMiB) MiB",
+                                value: $model.configuration.neptuneApertureMiB, in: 8192...65536, step: 8192)
+                        Toggle("Experimental Multi-Ring (Global)", isOn: $model.configuration.neptuneMultiRing)
+                    }
+                }.disabled(vm.busy)
+            }
+            Section("Game Performance") {
+                Picker("Overlay Level", selection: Binding(
+                    get: { model.configuration.gameHUDLevel },
+                    set: { model.setGameHUD(level: $0) }
+                )) {
+                    ForEach(GameHUDLevel.allCases, id: \.self) { level in
+                        Text(level.title).tag(level)
+                    }
+                }
+                Text(model.configuration.gameHUDLevel.detail)
+                    .font(.callout).foregroundStyle(.secondary)
+                Picker("Overlay Position", selection: Binding(
+                    get: { model.configuration.gameHUDPosition },
+                    set: { model.setGameHUD(position: $0) }
+                )) {
+                    ForEach(GameHUDPosition.allCases, id: \.self) { position in
+                        Text(position.title).tag(position)
+                    }
+                }.disabled(model.configuration.gameHUDLevel == .off)
+                Text("Game frame times measure the interval between successful frame submissions. CPU, GPU, memory, and battery metrics cover the whole Mac. A dash (—) indicates unavailable data.")
+                    .font(.callout).foregroundStyle(.secondary)
+                Text("Frame statistics are available for Neptune and Vulkan X11 games. Native Wayland games are currently unsupported. The SteamOS performance overlay can stay off.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            Section("Configuration File") {
+                Text(model.configurationPath).textSelection(.enabled)
+                if let error = model.loadError {
+                    Text(error).foregroundStyle(.red).textSelection(.enabled)
+                    Button("Reload Configuration") { model.reload() }.disabled(vm.busy)
+                }
+                if let error = model.saveError { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+            }
+        }.formStyle(.grouped)
+            .disabled(deployment.busy || model.diskResizing)
+            .confirmationDialog("Resize System Disk", isPresented: $confirmApply) {
+                Button("Apply") { applyCapacityChange() }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text(applyMessage)
+            }
+            .onChange(of: model.diskUsage) { requestedGiB = nil }
+    }
+}

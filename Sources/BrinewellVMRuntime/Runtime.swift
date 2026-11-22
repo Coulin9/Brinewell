@@ -1,0 +1,321 @@
+import AppKit
+import BrinewellCore
+import CKrun
+import Darwin
+import Foundation
+
+@discardableResult
+func krunCheck(_ operation: String, _ result: Int32) throws -> Int32 {
+    guard result >= 0 else {
+        throw RuntimeError("\(operation) failed: \(result) (\(String(cString: strerror(-result))))")
+    }
+    return result
+}
+
+@MainActor
+public final class Runtime {
+    private let options: RuntimeOptions
+    private let display: VMDisplay
+    private let ports: VMPorts
+    private let input: VMInput
+    private let network: RuntimeNetwork
+    private let workContext = WorkContextService()
+    private var context: UInt32?
+    private var shutdownFD: Int32 = -1
+    private var diskFD: Int32 = -1
+    private var stopping = false
+    private var started = false
+    private var ready = false
+    private var currentDisplayMode: VMDisplayConfiguration
+    private let initialScreenID: UInt32
+
+    /// If krun_start_enter returns, called after the main actor has closed the
+    /// guest window and runtime services. libkrun may terminate the process on
+    /// a normal guest shutdown instead of returning to its caller.
+    public var onExit: (@Sendable (Int32) -> Void)?
+    public var onGraphicsApplied: ((GraphicsBackend) -> Void)? {
+        get { ports.onGraphicsApplied }
+        set { ports.onGraphicsApplied = newValue }
+    }
+
+    /// Takes ownership of options.diskFD only after initialization succeeds.
+    public init(options: RuntimeOptions) throws {
+        self.options = options
+        guard let capabilities = HostDisplayCapabilities.detect(displayID: options.hostDisplayID) else {
+            throw RuntimeError(String(localized: "Could not read the available display modes for the host display."))
+        }
+        try capabilities.validate(options.display)
+        currentDisplayMode = options.display
+        initialScreenID = capabilities.id
+        display = try VMDisplay()
+        display.displayRefreshRate = Double(options.display.refreshRate)
+        display.setGameHUD(level: options.gameHUDLevel, position: options.gameHUDPosition)
+        network = try RuntimeNetwork(directory: options.runDirectory)
+        ports = try VMPorts(runDirectory: options.runDirectory)
+        display.hardwareSample = { [weak ports] in ports?.hardwareSample() }
+        input = try VMInput()
+        ports.onGraphicsRequest = { [weak self] mode in try self?.setGraphicsBackend(mode) }
+        diskFD = options.diskFD
+        workContext.onReport = { [weak display] line in
+            display?.setWorkContextWarning(WorkContextNotice.warning(for: line))
+        }
+    }
+
+    public func start() async throws {
+        do {
+            try Task.checkCancellation()
+            guard !stopping else { throw CancellationError() }
+            let sanitizedPrefixes = ["NPT_", "DMN_", "STEAMAC_", "BRINEWELL_WMTR", "WMTR_"]
+            for key in ProcessInfo.processInfo.environment.keys
+                where sanitizedPrefixes.contains(where: { key.hasPrefix($0) }) {
+                unsetenv(key)
+            }
+            for key in ["D3DMETAL_FRAMEWORK_PATH", "RENDER_SERVER_EXEC_PATH"] { unsetenv(key) }
+            setenv("RENDER_SERVER_EXEC_PATH", options.renderer.path, 1)
+            setenv("VKR_VULKAN_DRIVER", options.vulkanDriver.path, 1)
+            setenv("VKR_GPU_BUDGET_MIB", "4096", 1)
+            // Host-only trusted allowlists, set only for validated supports so
+            // a guest tag can never steer a worker to an unvalidated adapter.
+            if let support = options.neptuneD3DMetal {
+                setenv("NPT_BRINEWELL_D3DMETAL_ADAPTER", support.adapter.path, 1)
+                if case .d3dmetal(let framework, _) = support.backend {
+                    setenv("D3DMETAL_FRAMEWORK_PATH", framework.path, 1)
+                }
+                // The arm64 process reporting the capset cannot probe an x86_64 library.
+                setenv("NPT_CAPSET_D3D12", "1", 1)
+                setenv("DMN_LOG", "warn", 1)
+            }
+            if let support = options.neptuneMullion {
+                setenv("NPT_BRINEWELL_MULLION_ADAPTER", support.adapter.path, 1)
+                setenv("MULLION_LOG_PATH", "none", 0)
+            }
+            if let neptune = options.neptune {
+                setenv("NPT_D3D11_LIBRARY_PATH", neptune.adapter.path, 1)
+                setenv("NPT_DXGI_LIBRARY_PATH", neptune.adapter.path, 1)
+                setenv("NPT_D3D12_LIBRARY_PATH", neptune.adapter.path, 1)
+                let settings = "adapter=\(neptune.adapter.path) aperture_mib=\(neptune.apertureMiB) multi_ring=\(neptune.multiRing ? 1 : 0)"
+                switch neptune.backend {
+                case .d3dmetal(let framework, let version):
+                    setenv("NPT_BACKEND", "d3dmetal", 1)
+                    report("BRINEWELL neptune enabled framework=\(framework.path) version=\(version ?? "unknown") \(settings)")
+                case .mullion:
+                    setenv("NPT_BACKEND", "mullion", 1)
+                    report("BRINEWELL neptune enabled backend=mullion \(settings)")
+                }
+            }
+            await workContext.start(renderer: options.renderer, supportsBackend: options.neptune != nil)
+            try Task.checkCancellation()
+            guard !stopping else { throw CancellationError() }
+            try network.start(binary: options.resources.appendingPathComponent("gvproxy").path,
+                              sshPort: options.sshPort, configuration: options.network)
+            raiseFileLimit()
+            try krunCheck("krun_init_log", krun_init_log(KRUN_LOG_TARGET_DEFAULT, UInt32(KRUN_LOG_LEVEL_WARN), UInt32(KRUN_LOG_STYLE_AUTO), UInt32(KRUN_LOG_OPTION_NO_ENV)))
+            let ctx = UInt32(try krunCheck("krun_create_ctx", krun_create_ctx()))
+            context = ctx
+            try krunCheck("krun_set_vm_config", krun_set_vm_config(ctx, options.cpus, options.memoryMiB))
+            try krunCheck("krun_disable_implicit_vsock", krun_disable_implicit_vsock(ctx))
+            try ports.attach(context: ctx)
+            try input.attach(context: ctx)
+            let kernel = options.resources.appendingPathComponent("Image").path
+            let initrd = options.resources.appendingPathComponent("initramfs.cpio.gz").path
+            let telemetrySampler = options.resources.appendingPathComponent("macmon")
+            var cmdline = "console=hvc0 loglevel=4 rootwait brinewell.ssh=1 brinewell.steam_client=deck"
+            cmdline += HostCPUInfo.kernelArguments(sampler: telemetrySampler)
+            // Boot-time seed only; the live authority is the fx.graphics port.
+            cmdline += " brinewell.graphics=\(options.graphicsBackend.rawValue)"
+            if let neptune = options.neptune {
+                cmdline += " brinewell.gfx=neptune"
+                if case .mullion = neptune.backend { cmdline += " brinewell.neptune.backend=mullion" }
+                if neptune.multiRing { cmdline += " brinewell.neptune.multi_ring=1" }
+            }
+            if let folder = options.sharedFolder {
+                // Use the guest caller's UID/GID so deck can access directories owned by the Mac user.
+                try krunCheck("krun_add_virtiofs4", krun_add_virtiofs4(
+                    ctx, "brinewell-share", folder.path, 0, folder.readOnly, UInt32(KRUN_SEMANTICS_LINUX_SIMPLIFIED)
+                ))
+                cmdline += folder.readOnly ? " brinewell.share=ro" : " brinewell.share=rw"
+            }
+            if let shrinkHomeKiB = options.shrinkHomeKiB {
+                cmdline += " brinewell.shrink_home=\(shrinkHomeKiB)"
+            }
+            try krunCheck("krun_set_kernel", krun_set_kernel(ctx, kernel, 0, initrd, cmdline))
+            try krunCheck("krun_add_disk2(vda)", krun_add_disk2(ctx, "vda", options.disk, 0, false))
+            try krunCheck("krun_add_disk2(vdb)", krun_add_disk2(ctx, "vdb", options.resources.appendingPathComponent("brinewell-layer.img").path, 0, true))
+            if krun_has_feature(UInt64(KRUN_FEATURE_SND)) == 1 {
+                try krunCheck("krun_set_snd_device", krun_set_snd_device(ctx, true))
+            }
+            let venus: UInt32 = 1 << 6
+            let noVirgl: UInt32 = 1 << 7
+            let neptuneFlag: UInt32 = 1 << 15
+            let anyNeptune = options.neptuneD3DMetal != nil || options.neptuneMullion != nil
+            let gpuFlags = venus | noVirgl | (anyNeptune ? neptuneFlag : 0)
+            let apertureMiB = options.neptune?.apertureMiB ?? 8192
+            try krunCheck("krun_set_gpu_options2", krun_set_gpu_options2(ctx, gpuFlags, UInt64(apertureMiB) << 20))
+            let mode = options.display
+            let displayID = UInt32(try krunCheck("krun_add_display", krun_add_display(ctx, UInt32(mode.width), UInt32(mode.height))))
+            try krunCheck("krun_display_set_refresh_rate", krun_display_set_refresh_rate(ctx, displayID, UInt32(mode.refreshRate)))
+            try krunCheck("krun_display_set_physical_size", krun_display_set_physical_size(ctx, displayID, 339, 212))
+            report("BRINEWELL display width=\(mode.width) height=\(mode.height) refresh_rate=\(mode.refreshRate)")
+            var backend = display.makeBackend()
+            try krunCheck("krun_set_display_backend", krun_set_display_backend(ctx, &backend, MemoryLayout<krun_display_backend>.size))
+            try network.attach(context: ctx)
+            shutdownFD = try krunCheck("krun_get_shutdown_eventfd", krun_get_shutdown_eventfd(ctx))
+            try ports.start(onReady: { [weak self] in
+                guard let self, !self.stopping, !self.ready else { return }
+                self.ready = true
+                report("BRINEWELL state running")
+            }, onShutdown: { [weak self] in self?.shutdown() }, onFrameDump: { [weak self] path in
+                guard let self else { throw RuntimeError("runtime unavailable") }
+                try self.display.dump(to: path)
+                self.reportScanoutStats()
+            }, onPointerFocus: { [weak self] line in
+                self?.input.updateGuestFocus(line)
+            }, onFullScreen: { [weak self] enabled in
+                guard let self, !self.stopping else { throw RuntimeError("runtime stopping") }
+                try self.display.setFullScreen(enabled)
+            }, onGameFrame: { [weak self] sample in
+                self?.display.receiveGameFrame(sample)
+            })
+            // Desired mode is sent as soon as the guest control service is up.
+            try ports.setGraphicsBackend(options.graphicsBackend)
+            ports.startTelemetry(sampler: telemetrySampler)
+            display.show(input: input, mode: currentDisplayMode, screenID: initialScreenID,
+                         onScreenChange: { [weak self] screen in self?.hostScreenChanged(screen) },
+                         onActivity: { [weak self] active in
+                self?.ports.setInputActive(active)
+                self?.workContext.setActive(active)
+            }, onClose: { [weak self] in self?.shutdown() })
+            report("BRINEWELL state booting")
+            started = true
+            let thread = Thread { [self] in
+                let result = krun_start_enter(ctx)
+                Task { @MainActor in
+                    if result != 0 { report("BRINEWELL error krun_start_enter returned \(result)") }
+                    self.started = false
+                    self.workContext.stop()
+                    self.context = nil // krun_start_enter consumed the context.
+                    self.shutdownFD = -1
+                    self.display.close()
+                    self.input.setActive(false)
+                    self.ports.close()
+                    self.network.stop()
+                    self.closeDisk()
+                    if let onExit = self.onExit { onExit(result) } else { Darwin.exit(result == 0 ? 0 : 1) }
+                }
+            }
+            thread.name = "brinewell-vmm"
+            thread.stackSize = 16 << 20
+            thread.qualityOfService = .userInteractive
+            thread.start()
+        } catch {
+            workContext.stop()
+            display.close()
+            input.setActive(false)
+            ports.setInputActive(false)
+            if let context { _ = krun_free_ctx(context); self.context = nil }
+            ports.close()
+            network.stop()
+            closeDisk()
+            throw error
+        }
+    }
+
+    private func closeDisk() {
+        if diskFD >= 0 { Darwin.close(diskFD); diskFD = -1 }
+    }
+
+    deinit {
+        if diskFD >= 0 { Darwin.close(diskFD) }
+    }
+
+    private func hostScreenChanged(_ screen: NSScreen) {
+        guard !stopping, let id = HostDisplayCapabilities.screenID(screen),
+              let capabilities = HostDisplayCapabilities.detect(displayID: id) else { return }
+        report("BRINEWELL display screen \(id)")
+        guard (try? capabilities.validate(currentDisplayMode)) == nil,
+              let mode = capabilities.preferredMode(for: currentDisplayMode), let context else { return }
+        do {
+            try krunCheck("krun_display_set_mode", krun_display_set_mode(
+                context, 0, UInt32(mode.width), UInt32(mode.height), UInt32(mode.refreshRate), 339, 212
+            ))
+            currentDisplayMode = mode
+            display.displayRefreshRate = Double(mode.refreshRate)
+            report("BRINEWELL display width=\(mode.width) height=\(mode.height) refresh_rate=\(mode.refreshRate)")
+        } catch {
+            report("BRINEWELL error \(error)")
+            shutdown()
+        }
+    }
+
+    /// Emits the scanout path counters next to a frame dump. "native" counts
+    /// scanouts handed to the display as a GPU resource; a healthy zero-copy
+    /// session keeps `cpu_readback_bytes` at zero after the first frames.
+    private func reportScanoutStats() {
+        guard let context else { return }
+        var native: UInt64 = 0
+        var fallbacks: UInt64 = 0
+        var readback: UInt64 = 0
+        let result = krun_gpu_get_scanout_stats(context, &native, &fallbacks, &readback)
+        guard result == 0 else { return }
+        report("BRINEWELL scanout native=\(native) fallbacks=\(fallbacks) cpu_readback_bytes=\(readback)")
+    }
+
+    public func setGameHUD(level: GameHUDLevel, position: GameHUDPosition) {
+        guard !stopping else { return }
+        display.setGameHUD(level: level, position: position)
+    }
+
+    public func installUU() throws {
+        guard !stopping else { throw RuntimeError(String(localized: "The virtual machine is shutting down.")) }
+        try ports.sendUU(.install)
+    }
+
+    public func refreshUUStatus() throws {
+        guard !stopping else { throw RuntimeError(String(localized: "The virtual machine is shutting down.")) }
+        try ports.sendUU(.status)
+    }
+
+    /// Live backend switch, applied on the next game launch. Availability was
+    /// validated once at startup; refuse anything else.
+    public func setGraphicsBackend(_ backend: GraphicsBackend) throws {
+        guard !stopping else { throw RuntimeError(String(localized: "The virtual machine is shutting down.")) }
+        guard options.availableBackends.contains(backend) else {
+            throw RuntimeError(options.neptuneReasons[backend] ?? String(localized: "This graphics backend is not available."))
+        }
+        try ports.setGraphicsBackend(backend)
+    }
+
+    public func shutdown() {
+        guard !stopping else { return }
+        stopping = true
+        // Registration may be awaiting launchd. The startup continuation will
+        // clean up without creating a VM when it resumes.
+        guard started else {
+            workContext.stop()
+            return
+        }
+        ports.stopTelemetry()
+        display.stopInput()
+        input.setActive(false)
+        ports.setInputActive(false)
+        report("BRINEWELL state stopping")
+        var one: UInt64 = 1
+        if Darwin.write(shutdownFD, &one, MemoryLayout<UInt64>.size) != MemoryLayout<UInt64>.size {
+            report("BRINEWELL control error cannot send guest shutdown key: \(String(cString: strerror(errno)))")
+        }
+    }
+
+
+    private func raiseFileLimit() {
+        var limit = rlimit()
+        var maximum: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0,
+              sysctlbyname("kern.maxfilesperproc", &maximum, &size, nil, 0) == 0, maximum > 0 else { return }
+        let wanted = min(limit.rlim_max, rlim_t(maximum))
+        if limit.rlim_cur < wanted {
+            limit.rlim_cur = wanted
+            _ = setrlimit(RLIMIT_NOFILE, &limit)
+        }
+    }
+}

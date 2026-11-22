@@ -1,0 +1,33 @@
+{
+  "d3dmetal": {
+    "version": "4.0b3",
+    "binary": "Frameworks/D3DMetal.framework/Versions/A/D3DMetal",
+    "sha256": "a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660",
+    "architectures": [
+      "x86_64"
+    ]
+  },
+  "adapter": {
+    "path": ".build/out/d3dmetal/libd3dmetal-native.dylib",
+    "sha256": "72edba97a3b5da1b6588a4e15aed85c881515c0c5e4714fc9a8517f8b71e2b0e",
+    "architectures": [
+      "x86_64"
+    ]
+  },
+  "renderServer": {
+    "path": ".build/out/virglrenderer/virgl_render_server",
+    "sha256": "5f22dd7ff78b5ac5e1884c1631bd0de5f152dcfd7372feeaf04c3be52515521f",
+    "architectures": [
+      "x86_64",
+      "arm64"
+    ]
+  },
+  "guestProton": {
+    "version": "proton-11.0-2e-x86_64",
+    "ntdll": "ELF 64-bit LSB shared object, x86-64"
+  },
+  "guestProbes": {
+    "dx12-copy-smoke.exe": "neptune",
+    "launcher.exe": "venus"
+  }
+}
