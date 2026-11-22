@@ -146,6 +146,23 @@ Mullion 数据来自单轮测试，呈现尺寸为 2560×1600，仍有已知未�
 游戏的容器命名空间；Venus 与不兼容工具按原样直通。旧版本生成的 Brinewell 自有兼容工具会在
 Steam 启动前自动迁回其原始基底工具。
 
+### NGX 超分辨率
+
+Neptune / D3DMetal 提供按需开启的 `nvngx.dll` 与 `nvapi64.dll`，让游戏使用 D3DMetal 的
+NGX 超分辨率。该功能按游戏开启：在该游戏的 Steam 启动选项中加入
+`BRINEWELL_NGX_SR=1 %command%`。不会做任何系统级安装，Steam 自身不会加载 nvapi64。
+
+- 仅 Neptune / D3DMetal 后端下的 x86-64 Proton 启动生效；其他后端和 ARM64 工具会忽略该选项。
+- 符合条件的启动会把两个 DLL 复制进该游戏自己的前缀
+  （`pfx/drive_c/windows/system32`），并设置 `BRINEWELL_NGX_SR_ACTIVE=1` 与
+  `nvngx=n;nvapi64=n` override。前缀中已有第三方 `nvngx.dll`/`nvapi64.dll`（包括
+  Proton 自带）时绝不覆盖、不备份、不接管，该次启动只保留普通 Neptune 注入；用户自己的
+  `WINEDLLOVERRIDES` 覆盖这两个 DLL 时同样不启用。`BRINEWELL_NGX_SR_ACTIVE`
+  是 wrapper 推导的有效标志：未激活 NGX 的注入启动会显式清除它，外层环境
+  中遗留的值不会生效。
+- 移除启动选项、切换后端或 payload 文件缺失后，下一次启动只清理 wrapper 自己安装过的
+  文件；被用户替换过的文件保留不动。
+- 仍不显示超分选项的游戏（驱动注册表或签名校验、Streamline 插件包等）不在支持范围内。
 
 ### 反作弊（EAC）
 

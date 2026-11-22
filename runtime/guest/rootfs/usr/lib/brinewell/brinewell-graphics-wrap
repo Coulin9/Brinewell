@@ -13,8 +13,11 @@ tool root executes the delegate with byte-identical arguments.
 
 import array
 import fcntl
+import hashlib
+import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 
@@ -28,6 +31,12 @@ CONTAINER_PAYLOAD = graphics.CONTAINER_PAYLOAD
 DEV_PAYLOAD = Path.home() / ".local/share/brinewell/neptune-dev"
 GRAPHICS_DLLS = graphics.GRAPHICS_DLLS
 SRT_BWRAP_REL = "libexec/steam-runtime-tools-0/srt-bwrap"
+# Per-game opt-in NGX payload (BRINEWELL_NGX_SR=1): installed into the game's
+# own prefix, never bound system-wide so Steam itself cannot pick nvapi64 up.
+NGX_DLLS = ("nvngx", "nvapi64")
+NGX_MANAGED = tuple(f"{name}.dll" for name in NGX_DLLS)
+NGX_MARKER = ".brinewell-ngx-sr.json"
+NGX_LOCK = ".brinewell-ngx-sr.lock"
 
 
 def _log(message):
@@ -144,6 +153,38 @@ def _payload():
     return PAYLOAD, CONTAINER_PAYLOAD, []
 
 
+def _prefix_system32(compat, create):
+    """The prefix's safe system32 path, or None. With create the missing chain
+    is made like _ensure_prefix_nptunix does; without it a missing component
+    just means there is nothing to touch. Symlink and non-directory
+    components are always refused."""
+    node = Path(compat)
+    if not node.is_dir():
+        _log(f"compatdata {compat} is not a directory: passing through")
+        return None
+    try:
+        for name in ("pfx", "drive_c", "windows", "system32"):
+            node = node / name
+            if node.is_symlink():
+                _log(f"prefix component {node} is a symlink: passing through")
+                return None
+            if not node.exists():
+                if not create:
+                    return None
+                os.mkdir(node, 0o755)
+                if name == "drive_c":
+                    # Proton sets casefold right after creating drive_c; it
+                    # only works on an empty directory, so do it now.
+                    _set_casefold(node)
+            elif not node.is_dir():
+                _log(f"prefix component {node} is not a directory: passing through")
+                return None
+    except OSError as error:
+        _log(f"cannot create prefix dirs under {compat}: {error}")
+        return None
+    return node
+
+
 def _ensure_prefix_nptunix(compat, arch, root):
     """Keep <compat>/pfx/drive_c/windows/system32/nptunix.dll byte-identical
     to the payload copy. Wine only loads a builtin that also has a file inside
@@ -152,29 +193,9 @@ def _ensure_prefix_nptunix(compat, arch, root):
     tolerates pre-existing dirs and files). False means the prefix could not
     be made safe and Neptune must not be injected.
     """
-    node = Path(compat)
-    if not node.is_dir():
-        _log(f"compatdata {compat} is not a directory: passing through")
+    system32 = _prefix_system32(compat, create=True)
+    if system32 is None:
         return False
-    try:
-        for name in ("pfx", "drive_c", "windows", "system32"):
-            node = node / name
-            if node.is_symlink():
-                _log(f"prefix component {node} is a symlink: passing through")
-                return False
-            if not node.exists():
-                os.mkdir(node, 0o755)
-                if name == "drive_c":
-                    # Proton sets casefold right after creating drive_c; it
-                    # only works on an empty directory, so do it now.
-                    _set_casefold(node)
-            elif not node.is_dir():
-                _log(f"prefix component {node} is not a directory: passing through")
-                return False
-    except OSError as error:
-        _log(f"cannot create prefix dirs under {compat}: {error}")
-        return False
-    system32 = node
     try:
         payload = (root / f"{arch}-windows/nptunix.dll").read_bytes()
         target = system32 / "nptunix.dll"
@@ -200,12 +221,446 @@ def _ensure_prefix_nptunix(compat, arch, root):
         return False
 
 
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_fd(fd):
+    digest = hashlib.sha256()
+    with os.fdopen(fd, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _ngx_requested(env):
+    return env.get("BRINEWELL_NGX_SR", "").strip().lower() in ("1", "true", "yes")
+
+
+def _ngx_overridden(env):
+    """True when the user's WINEDLLOVERRIDES already covers nvngx/nvapi64."""
+    for entry in env.get("WINEDLLOVERRIDES", "").split(";"):
+        left = entry.strip().split("=")[0]
+        for key in left.split(","):
+            key = key.strip().lower()
+            if key.endswith(".dll"):
+                key = key[:-4]
+            if key and (key in NGX_DLLS or "*" in key or "?" in key):
+                return True
+    return False
+
+
+def _ngx_marker(compat):
+    """Digests this helper recorded, keyed by the fixed managed names.
+
+    The marker is untrusted data: a missing entry yields {}, while a
+    symlink, non-regular file, unparseable JSON, non-dict top level or any
+    unexpected file key/digest fails the whole schema check and also
+    yields {} (the marker never contributes delete paths)."""
+    try:
+        cfd = os.open(compat, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return {}
+    try:
+        try:
+            info = os.stat(NGX_MARKER, dir_fd=cfd, follow_symlinks=False)
+        except OSError:
+            return {}
+        if not stat.S_ISREG(info.st_mode):
+            _log(f"NGX SR marker under {compat} is not a regular file: "
+                 "ignoring it")
+            return {}
+        try:
+            fd = os.open(NGX_MARKER, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=cfd)
+            with os.fdopen(fd, "r") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            _log(f"NGX SR marker under {compat} is unreadable: ignoring it")
+            return {}
+    finally:
+        os.close(cfd)
+    if not isinstance(data, dict):
+        _log(f"NGX SR marker under {compat} fails schema check: ignoring it")
+        return {}
+    files = data.get("files")
+    if not isinstance(files, dict):
+        _log(f"NGX SR marker under {compat} fails schema check: ignoring it")
+        return {}
+    for name, digest in files.items():
+        if name not in NGX_MANAGED or not isinstance(digest, str) \
+                or len(digest) != 64 \
+                or any(c not in "0123456789abcdef" for c in digest.lower()):
+            _log(f"NGX SR marker under {compat} fails schema check: "
+                 "ignoring it")
+            return {}
+    return dict(files)
+
+
+def _ngx_lock(compat):
+    """Non-blocking per-prefix lock fd, or None when another launch holds it."""
+    try:
+        fd = os.open(Path(compat) / NGX_LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _ngx_dirs(compat, create):
+    """(compat_fd, system32_fd) pinning the prefix dirs, else (None, None).
+
+    Every component below compat is opened O_NOFOLLOW|O_DIRECTORY (created
+    like _ensure_prefix_nptunix does when create is set), so all later
+    file operations run relative to the pinned directory and cannot be
+    redirected by renaming or re-linking path components afterwards."""
+    try:
+        compat_fd = os.open(compat, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        _log(f"compatdata {compat} is not a directory: passing through")
+        return None, None
+    node = compat_fd
+    chain = []
+    path = Path(compat)
+    for name in ("pfx", "drive_c", "windows", "system32"):
+        path = path / name
+        child = None
+        try:
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=node)
+        except OSError:
+            if create:
+                try:
+                    os.mkdir(name, 0o755, dir_fd=node)
+                except OSError as error:
+                    _log(f"cannot create {path}: {error}")
+                else:
+                    if name == "drive_c":
+                        # Proton sets casefold right after creating drive_c;
+                        # it only works on an empty directory, so do it now.
+                        _set_casefold(path)
+                    try:
+                        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY
+                                        | os.O_NOFOLLOW, dir_fd=node)
+                    except OSError as error:
+                        _log(f"cannot open {path}: {error}")
+        if child is None:
+            break
+        chain.append(child)
+        node = child
+    else:
+        return compat_fd, node
+    os.close(compat_fd)
+    for fd in chain:
+        os.close(fd)
+    return None, None
+
+
+def _ngx_temp(dirfd, data, mode):
+    """Write data to a fresh hidden temp file inside dirfd; return its name."""
+    for _ in range(10):
+        name = f".ngx-{os.getpid()}-{os.urandom(4).hex()}.tmp"
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode,
+                         dir_fd=dirfd)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.chmod(name, mode, dir_fd=dirfd)
+        except BaseException:
+            try:
+                os.unlink(name, dir_fd=dirfd)
+            except OSError:
+                pass
+            raise
+        return name
+    raise OSError("cannot create a staging file")
+
+
+def _ngx_prefix_busy(compat):
+    """True when a live process still names this prefix in WINEPREFIX.
+
+    The NGX lock is released before exec, so an opt-out launch racing a
+    just-started opt-in game could delete the DLLs before it maps them.
+    This check only narrows that window: a launch whose Wine processes
+    have not been created yet is still uncovered.
+    """
+    prefix = os.path.join(os.path.realpath(compat), "pfx")
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return False
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            data = Path(f"/proc/{pid}/environ").read_bytes()
+        except OSError:
+            continue
+        for item in data.split(b"\0"):
+            if item.startswith(b"WINEPREFIX=") and \
+                    os.path.realpath(os.fsdecode(item[11:])) == prefix:
+                return True
+    return False
+
+
+def _ngx_cleanup(compat):
+    """Remove this helper's own files from the prefix, then the marker.
+
+    Only the two fixed managed names are ever unlinked, and only when the
+    (strictly validated) marker recorded them and the current digest still
+    matches; a file the user replaced is kept and disowned. The marker is
+    removed only when nothing is left pending: a busy prefix, a live Wine
+    process or a failed unlink keeps the record for the next launch.
+    """
+    compat = Path(compat)
+    if not os.path.lexists(compat / NGX_MARKER):
+        return
+    fd = _ngx_lock(compat)
+    if fd is None:
+        _log(f"NGX SR cleanup for {compat} skipped: prefix is busy")
+        return
+    try:
+        if _ngx_prefix_busy(compat):
+            _log(f"NGX SR cleanup for {compat} skipped: "
+                 "a Wine process is still live")
+            return
+        owned = _ngx_marker(compat)
+        cfd, sfd = _ngx_dirs(compat, create=False)
+        if sfd is None:
+            if not owned:
+                try:
+                    (compat / NGX_MARKER).unlink()
+                except OSError:
+                    pass
+            return
+        try:
+            pending = False
+            for name in NGX_MANAGED:
+                digest = owned.get(name)
+                if digest is None:
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=sfd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    pending = True
+                    _log(f"cannot inspect managed {name} in {compat}: {error}")
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                try:
+                    target = os.open(name, os.O_RDONLY | os.O_NOFOLLOW,
+                                     dir_fd=sfd)
+                    actual = _sha256_fd(target)
+                except OSError as error:
+                    pending = True
+                    _log(f"cannot read managed {name} in {compat}: {error}")
+                    continue
+                if actual != digest:
+                    continue
+                try:
+                    os.unlink(name, dir_fd=sfd)
+                except OSError as error:
+                    pending = True
+                    _log(f"cannot remove managed {name} in {compat}: {error}")
+            if not pending:
+                try:
+                    os.unlink(NGX_MARKER, dir_fd=cfd)
+                except OSError:
+                    pass
+        finally:
+            os.close(sfd)
+            os.close(cfd)
+    finally:
+        os.close(fd)
+
+
+def _ngx_rollback(sfd, state, done, temps, backups):
+    """Undo a partially committed install, restoring the previous files."""
+    for temp in temps.values():
+        if temp is not None:
+            try:
+                os.unlink(temp, dir_fd=sfd)
+            except OSError:
+                pass
+    for name in reversed(done):
+        if state[name] == "empty":
+            try:
+                os.unlink(name, dir_fd=sfd)
+            except OSError:
+                pass
+        else:
+            try:
+                os.replace(backups[name], name, src_dir_fd=sfd,
+                           dst_dir_fd=sfd)
+            except OSError:
+                pass
+            backups[name] = None
+    for backup in backups.values():
+        if backup is not None:
+            try:
+                os.unlink(backup, dir_fd=sfd)
+            except OSError:
+                pass
+
+
+def _ngx_publish(compat, cfd, sfd, sources, digests):
+    """Commit the two payload DLLs and the marker as one transaction.
+
+    Both files are staged inside the pinned system32 first. An empty slot
+    is published by link+unlink so a file appearing after the checks is
+    never replaced; a managed file is kept as a hardlink backup until the
+    marker commits, so any mid-update or marker failure restores the
+    previous managed generation and no backup survives a return.
+    """
+    owned = _ngx_marker(compat)
+    state = {}
+    for name in NGX_MANAGED:
+        try:
+            info = os.stat(name, dir_fd=sfd, follow_symlinks=False)
+        except FileNotFoundError:
+            state[name] = "empty"
+            continue
+        except OSError as error:
+            _log(f"NGX SR refused: cannot inspect system32/{name}: {error}")
+            return False
+        if not stat.S_ISREG(info.st_mode):
+            _log(f"NGX SR refused: system32/{name} is not a regular file")
+            return False
+        digest = owned.get(name)
+        if digest is None:
+            _log(f"NGX SR refused: system32/{name} belongs to another "
+                 "provider; leaving it untouched")
+            return False
+        try:
+            target = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=sfd)
+            actual = _sha256_fd(target)
+        except OSError as error:
+            _log(f"NGX SR refused: cannot read system32/{name}: {error}")
+            return False
+        if actual != digest:
+            _log(f"NGX SR refused: system32/{name} belongs to another "
+                 "provider; leaving it untouched")
+            return False
+        state[name] = "managed"
+    temps = {}
+    backups = {}
+    done = []
+    try:
+        for name in NGX_MANAGED:
+            temps[name] = _ngx_temp(sfd, sources[name].read_bytes(), 0o755)
+        for name in NGX_MANAGED:
+            if state[name] == "managed":
+                backup = f".ngx-{name}.{os.urandom(4).hex()}.bak"
+                os.link(name, backup, src_dir_fd=sfd, dst_dir_fd=sfd,
+                        follow_symlinks=False)
+                backups[name] = backup
+        for name in NGX_MANAGED:
+            if state[name] == "empty":
+                # No-replace publish: link fails EEXIST if the slot filled.
+                os.link(temps[name], name, src_dir_fd=sfd, dst_dir_fd=sfd,
+                        follow_symlinks=False)
+                os.unlink(temps[name], dir_fd=sfd)
+            else:
+                os.replace(temps[name], name, src_dir_fd=sfd, dst_dir_fd=sfd)
+            temps[name] = None
+            done.append(name)
+        marker = _ngx_temp(cfd, json.dumps({"files": digests}).encode(), 0o644)
+        os.replace(marker, NGX_MARKER, src_dir_fd=cfd, dst_dir_fd=cfd)
+    except BaseException as error:
+        _ngx_rollback(sfd, state, done, temps, backups)
+        _log(f"NGX SR install under {compat} failed: {error}")
+        return False
+    for backup in backups.values():
+        try:
+            os.unlink(backup, dir_fd=sfd)
+        except OSError:
+            pass
+    return True
+
+
+def _ngx_install(compat, env, root):
+    """Install/update the payload nvngx.dll and nvapi64.dll into the prefix.
+
+    Only empty slots or files this helper installed earlier (marker digest
+    match) are touched; a foreign nvngx/nvapi64 is never overwritten, backed
+    up or adopted. Both payload files are validated and staged before either
+    is published, and a partial failure restores the previous managed
+    generation. True means the NGX overrides may be activated this launch.
+    """
+    if _ngx_overridden(env):
+        _log("NGX SR refused: user WINEDLLOVERRIDES covers nvngx/nvapi64")
+        _ngx_cleanup(compat)
+        return False
+    sources = {}
+    digests = {}
+    for name in NGX_MANAGED:
+        source = Path(root) / "x86_64-windows" / name
+        if not source.is_file() or graphics._pe_machine(source) != 0x8664:
+            _log(f"NGX SR payload {name} is missing or not x86-64: "
+                 "keeping base Neptune injection only")
+            _ngx_cleanup(compat)
+            return False
+        sources[name] = source
+        digests[name] = _sha256(source)
+    compat = Path(compat)
+    fd = _ngx_lock(compat)
+    if fd is None:
+        _log(f"NGX SR install for {compat} skipped: prefix is busy")
+        return False
+    try:
+        cfd, sfd = _ngx_dirs(compat, create=True)
+        if sfd is None:
+            return False
+        try:
+            return _ngx_publish(compat, cfd, sfd, sources, digests)
+        finally:
+            os.close(sfd)
+            os.close(cfd)
+    finally:
+        os.close(fd)
+
+
 def _injection(mode, cmd, env):
     """Extra bwrap options for a recognized Proton game launch, else []."""
     info = graphics.proton_invocation(cmd, env)
     if not info:
         return []
     tool, _ = info
+    compat = Path(env["STEAM_COMPAT_DATA_PATH"])
+    inject = _neptune_injection(mode, cmd, env, tool)
+    if not inject:
+        _ngx_cleanup(compat)
+        return inject
+    activated = False
+    if _ngx_requested(env) and _backend(mode) == "d3dmetal":
+        activated = _ngx_install(compat, env, _payload()[0])
+    else:
+        _ngx_cleanup(compat)
+    if activated:
+        at = inject.index("WINEDLLOVERRIDES") + 1
+        inject[at] = f"{inject[at]};nvngx=n;nvapi64=n"
+        inject += ["--setenv", "BRINEWELL_NGX_SR_ACTIVE", "1"]
+    else:
+        # The wrapper owns the internal flag: a refused or non-opt-in launch
+        # must not inherit an ACTIVE value set by an outer environment.
+        inject += ["--unsetenv", "BRINEWELL_NGX_SR_ACTIVE"]
+    return inject
+
+
+def _neptune_injection(mode, cmd, env, tool):
+    """Base Neptune bwrap options; [] keeps the launch untouched."""
     if graphics.graphics_overridden(env):
         return []
     fex = Path(cmd[0]).name == "FEXCompatTool"

@@ -177,6 +177,30 @@ the VM. The framework path, aperture and multi-ring options remain boot-only.
   affected games.
 - The multi-ring option maps to `NPT_PERF=multi_ring` and is off by default.
 
+### NGX super resolution
+
+Neptune / D3DMetal ships opt-in `nvngx.dll` and `nvapi64.dll` shims that let a
+game use D3DMetal's NGX super resolution. They are per-game: add
+`BRINEWELL_NGX_SR=1 %command%` to the game's Steam launch options. Nothing is
+installed system-wide, so Steam itself never loads nvapi64.
+
+- Only recognized x86-64 Proton launches on the Neptune / D3DMetal backend are
+  eligible; other backends and ARM64 tools ignore the option.
+- On a qualifying launch the wrapper copies both DLLs into that game's own
+  prefix (`pfx/drive_c/windows/system32`) and sets `BRINEWELL_NGX_SR_ACTIVE=1`
+  with `nvngx=n;nvapi64=n` overrides. A prefix slot already holding a foreign
+  `nvngx.dll`/`nvapi64.dll` — Proton's own or any other provider — is never
+  overwritten, backed up or adopted; the launch just keeps the plain Neptune
+  injection. The same applies to a `WINEDLLOVERRIDES` entry covering either
+  DLL. `BRINEWELL_NGX_SR_ACTIVE` is the wrapper's own effective bit and is
+  cleared for any injected launch that does not activate NGX, so an
+  inherited value cannot enable it.
+- Removing the launch option, switching the backend, or losing the payload
+  files removes only the files the wrapper itself installed on the next launch.
+  A file you replaced afterwards is left alone.
+- Games that still do not expose an upscaler option (driver registry or
+  signature checks, Streamline plugin bundles) are outside the supported scope.
+
 ### Anti-cheat (EAC)
 
 Brinewell ships an FEX build with Easy Anti-Cheat patches ([StonkGuy/FEX](https://github.com/StonkGuy/FEX/tree/eac-2610) tag

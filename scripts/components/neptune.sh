@@ -76,9 +76,15 @@ CROSS
     -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
     -Dshader-cache=disabled -Dxmlconfig=disabled -Dexpat=disabled \
     -Dzstd=disabled -Dzlib=disabled -Ddisplay-info=disabled
-    ninja -C "$build" -j3 \
-        src/virtio/neptune/d3d11.dll src/virtio/neptune/d3d12.dll \
-        src/virtio/neptune/dxgi.dll src/virtio/neptune/nptunix/nptunix.dll
+    local -a ninja_targets=(
+        src/virtio/neptune/d3d11.dll src/virtio/neptune/d3d12.dll
+        src/virtio/neptune/dxgi.dll src/virtio/neptune/nptunix/nptunix.dll)
+    # The opt-in NGX shims are x86-64 PE only; arm64ec targets do not exist.
+    if [[ $pe_target == x86_64 ]]; then
+        ninja_targets+=(src/virtio/neptune/nvngx.dll
+            src/virtio/neptune/nvapi64.dll)
+    fi
+    ninja -C "$build" -j3 "${ninja_targets[@]}"
     mkdir -p "$payload/$arch-windows" "$payload/$arch-unix"
     cp "$build/src/virtio/neptune/"{d3d11,d3d12,dxgi}.dll \
         "$build/src/virtio/neptune/nptunix/nptunix.dll" "$payload/$arch-windows/"
@@ -90,6 +96,40 @@ CROSS
     '; then
         echo "Neptune $pe_target d3d12.dll has incorrect device or debug export ordinals" >&2
         return 1
+    fi
+    if [[ $pe_target == x86_64 ]]; then
+        cp "$build/src/virtio/neptune/"{nvngx,nvapi64}.dll \
+            "$payload/$arch-windows/"
+        if ! llvm-readobj --coff-exports "$payload/$arch-windows/nvngx.dll" | awk '
+            $1 == "Name:" && $2 ~ /^NVSDK_NGX_D3D12_/ { count++ }
+            END { exit !(count == 16) }
+        '; then
+            echo "Neptune $pe_target nvngx.dll does not export the 16 NVSDK_NGX_D3D12_* symbols" >&2
+            return 1
+        fi
+        if ! llvm-readobj --coff-exports "$payload/$arch-windows/nvapi64.dll" \
+                | grep -q 'Name: nvapi_QueryInterface'; then
+            echo "Neptune $pe_target nvapi64.dll does not export nvapi_QueryInterface" >&2
+            return 1
+        fi
+        # The shims go into game prefixes: only kernel32 and the Wine-provided
+        # CRT forwarders may be imported, no MinGW C/C++ runtime DLLs.
+        local dll
+        for dll in "$payload/$arch-windows/"{nvngx,nvapi64}.dll; do
+            if llvm-readobj --coff-imports "$dll" | awk '
+                $1 == "Name:" && $2 ~ /\.dll$/ {
+                    ok = ($2 == "KERNEL32.dll" || $2 == "ntdll.dll" ||
+                          $2 == "msvcrt.dll" || $2 ~ /^api-ms-win-crt-/)
+                    if (!ok) { bad = $2; exit }
+                }
+                END { if (bad) { print bad > "/dev/stderr"; exit 1 } }
+            '; then
+                :
+            else
+                echo "Neptune $pe_target ${dll##*/} imports a non-system runtime DLL" >&2
+                return 1
+            fi
+        done
     fi
     if [[ $pe_target == arm64ec ]]; then
         local dll
@@ -135,7 +175,10 @@ from pathlib import Path
 root = Path(sys.argv[1])
 files = {}
 for arch, elf_machine in [('x86_64', 62), ('aarch64', 183)]:
-    for name in ['d3d11', 'd3d12', 'dxgi', 'nptunix']:
+    names = ['d3d11', 'd3d12', 'dxgi', 'nptunix']
+    if arch == 'x86_64':
+        names += ['nvngx', 'nvapi64']
+    for name in names:
         relative = f'{arch}-windows/{name}.dll'
         data = (root / relative).read_bytes()
         pe = struct.unpack_from('<I', data, 0x3c)[0]
