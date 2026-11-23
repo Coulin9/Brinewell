@@ -88,6 +88,9 @@ class GraphicsWrapTests(unittest.TestCase):
         vkd3d = wine / "vkd3d-proton" / f"{arch}-windows"
         vkd3d.mkdir(parents=True, exist_ok=True)
         (vkd3d / "d3d12.dll").write_bytes(_pe(0x8664))
+        nvapi = wine / "nvapi" / f"{arch}-windows"
+        nvapi.mkdir(parents=True, exist_ok=True)
+        (nvapi / "nvapi64.dll").write_bytes(_pe(0x8664) + b"stock-nvapi64")
 
     def _exec(self, path, args):
         self.execed.append((path, list(args)))
@@ -508,7 +511,8 @@ class GraphicsWrapTests(unittest.TestCase):
     def _ngx_payload(self, root=None, tag=b"x"):
         root = root or self.payload
         for name in ("nvngx", "nvapi64"):
-            (root / f"x86_64-windows/{name}.dll").write_bytes(_pe(0x8664) + tag + name.encode())
+            (root / f"x86_64-windows/{name}.dll").write_bytes(
+                _pe(0x8664) + tag + name.encode())
 
     def _ngx_env(self, compat, extra=None):
         return {**self._nptunix_env(compat), "BRINEWELL_NGX_SR": "1", **(extra or {})}
@@ -516,59 +520,128 @@ class GraphicsWrapTests(unittest.TestCase):
     def _sys32(self, compat):
         return compat / "pfx/drive_c/windows/system32"
 
-    def _ngx_files(self, compat):
-        return [self._sys32(compat) / f"{name}.dll" for name in ("nvngx", "nvapi64")]
+    def _nvngx(self, compat):
+        return self._sys32(compat) / "nvngx.dll"
+
+    def _nvapi64(self, compat):
+        return self._sys32(compat) / "nvapi64.dll"
+
+    def _tool_nvapi64(self, tool=None):
+        return (tool or self.tool) / "files/lib/wine/nvapi/x86_64-windows/nvapi64.dll"
 
     def _ngx_marker(self, compat):
         return compat / ".brinewell-ngx-sr.json"
 
-    def assertNotActivated(self, argv):
-        # ACTIVE is an effective bit set only on successful opt-in; the
-        # wrapper may still pass --unsetenv for an inherited value.
-        self.assertNotIn("--setenv",
-                         [a for a, b in zip(argv, argv[1:])
-                          if b == "BRINEWELL_NGX_SR_ACTIVE"])
+    def _ngx_stock(self, compat):
+        self._nvapi64(compat).write_bytes(self._tool_nvapi64().read_bytes())
 
-    def test_ngx_installs_dlls_marker_and_env(self):
+    def _setenvs(self, argv):
+        return {b: argv[i + 2]
+                for i, (a, b) in enumerate(zip(argv, argv[1:]))
+                if a == "--setenv"}
+
+    def _unsetenvs(self, argv):
+        return {argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--unsetenv"}
+
+    def _binds(self, argv):
+        return [(argv[i + 1], argv[i + 2])
+                for i, a in enumerate(argv[:-2]) if a == "--ro-bind"]
+
+    def assertNotCandidate(self, argv):
+        # The internal flags are set only on a candidate launch; refused or
+        # non-opt-in launches may still pass --unsetenv for inherited values.
+        for var in ("BRINEWELL_NGX_SR_CANDIDATE", "BRINEWELL_NGX_CORE_SHA256",
+                    "BRINEWELL_NGX_NVAPI_SHA256", "BRINEWELL_NGX_SR_ACTIVE"):
+            self.assertNotIn(var, self._setenvs(argv))
+
+    def assertCandidate(self, argv, root=None):
+        root = root or self.payload
+        setenvs = self._setenvs(argv)
+        self.assertEqual(setenvs["BRINEWELL_NGX_SR_CANDIDATE"], "1")
+        self.assertEqual(setenvs["BRINEWELL_NGX_CORE_SHA256"],
+                         wrap._sha256(root / "x86_64-windows/nvngx.dll"))
+        self.assertEqual(setenvs["BRINEWELL_NGX_NVAPI_SHA256"],
+                         wrap._sha256(root / "x86_64-windows/nvapi64.dll"))
+        self.assertIn("BRINEWELL_NGX_SR_ACTIVE", self._unsetenvs(argv))
+        self.assertIn((str(root / "x86_64-windows/nvapi64.dll"),
+                       str(self._tool_nvapi64())), self._binds(argv))
+        overrides = setenvs["WINEDLLOVERRIDES"]
+        self.assertIn("nvngx=n", overrides)
+        self.assertIn("nvapi64=n", overrides)
+
+    def test_ngx_candidate_binds_copy_source_and_publishes_core(self):
         compat = self._make_prefix()
         self._ngx_payload()
         argv = self.game(mode="neptune", env=self._ngx_env(compat))
-        self.assertEqual(argv[argv.index("BRINEWELL_NGX_SR_ACTIVE") + 1], "1")
-        overrides = argv[argv.index("WINEDLLOVERRIDES") + 1]
-        self.assertIn("nvngx=n", overrides)
-        self.assertIn("nvapi64=n", overrides)
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.is_symlink())
-            self.assertEqual(target.read_bytes(),
-                             (self.payload / f"x86_64-windows/{target.name}").read_bytes())
+        self.assertCandidate(argv)
+        nvngx = self._nvngx(compat)
+        self.assertFalse(nvngx.is_symlink())
+        self.assertEqual(nvngx.read_bytes(),
+                         (self.payload / "x86_64-windows/nvngx.dll").read_bytes())
         marker = json.loads(self._ngx_marker(compat).read_text())
-        self.assertEqual(sorted(marker["files"]), ["nvapi64.dll", "nvngx.dll"])
+        self.assertEqual(sorted(marker["files"]), ["nvngx.dll"])
+        # The wrapper never writes nvapi64.dll into the prefix.
+        self.assertFalse(self._nvapi64(compat).exists())
+
+    def test_ngx_stock_prefix_nvapi64_never_touched(self):
+        compat = self._make_prefix()
+        self._ngx_payload()
+        self._ngx_stock(compat)
+        stock = self._nvapi64(compat).read_bytes()
+        self.assertCandidate(self.game(mode="neptune", env=self._ngx_env(compat)))
+        self.assertEqual(self._nvapi64(compat).read_bytes(), stock)
+        # Proton's setup unlink+copy cycle between launches leaves the
+        # deployment intact: the bind still delivers the payload copy.
+        self._nvapi64(compat).unlink()
+        self._ngx_stock(compat)
+        self.assertCandidate(self.game(mode="neptune", env=self._ngx_env(compat)))
+        self.assertEqual(self._nvapi64(compat).read_bytes(), stock)
+        self.assertEqual(self._nvngx(compat).read_bytes(),
+                         (self.payload / "x86_64-windows/nvngx.dll").read_bytes())
+        argv = self.game(mode="neptune", env=self._nptunix_env(compat))
+        self.assertNotCandidate(argv)
+        self.assertEqual(self._nvapi64(compat).read_bytes(), stock)
+        self.assertFalse(self._nvngx(compat).exists())
+
+    def test_ngx_stale_payload_in_prefix_never_removed(self):
+        # An earlier generation may have left its nvapi64.dll in the prefix;
+        # the wrapper never claims or deletes it, opt-in or opt-out.
+        compat = self._make_prefix()
+        self._ngx_payload()
+        self._nvapi64(compat).write_bytes(_pe(0x8664) + b"old-gen-nvapi64")
+        self.assertCandidate(self.game(mode="neptune", env=self._ngx_env(compat)))
+        self.assertEqual(self._nvapi64(compat).read_bytes(),
+                         _pe(0x8664) + b"old-gen-nvapi64")
+        argv = self.game(mode="neptune", env=self._nptunix_env(compat))
+        self.assertNotCandidate(argv)
+        self.assertEqual(self._nvapi64(compat).read_bytes(),
+                         _pe(0x8664) + b"old-gen-nvapi64")
+        self.assertFalse(self._nvngx(compat).exists())
 
     def test_ngx_not_requested_leaves_everything_alone(self):
         compat = self._make_prefix()
         self._ngx_payload()
         argv = self.game(mode="neptune", env=self._nptunix_env(compat))
         self.assertIn("--ro-bind", argv)
-        self.assertNotActivated(argv)
-        self.assertNotIn("nvngx", argv[argv.index("WINEDLLOVERRIDES") + 1])
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.exists())
+        self.assertNotCandidate(argv)
+        self.assertNotIn("nvngx", self._setenvs(argv)["WINEDLLOVERRIDES"])
+        self.assertNotIn((str(self.payload / "x86_64-windows/nvapi64.dll"),
+                          str(self._tool_nvapi64())), self._binds(argv))
+        self.assertFalse(self._nvngx(compat).exists())
         self.assertFalse(self._ngx_marker(compat).exists())
         # A disabled value is not opt-in either.
         argv = self.game(mode="neptune",
                          env={**self._nptunix_env(compat), "BRINEWELL_NGX_SR": "0"})
-        self.assertNotActivated(argv)
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.exists())
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
 
     def test_ngx_missing_payload_keeps_base_injection(self):
         compat = self._make_prefix()
         argv = self.game(mode="neptune", env=self._ngx_env(compat))
         self.assertIn("--ro-bind", argv)
-        self.assertNotActivated(argv)
-        self.assertNotIn("nvngx", argv[argv.index("WINEDLLOVERRIDES") + 1])
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.exists())
+        self.assertNotCandidate(argv)
+        self.assertNotIn("nvngx", self._setenvs(argv)["WINEDLLOVERRIDES"])
+        self.assertFalse(self._nvngx(compat).exists())
 
     def test_ngx_invalid_payload_keeps_base_injection(self):
         compat = self._make_prefix()
@@ -576,60 +649,88 @@ class GraphicsWrapTests(unittest.TestCase):
             (self.payload / f"x86_64-windows/{name}.dll").write_bytes(b"not a pe")
         argv = self.game(mode="neptune", env=self._ngx_env(compat))
         self.assertIn("--ro-bind", argv)
-        self.assertNotActivated(argv)
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.exists())
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
 
-    def test_ngx_foreign_files_never_touched(self):
+    def test_ngx_missing_tool_slot_refused(self):
         compat = self._make_prefix()
         self._ngx_payload()
-        foreign = self._sys32(compat) / "nvngx.dll"
+        self._tool_nvapi64().unlink()
+        argv = self.game(mode="neptune", env=self._ngx_env(compat))
+        self.assertIn("--ro-bind", argv)
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
+        (self._tool_nvapi64().parent).rmdir()
+        argv = self.game(mode="neptune", env=self._ngx_env(compat))
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
+
+    def test_ngx_foreign_nvngx_never_touched(self):
+        compat = self._make_prefix()
+        self._ngx_payload()
+        foreign = self._nvngx(compat)
         foreign.write_bytes(b"third party nvngx")
         argv = self.game(mode="neptune", env=self._ngx_env(compat))
         self.assertIn("--ro-bind", argv)
-        self.assertNotActivated(argv)
+        self.assertNotCandidate(argv)
         self.assertEqual(foreign.read_bytes(), b"third party nvngx")
-        self.assertFalse((self._sys32(compat) / "nvapi64.dll").exists())
         self.assertFalse(self._ngx_marker(compat).exists())
 
-    def test_ngx_symlinked_target_refused(self):
+    def test_ngx_foreign__nvngx_provider_refused(self):
         compat = self._make_prefix()
         self._ngx_payload()
-        link = self._sys32(compat) / "nvapi64.dll"
-        link.symlink_to("../old/nvapi64.dll")
+        (self._sys32(compat) / "_nvngx.dll").write_bytes(b"driver core")
         argv = self.game(mode="neptune", env=self._ngx_env(compat))
-        self.assertNotActivated(argv)
-        self.assertTrue(link.is_symlink())
-        self.assertFalse((self._sys32(compat) / "nvngx.dll").exists())
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
         self.assertFalse(self._ngx_marker(compat).exists())
 
-    def test_ngx_own_files_update_with_payload(self):
+    def test_ngx_symlinked_nvngx_refused(self):
         compat = self._make_prefix()
         self._ngx_payload()
-        self.game(mode="neptune", env=self._ngx_env(compat))
+        link = self._nvngx(compat)
+        link.symlink_to("../old/nvngx.dll")
+        argv = self.game(mode="neptune", env=self._ngx_env(compat))
+        self.assertNotCandidate(argv)
+        self.assertTrue(link.is_symlink())
+        self.assertFalse(self._ngx_marker(compat).exists())
+
+    def test_ngx_user_disables_nvapi_refused(self):
+        compat = self._make_prefix()
+        self._ngx_payload()
+        for extra in ({"PROTON_DISABLE_NVAPI": "1"},
+                      {"PROTON_ENABLE_NVAPI": "0"}):
+            argv = self.game(mode="neptune", env=self._ngx_env(compat, extra))
+            self.assertIn("--ro-bind", argv)
+            self.assertNotCandidate(argv)
+            self.assertFalse(self._nvngx(compat).exists())
+
+    def test_ngx_repeated_invocation_and_payload_update(self):
+        compat = self._make_prefix()
+        self._ngx_payload()
+        self.assertCandidate(self.game(mode="neptune", env=self._ngx_env(compat)))
+        self.assertCandidate(self.game(mode="neptune", env=self._ngx_env(compat)))
         self._ngx_payload(tag=b"v2-")
         argv = self.game(mode="neptune", env=self._ngx_env(compat))
-        self.assertIn("BRINEWELL_NGX_SR_ACTIVE", argv)
-        for target in self._ngx_files(compat):
-            self.assertEqual(target.read_bytes(),
-                             (self.payload / f"x86_64-windows/{target.name}").read_bytes())
+        self.assertCandidate(argv)
+        self.assertEqual(self._nvngx(compat).read_bytes(),
+                         (self.payload / "x86_64-windows/nvngx.dll").read_bytes())
 
-    def test_ngx_partial_publish_rolls_back(self):
+    def test_ngx_publish_failure_rolls_back(self):
         compat = self._make_prefix()
         self._ngx_payload()
         real_link = os.link
 
         def flaky(src, dst, **kw):
-            if str(dst).endswith("nvapi64.dll"):
+            if str(dst).endswith("nvngx.dll"):
                 raise OSError(5, "simulated publish failure")
             return real_link(src, dst, **kw)
 
         with patch.object(wrap.os, "link", side_effect=flaky):
             argv = self.game(mode="neptune", env=self._ngx_env(compat))
         self.assertIn("--ro-bind", argv)
-        self.assertNotActivated(argv)
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.exists())
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
         self.assertFalse(self._ngx_marker(compat).exists())
         self.assertFalse(list(self._sys32(compat).glob(".ngx-*")))
 
@@ -637,28 +738,10 @@ class GraphicsWrapTests(unittest.TestCase):
         compat = self._make_prefix()
         self._ngx_payload()
         self.game(mode="neptune", env=self._ngx_env(compat))
-        v1 = {name: (self._sys32(compat) / f"{name}.dll").read_bytes()
-              for name in ("nvngx", "nvapi64")}
+        v1 = self._nvngx(compat).read_bytes()
         v1_marker = self._ngx_marker(compat).read_text()
         self._ngx_payload(tag=b"v2-")
         real_replace = os.replace
-
-        def flaky_publish(src, dst, **kw):
-            if str(dst).endswith("nvapi64.dll"):
-                raise OSError(5, "simulated publish failure")
-            return real_replace(src, dst, **kw)
-
-        # Failing the second publish restores the whole previous generation.
-        with patch.object(wrap.os, "replace", side_effect=flaky_publish):
-            argv = self.game(mode="neptune", env=self._ngx_env(compat))
-        self.assertIn("--ro-bind", argv)
-        self.assertNotActivated(argv)
-        for name in ("nvngx", "nvapi64"):
-            self.assertEqual((self._sys32(compat) / f"{name}.dll").read_bytes(),
-                             v1[name])
-        self.assertEqual(self._ngx_marker(compat).read_text(), v1_marker)
-        self.assertFalse(list(self._sys32(compat).glob(".ngx-*")))
-        # A marker-commit failure also restores the previous generation.
 
         def flaky_marker(src, dst, **kw):
             if str(dst).endswith(".brinewell-ngx-sr.json"):
@@ -667,28 +750,23 @@ class GraphicsWrapTests(unittest.TestCase):
 
         with patch.object(wrap.os, "replace", side_effect=flaky_marker):
             argv = self.game(mode="neptune", env=self._ngx_env(compat))
-        self.assertNotActivated(argv)
-        for name in ("nvngx", "nvapi64"):
-            self.assertEqual((self._sys32(compat) / f"{name}.dll").read_bytes(),
-                             v1[name])
+        self.assertNotCandidate(argv)
+        self.assertEqual(self._nvngx(compat).read_bytes(), v1)
         self.assertEqual(self._ngx_marker(compat).read_text(), v1_marker)
         self.assertFalse(list(self._sys32(compat).glob(".ngx-*")))
         # The next launch retries the update, and opt-out still cleans.
-        argv = self.game(mode="neptune", env=self._ngx_env(compat))
-        self.assertEqual(argv[argv.index("BRINEWELL_NGX_SR_ACTIVE") + 1], "1")
-        for target in self._ngx_files(compat):
-            self.assertEqual(target.read_bytes(),
-                             (self.payload / f"x86_64-windows/{target.name}").read_bytes())
+        self.assertCandidate(self.game(mode="neptune", env=self._ngx_env(compat)))
+        self.assertEqual(self._nvngx(compat).read_bytes(),
+                         (self.payload / "x86_64-windows/nvngx.dll").read_bytes())
         argv = self.game(mode="neptune", env=self._nptunix_env(compat))
-        self.assertNotActivated(argv)
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.exists())
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
         self.assertFalse(self._ngx_marker(compat).exists())
 
     def test_ngx_corrupt_marker_safe_skip(self):
         compat = self._make_prefix()
         self._ngx_payload()
-        foreign = self._sys32(compat) / "nvngx.dll"
+        foreign = self._nvngx(compat)
         foreign.write_bytes(b"foreign nvngx")
         outside = compat / "../escape.dll"
         outside.write_bytes(b"escape")
@@ -700,7 +778,7 @@ class GraphicsWrapTests(unittest.TestCase):
             self._ngx_marker(compat).write_text(bad)
             argv = self.game(mode="neptune", env=self._nptunix_env(compat))
             self.assertIn("--ro-bind", argv)
-            self.assertNotActivated(argv)
+            self.assertNotCandidate(argv)
             self.assertEqual(outside.read_bytes(), b"escape")
             self.assertEqual(foreign.read_bytes(), b"foreign nvngx")
         # A symlinked marker is ignored and removed, still without touching
@@ -715,81 +793,155 @@ class GraphicsWrapTests(unittest.TestCase):
         self.assertFalse(self._ngx_marker(compat).exists())
         self.assertEqual(foreign.read_bytes(), b"foreign nvngx")
 
-    def test_ngx_inherited_active_env_cleared(self):
+    def test_ngx_v1_marker_migrates(self):
+        # A v1 marker records both files, but the prefix nvapi64.dll is
+        # already the tool's stock copy: the legacy claim is dropped, our
+        # nvngx claim still applies, and the marker is rewritten v2-style.
         compat = self._make_prefix()
         self._ngx_payload()
-        # An inherited ACTIVE=1 must not survive a non-opt-in launch.
+        v1_nvngx = _pe(0x8664) + b"v1-nvngx"
+        self._nvngx(compat).write_bytes(v1_nvngx)
+        self._ngx_stock(compat)
+        stock = self._nvapi64(compat).read_bytes()
+        files = {"files": {"nvngx.dll": wrap._sha256(self._nvngx(compat)),
+                           "nvapi64.dll": wrap._sha256(self.payload / "x86_64-windows/nvapi64.dll")}}
+        self._ngx_marker(compat).write_text(json.dumps(files))
+        argv = self.game(mode="neptune", env=self._ngx_env(compat))
+        self.assertCandidate(argv)
+        self.assertEqual(self._nvapi64(compat).read_bytes(), stock)
+        self.assertEqual(self._nvngx(compat).read_bytes(),
+                         (self.payload / "x86_64-windows/nvngx.dll").read_bytes())
+        marker = json.loads(self._ngx_marker(compat).read_text())
+        self.assertEqual(sorted(marker["files"]), ["nvngx.dll"])
+
+    def test_ngx_v1_marker_optout_removes_only_core(self):
+        compat = self._make_prefix()
+        self._ngx_payload()
+        self._nvngx(compat).write_bytes(_pe(0x8664) + b"v1-nvngx")
+        self._nvapi64(compat).write_bytes(_pe(0x8664) + b"v1-nvapi64")
+        files = {"files": {"nvngx.dll": wrap._sha256(self._nvngx(compat)),
+                           "nvapi64.dll": wrap._sha256(self._nvapi64(compat))}}
+        self._ngx_marker(compat).write_text(json.dumps(files))
+        argv = self.game(mode="neptune", env=self._nptunix_env(compat))
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
+        self.assertFalse(self._ngx_marker(compat).exists())
+        # The old nvapi64 claim grants no deletion right over the file.
+        self.assertEqual(self._nvapi64(compat).read_bytes(),
+                         _pe(0x8664) + b"v1-nvapi64")
+
+    def test_ngx_inherited_internal_env_cleared(self):
+        compat = self._make_prefix()
+        self._ngx_payload()
+        inherited = {"BRINEWELL_NGX_SR_ACTIVE": "1",
+                     "BRINEWELL_NGX_SR_CANDIDATE": "1",
+                     "BRINEWELL_NGX_CORE_SHA256": "0" * 64,
+                     "BRINEWELL_NGX_NVAPI_SHA256": "0" * 64}
+        # An inherited set must not survive a non-opt-in launch.
         argv = self.game(mode="neptune",
-                         env={**self._nptunix_env(compat),
-                              "BRINEWELL_NGX_SR_ACTIVE": "1"})
+                         env={**self._nptunix_env(compat), **inherited})
         self.assertIn("--ro-bind", argv)
-        self.assertNotActivated(argv)
-        index = argv.index("--unsetenv")
-        self.assertEqual(argv[index + 1], "BRINEWELL_NGX_SR_ACTIVE")
-        # A refused opt-in clears it too.
-        foreign = self._sys32(compat) / "nvngx.dll"
+        self.assertNotCandidate(argv)
+        unsets = self._unsetenvs(argv)
+        for var in inherited:
+            self.assertIn(var, unsets)
+        # A refused opt-in clears them too.
+        foreign = self._nvngx(compat)
         foreign.write_bytes(b"third party nvngx")
         argv = self.game(mode="neptune",
-                         env=self._ngx_env(compat,
-                                           {"BRINEWELL_NGX_SR_ACTIVE": "1"}))
-        self.assertNotActivated(argv)
-        index = argv.index("--unsetenv")
-        self.assertEqual(argv[index + 1], "BRINEWELL_NGX_SR_ACTIVE")
+                         env=self._ngx_env(compat, inherited))
+        self.assertNotCandidate(argv)
+        unsets = self._unsetenvs(argv)
+        for var in inherited:
+            self.assertIn(var, unsets)
         self.assertEqual(foreign.read_bytes(), b"third party nvngx")
 
-    def test_ngx_user_modified_file_kept_and_disowned(self):
+    def test_ngx_user_modified_nvngx_kept_and_disowned(self):
         compat = self._make_prefix()
         self._ngx_payload()
         self.game(mode="neptune", env=self._ngx_env(compat))
-        # The user replaced one managed file: next opt-in launch must not
+        # The user replaced the managed file: next opt-in launch must not
         # overwrite it, and revoking the opt-in keeps it too.
-        foreign = self._sys32(compat) / "nvngx.dll"
+        foreign = self._nvngx(compat)
         foreign.write_bytes(b"user replacement")
         argv = self.game(mode="neptune", env=self._ngx_env(compat))
-        self.assertNotActivated(argv)
+        self.assertNotCandidate(argv)
         self.assertEqual(foreign.read_bytes(), b"user replacement")
         argv = self.game(mode="neptune", env=self._nptunix_env(compat))
-        self.assertNotActivated(argv)
+        self.assertNotCandidate(argv)
         self.assertEqual(foreign.read_bytes(), b"user replacement")
-        self.assertFalse((self._sys32(compat) / "nvapi64.dll").exists())
         self.assertFalse(self._ngx_marker(compat).exists())
 
     def test_ngx_cleanup_on_optout_backend_and_payload_loss(self):
         compat = self._make_prefix()
+        self._ngx_stock(compat)
+        stock = self._nvapi64(compat).read_bytes()
         for drop_opt_in, mode, keep_payload in (
                 (True, "neptune", True), (False, "venus", True),
                 (False, "neptune", False)):
             self._ngx_payload()
             self.game(mode="neptune", env=self._ngx_env(compat))
-            for target in self._ngx_files(compat):
-                self.assertTrue(target.is_file())
+            self.assertTrue(self._nvngx(compat).is_file())
             env = self._nptunix_env(compat) if drop_opt_in else self._ngx_env(compat)
             if not keep_payload:
                 for name in ("nvngx", "nvapi64"):
                     (self.payload / f"x86_64-windows/{name}.dll").unlink()
             argv = self.game(mode=mode, env=env)
-            self.assertNotActivated(argv)
-            for target in self._ngx_files(compat):
-                self.assertFalse(target.exists(), f"{mode} {keep_payload}")
+            self.assertNotCandidate(argv)
+            self.assertFalse(self._nvngx(compat).exists(), f"{mode} {keep_payload}")
             self.assertFalse(self._ngx_marker(compat).exists())
+            self.assertEqual(self._nvapi64(compat).read_bytes(), stock)
             self._ngx_payload()
+
+    def test_ngx_busy_prefix_delays_cleanup(self):
+        compat = self._make_prefix()
+        self._ngx_payload()
+        self.game(mode="neptune", env=self._ngx_env(compat))
+        with patch.object(wrap, "_ngx_prefix_busy", lambda c: True):
+            argv = self.game(mode="neptune", env=self._nptunix_env(compat))
+        self.assertNotCandidate(argv)
+        self.assertTrue(self._nvngx(compat).is_file())
+        self.assertTrue(self._ngx_marker(compat).exists())
+        argv = self.game(mode="neptune", env=self._nptunix_env(compat))
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
+        self.assertFalse(self._ngx_marker(compat).exists())
+
+    def test_ngx_busy_lock_skips_install(self):
+        compat = self._make_prefix()
+        self._ngx_payload()
+        import fcntl
+        fd = os.open(compat / ".brinewell-ngx-sr.lock", os.O_CREAT | os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            argv = self.game(mode="neptune", env=self._ngx_env(compat))
+        finally:
+            os.close(fd)
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
 
     def test_ngx_user_override_conflict_disables_and_cleans(self):
         compat = self._make_prefix()
         self._ngx_payload()
+        for conflict in ("nvngx=b", "nvapi64.dll=n", "_nvngx=n"):
+            argv = self.game(mode="neptune",
+                             env=self._ngx_env(compat,
+                                               {"WINEDLLOVERRIDES": conflict}))
+            self.assertIn("--ro-bind", argv)
+            self.assertNotCandidate(argv)
+            self.assertFalse(self._nvngx(compat).exists())
+        # A wildcard override refuses base Neptune injection entirely.
         argv = self.game(mode="neptune",
-                         env=self._ngx_env(compat, {"WINEDLLOVERRIDES": "nvngx=b"}))
-        self.assertIn("--ro-bind", argv)
-        self.assertNotActivated(argv)
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.exists())
+                         env=self._ngx_env(compat,
+                                           {"WINEDLLOVERRIDES": "nv*=n"}))
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
         # An already-managed prefix is cleaned when the user takes over.
         self.game(mode="neptune", env=self._ngx_env(compat))
         argv = self.game(mode="neptune",
-                         env=self._ngx_env(compat, {"WINEDLLOVERRIDES": "nvapi64.dll=n"}))
-        self.assertNotActivated(argv)
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.exists())
+                         env=self._ngx_env(compat, {"WINEDLLOVERRIDES": "nvngx=b"}))
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
         self.assertFalse(self._ngx_marker(compat).exists())
 
     def test_ngx_dev_payload_sources(self):
@@ -797,10 +949,9 @@ class GraphicsWrapTests(unittest.TestCase):
         self._ngx_payload(root=self.dev, tag=b"dev-")
         compat = self._make_prefix()
         argv = self.game(mode="neptune", env=self._ngx_env(compat))
-        self.assertIn("BRINEWELL_NGX_SR_ACTIVE", argv)
-        for target in self._ngx_files(compat):
-            self.assertEqual(target.read_bytes(),
-                             (self.dev / f"x86_64-windows/{target.name}").read_bytes())
+        self.assertCandidate(argv, root=self.dev)
+        self.assertEqual(self._nvngx(compat).read_bytes(),
+                         (self.dev / "x86_64-windows/nvngx.dll").read_bytes())
 
     def test_ngx_never_for_arm64(self):
         arm = self.root / "common/Proton ARM64"
@@ -810,20 +961,17 @@ class GraphicsWrapTests(unittest.TestCase):
         argv = self.run_wrap(["waitforexitandrun", "/game/x.exe"], mode="neptune",
                              tool=arm, fex=False, env=self._ngx_env(compat))
         self.assertNotIn("--ro-bind", argv)
-        self.assertNotActivated(argv)
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.exists())
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
 
     def test_ngx_mullion_cleans_managed_prefix(self):
         compat = self._make_prefix()
         self._ngx_payload()
         self.game(mode="neptune", env=self._ngx_env(compat))
         argv = self.game(mode="mullion", env=self._ngx_env(compat))
-        self.assertNotActivated(argv)
-        for target in self._ngx_files(compat):
-            self.assertFalse(target.exists())
+        self.assertNotCandidate(argv)
+        self.assertFalse(self._nvngx(compat).exists())
         self.assertFalse(self._ngx_marker(compat).exists())
-
 
 if __name__ == "__main__":
     unittest.main()

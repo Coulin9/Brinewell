@@ -31,10 +31,14 @@ CONTAINER_PAYLOAD = graphics.CONTAINER_PAYLOAD
 DEV_PAYLOAD = Path.home() / ".local/share/brinewell/neptune-dev"
 GRAPHICS_DLLS = graphics.GRAPHICS_DLLS
 SRT_BWRAP_REL = "libexec/steam-runtime-tools-0/srt-bwrap"
-# Per-game opt-in NGX payload (BRINEWELL_NGX_SR=1): installed into the game's
-# own prefix, never bound system-wide so Steam itself cannot pick nvapi64 up.
-NGX_DLLS = ("nvngx", "nvapi64")
-NGX_MANAGED = tuple(f"{name}.dll" for name in NGX_DLLS)
+# Per-game opt-in NGX payload (BRINEWELL_NGX_SR=1): nvapi64.dll is bound over
+# the selected tool's own copy source so Proton's setup_prefix installs it,
+# while nvngx.dll stays a managed single file inside the game prefix.
+NGX_KEYS = ("nvngx", "nvapi64", "_nvngx")
+NGX_MANAGED = ("nvngx.dll",)
+# v1 markers may still claim nvapi64.dll; the claim is parsed but never
+# grants ownership of the prefix file.
+NGX_LEGACY = ("nvapi64.dll",)
 NGX_MARKER = ".brinewell-ngx-sr.json"
 NGX_LOCK = ".brinewell-ngx-sr.lock"
 
@@ -242,16 +246,25 @@ def _ngx_requested(env):
 
 
 def _ngx_overridden(env):
-    """True when the user's WINEDLLOVERRIDES already covers nvngx/nvapi64."""
+    """True when the user's WINEDLLOVERRIDES already covers an NGX name."""
     for entry in env.get("WINEDLLOVERRIDES", "").split(";"):
         left = entry.strip().split("=")[0]
         for key in left.split(","):
             key = key.strip().lower()
             if key.endswith(".dll"):
                 key = key[:-4]
-            if key and (key in NGX_DLLS or "*" in key or "?" in key):
+            if key and (key in NGX_KEYS or "*" in key or "?" in key):
                 return True
     return False
+
+
+def _ngx_nvapi_disabled(env):
+    """True when the user explicitly disabled Proton's NVAPI install."""
+    off = env.get("PROTON_DISABLE_NVAPI", "").strip().lower()
+    if off in ("1", "true", "yes"):
+        return True
+    return env.get("PROTON_ENABLE_NVAPI", "").strip().lower() in \
+        ("0", "false", "no")
 
 
 def _ngx_marker(compat):
@@ -291,13 +304,16 @@ def _ngx_marker(compat):
         _log(f"NGX SR marker under {compat} fails schema check: ignoring it")
         return {}
     for name, digest in files.items():
-        if name not in NGX_MANAGED or not isinstance(digest, str) \
+        if name not in NGX_MANAGED + NGX_LEGACY or not isinstance(digest, str) \
                 or len(digest) != 64 \
                 or any(c not in "0123456789abcdef" for c in digest.lower()):
             _log(f"NGX SR marker under {compat} fails schema check: "
                  "ignoring it")
             return {}
-    return dict(files)
+    # Legacy nvapi64.dll claims are dropped: only names still managed by
+    # this version contribute ownership.
+    return {name: digest for name, digest in files.items()
+            if name in NGX_MANAGED}
 
 
 def _ngx_lock(compat):
@@ -416,7 +432,7 @@ def _ngx_prefix_busy(compat):
 def _ngx_cleanup(compat):
     """Remove this helper's own files from the prefix, then the marker.
 
-    Only the two fixed managed names are ever unlinked, and only when the
+    Only the fixed managed name is ever unlinked, and only when the
     (strictly validated) marker recorded them and the current digest still
     matches; a file the user replaced is kept and disowned. The marker is
     removed only when nothing is left pending: a busy prefix, a live Wine
@@ -515,16 +531,27 @@ def _ngx_rollback(sfd, state, done, temps, backups):
                 pass
 
 
-def _ngx_publish(compat, cfd, sfd, sources, digests):
-    """Commit the two payload DLLs and the marker as one transaction.
+def _ngx_publish(compat, cfd, sfd, source, digest):
+    """Commit the payload nvngx.dll and the marker as one transaction.
 
-    Both files are staged inside the pinned system32 first. An empty slot
+    The file is staged inside the pinned system32 first. An empty slot
     is published by link+unlink so a file appearing after the checks is
     never replaced; a managed file is kept as a hardlink backup until the
-    marker commits, so any mid-update or marker failure restores the
+    marker commits, so a mid-update or marker failure restores the
     previous managed generation and no backup survives a return.
     """
     owned = _ngx_marker(compat)
+    try:
+        os.stat("_nvngx.dll", dir_fd=sfd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        _log(f"NGX SR refused: cannot inspect system32/_nvngx.dll: {error}")
+        return False
+    else:
+        _log("NGX SR refused: system32/_nvngx.dll belongs to another "
+             "provider; leaving it untouched")
+        return False
     state = {}
     for name in NGX_MANAGED:
         try:
@@ -538,8 +565,8 @@ def _ngx_publish(compat, cfd, sfd, sources, digests):
         if not stat.S_ISREG(info.st_mode):
             _log(f"NGX SR refused: system32/{name} is not a regular file")
             return False
-        digest = owned.get(name)
-        if digest is None:
+        claimed = owned.get(name)
+        if claimed is None:
             _log(f"NGX SR refused: system32/{name} belongs to another "
                  "provider; leaving it untouched")
             return False
@@ -549,7 +576,7 @@ def _ngx_publish(compat, cfd, sfd, sources, digests):
         except OSError as error:
             _log(f"NGX SR refused: cannot read system32/{name}: {error}")
             return False
-        if actual != digest:
+        if actual != claimed:
             _log(f"NGX SR refused: system32/{name} belongs to another "
                  "provider; leaving it untouched")
             return False
@@ -558,8 +585,7 @@ def _ngx_publish(compat, cfd, sfd, sources, digests):
     backups = {}
     done = []
     try:
-        for name in NGX_MANAGED:
-            temps[name] = _ngx_temp(sfd, sources[name].read_bytes(), 0o755)
+        temps["nvngx.dll"] = _ngx_temp(sfd, source.read_bytes(), 0o755)
         for name in NGX_MANAGED:
             if state[name] == "managed":
                 backup = f".ngx-{name}.{os.urandom(4).hex()}.bak"
@@ -576,7 +602,8 @@ def _ngx_publish(compat, cfd, sfd, sources, digests):
                 os.replace(temps[name], name, src_dir_fd=sfd, dst_dir_fd=sfd)
             temps[name] = None
             done.append(name)
-        marker = _ngx_temp(cfd, json.dumps({"files": digests}).encode(), 0o644)
+        files = {"files": {"nvngx.dll": digest}}
+        marker = _ngx_temp(cfd, json.dumps(files).encode(), 0o644)
         os.replace(marker, NGX_MARKER, src_dir_fd=cfd, dst_dir_fd=cfd)
     except BaseException as error:
         _ngx_rollback(sfd, state, done, temps, backups)
@@ -590,46 +617,74 @@ def _ngx_publish(compat, cfd, sfd, sources, digests):
     return True
 
 
-def _ngx_install(compat, env, root):
-    """Install/update the payload nvngx.dll and nvapi64.dll into the prefix.
+def _ngx_install(compat, env, root, tool):
+    """Validate the NGX opt-in and publish the managed nvngx.dll.
 
-    Only empty slots or files this helper installed earlier (marker digest
-    match) are touched; a foreign nvngx/nvapi64 is never overwritten, backed
-    up or adopted. Both payload files are validated and staged before either
-    is published, and a partial failure restores the previous managed
-    generation. True means the NGX overrides may be activated this launch.
+    nvapi64.dll is never written to the prefix: it is bound over the
+    selected tool's own nvapi copy source so Proton's setup_prefix installs
+    the payload copy. Only an empty nvngx slot or a file this helper
+    installed earlier (marker digest match) is touched; a foreign
+    nvngx/_nvngx is never overwritten, backed up or adopted. Returns the
+    extra bwrap options for a candidate launch, or None when the opt-in
+    cannot be fulfilled this launch.
     """
     if _ngx_overridden(env):
-        _log("NGX SR refused: user WINEDLLOVERRIDES covers nvngx/nvapi64")
+        _log("NGX SR refused: user WINEDLLOVERRIDES covers an NGX name")
         _ngx_cleanup(compat)
-        return False
+        return None
+    if _ngx_nvapi_disabled(env):
+        _log("NGX SR refused: user disabled Proton's NVAPI install")
+        _ngx_cleanup(compat)
+        return None
     sources = {}
     digests = {}
-    for name in NGX_MANAGED:
+    for name in ("nvngx.dll", "nvapi64.dll"):
         source = Path(root) / "x86_64-windows" / name
         if not source.is_file() or graphics._pe_machine(source) != 0x8664:
             _log(f"NGX SR payload {name} is missing or not x86-64: "
                  "keeping base Neptune injection only")
             _ngx_cleanup(compat)
-            return False
+            return None
         sources[name] = source
         digests[name] = _sha256(source)
+    dll_dir = Path(tool) / "files/lib/wine/nvapi/x86_64-windows"
+    target = dll_dir / "nvapi64.dll"
+    if not (dll_dir.is_dir() and target.is_file()):
+        _log(f"NGX SR refused: {tool} has no nvapi x86-64 copy source")
+        return None
+    if Path(os.path.realpath(dll_dir)) != Path(os.path.abspath(dll_dir)):
+        _log(f"unsafe NGX bind target under {tool}: passing through")
+        return None
+    target_real = Path(os.path.realpath(target))
+    if target_real != Path(os.path.abspath(target)) and \
+            not str(target_real).startswith(str(tool) + "/"):
+        _log(f"unsafe NGX bind target under {tool}: passing through")
+        return None
     compat = Path(compat)
     fd = _ngx_lock(compat)
     if fd is None:
         _log(f"NGX SR install for {compat} skipped: prefix is busy")
-        return False
+        return None
     try:
         cfd, sfd = _ngx_dirs(compat, create=True)
         if sfd is None:
-            return False
+            return None
         try:
-            return _ngx_publish(compat, cfd, sfd, sources, digests)
+            if not _ngx_publish(compat, cfd, sfd, sources["nvngx.dll"],
+                                digests["nvngx.dll"]):
+                return None
         finally:
             os.close(sfd)
             os.close(cfd)
     finally:
         os.close(fd)
+    # Candidate only: the Windows side verifies the process-visible files
+    # against these digests before activating NGX SR.
+    return ["--ro-bind", str(sources["nvapi64.dll"]), str(target),
+            "--setenv", "BRINEWELL_NGX_SR_CANDIDATE", "1",
+            "--setenv", "BRINEWELL_NGX_CORE_SHA256", digests["nvngx.dll"],
+            "--setenv", "BRINEWELL_NGX_NVAPI_SHA256", digests["nvapi64.dll"],
+            "--unsetenv", "BRINEWELL_NGX_SR_ACTIVE"]
 
 
 def _injection(mode, cmd, env):
@@ -643,19 +698,23 @@ def _injection(mode, cmd, env):
     if not inject:
         _ngx_cleanup(compat)
         return inject
-    activated = False
+    candidate = None
     if _ngx_requested(env) and _backend(mode) == "d3dmetal":
-        activated = _ngx_install(compat, env, _payload()[0])
+        candidate = _ngx_install(compat, env, _payload()[0], tool)
     else:
         _ngx_cleanup(compat)
-    if activated:
+    if candidate:
         at = inject.index("WINEDLLOVERRIDES") + 1
         inject[at] = f"{inject[at]};nvngx=n;nvapi64=n"
-        inject += ["--setenv", "BRINEWELL_NGX_SR_ACTIVE", "1"]
+        inject += candidate
     else:
-        # The wrapper owns the internal flag: a refused or non-opt-in launch
-        # must not inherit an ACTIVE value set by an outer environment.
-        inject += ["--unsetenv", "BRINEWELL_NGX_SR_ACTIVE"]
+        # The wrapper owns the internal flags: a refused or non-opt-in
+        # launch must not inherit candidate or ACTIVE values set by an
+        # outer environment.
+        inject += ["--unsetenv", "BRINEWELL_NGX_SR_CANDIDATE",
+                   "--unsetenv", "BRINEWELL_NGX_CORE_SHA256",
+                   "--unsetenv", "BRINEWELL_NGX_NVAPI_SHA256",
+                   "--unsetenv", "BRINEWELL_NGX_SR_ACTIVE"]
     return inject
 
 

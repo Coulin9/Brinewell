@@ -153,16 +153,23 @@ NGX 超分辨率。该功能按游戏开启：在该游戏的 Steam 启动选项
 `BRINEWELL_NGX_SR=1 %command%`。不会做任何系统级安装，Steam 自身不会加载 nvapi64。
 
 - 仅 Neptune / D3DMetal 后端下的 x86-64 Proton 启动生效；其他后端和 ARM64 工具会忽略该选项。
-- 符合条件的启动会把两个 DLL 复制进该游戏自己的前缀
-  （`pfx/drive_c/windows/system32`），并设置 `BRINEWELL_NGX_SR_ACTIVE=1` 与
-  `nvngx=n;nvapi64=n` override。前缀中已有第三方 `nvngx.dll`/`nvapi64.dll`（包括
-  Proton 自带）时绝不覆盖、不备份、不接管，该次启动只保留普通 Neptune 注入；用户自己的
-  `WINEDLLOVERRIDES` 覆盖这两个 DLL 时同样不启用。`BRINEWELL_NGX_SR_ACTIVE`
-  是 wrapper 推导的有效标志：未激活 NGX 的注入启动会显式清除它，外层环境
-  中遗留的值不会生效。
-- 移除启动选项、切换后端或 payload 文件缺失后，下一次启动只清理 wrapper 自己安装过的
-  文件；被用户替换过的文件保留不动。
-- 仍不显示超分选项的游戏（驱动注册表或签名校验、Streamline 插件包等）不在支持范围内。
+- 符合条件的启动对两个 DLL 采用不同部署方式：`nvapi64.dll` 以只读方式绑定覆盖所选工具
+  自己的 NVAPI 复制源（`files/lib/wine/nvapi/x86_64-windows/nvapi64.dll`），由 Proton
+  正常的前缀 setup 把 payload 副本复制进前缀；wrapper 不在前缀中写、删或备份
+  `nvapi64.dll`。`nvngx.dll` 则仍是 wrapper 按游戏管理的单文件，位于该游戏前缀的
+  `pfx/drive_c/windows/system32`。前缀中已有第三方 `nvngx.dll`/`_nvngx.dll` 时绝不
+  覆盖、不备份、不接管，该次启动只保留普通 Neptune 注入；用户自己的
+  `WINEDLLOVERRIDES` 覆盖这两个名字、或显式禁用 Proton NVAPI 安装时同样不启用。
+- wrapper 只把该次启动声明为*候选*：它传递 `BRINEWELL_NGX_SR_CANDIDATE=1` 和两个 DLL
+  的预期 SHA-256，并清除继承来的 `BRINEWELL_NGX_SR_ACTIVE`。Neptune 的 Windows 侧随后
+  在游戏进程内核验该进程从 System32 看到的两个文件的摘要；只有核验通过的进程才为自己
+  设置 `BRINEWELL_NGX_SR_ACTIVE`，子进程不能靠继承获得激活，过期前缀也无法骗过核验。
+- 取消开启在*下一次* Proton 前缀 setup 后才完全生效：移除启动选项后绑定消失，工具自带的
+  原版 `nvapi64.dll` 在下一次 setup 时被重新复制；wrapper 则在下一次启动时只移除自己
+  安装的 `nvngx.dll` 与 marker。被用户替换过的文件保留不动。
+- 仍不显示超分选项的游戏不在支持范围内：部分 SDK loader 会校验 core 库的签名或信任链
+  （随附的 `nvngx.dll` 没有内嵌 Authenticode 签名），驱动注册表或 Streamline 插件的
+  检查也可能独立于文件来源拦截该功能。
 
 ### 反作弊（EAC）
 

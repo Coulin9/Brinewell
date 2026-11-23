@@ -186,20 +186,34 @@ installed system-wide, so Steam itself never loads nvapi64.
 
 - Only recognized x86-64 Proton launches on the Neptune / D3DMetal backend are
   eligible; other backends and ARM64 tools ignore the option.
-- On a qualifying launch the wrapper copies both DLLs into that game's own
-  prefix (`pfx/drive_c/windows/system32`) and sets `BRINEWELL_NGX_SR_ACTIVE=1`
-  with `nvngx=n;nvapi64=n` overrides. A prefix slot already holding a foreign
-  `nvngx.dll`/`nvapi64.dll` — Proton's own or any other provider — is never
-  overwritten, backed up or adopted; the launch just keeps the plain Neptune
-  injection. The same applies to a `WINEDLLOVERRIDES` entry covering either
-  DLL. `BRINEWELL_NGX_SR_ACTIVE` is the wrapper's own effective bit and is
-  cleared for any injected launch that does not activate NGX, so an
-  inherited value cannot enable it.
-- Removing the launch option, switching the backend, or losing the payload
-  files removes only the files the wrapper itself installed on the next launch.
-  A file you replaced afterwards is left alone.
-- Games that still do not expose an upscaler option (driver registry or
-  signature checks, Streamline plugin bundles) are outside the supported scope.
+- On a qualifying launch the two DLLs are deployed differently. `nvapi64.dll`
+  is read-only bound over the selected tool's own NVAPI copy source
+  (`files/lib/wine/nvapi/x86_64-windows/nvapi64.dll`), so Proton's normal
+  prefix setup installs the payload copy itself; the wrapper never writes,
+  deletes or backs up `nvapi64.dll` in the prefix. `nvngx.dll` stays a
+  managed single file inside the game prefix's
+  `pfx/drive_c/windows/system32`. A foreign `nvngx.dll`/`_nvngx.dll` already
+  in the prefix — any other provider — is never overwritten, backed up or
+  adopted; the launch just keeps the plain Neptune injection. The same
+  applies to a `WINEDLLOVERRIDES` entry covering either name or to an
+  explicitly disabled Proton NVAPI install.
+- The wrapper only declares the launch a *candidate*: it passes
+  `BRINEWELL_NGX_SR_CANDIDATE=1` plus the expected SHA-256 of both DLLs and
+  clears any inherited `BRINEWELL_NGX_SR_ACTIVE`. The Windows side of
+  Neptune then verifies, inside the game process, that the two files that
+  process sees in System32 match those digests; only a process that passes
+  sets `BRINEWELL_NGX_SR_ACTIVE` for itself, so a child process cannot
+  inherit activation and a stale prefix cannot fool the check.
+- Opting out takes full effect at the next Proton prefix setup: with the
+  launch option removed the bind is gone, so the tool's stock `nvapi64.dll`
+  is copied again on the next setup run, while the wrapper removes only its
+  own `nvngx.dll` and marker on the next launch. A file you replaced
+  afterwards is left alone.
+- Games that still do not expose an upscaler option are outside the
+  supported scope: several SDK loaders check the core library's signature
+  or trust chain (the shipped `nvngx.dll` carries no embedded Authenticode
+  signature), and driver registry or Streamline plugin checks can gate the
+  feature independently of where the files came from.
 
 ### Anti-cheat (EAC)
 
