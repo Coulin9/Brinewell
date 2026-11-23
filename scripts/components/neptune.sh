@@ -16,9 +16,35 @@ tool = json.load(open(sys.argv[1]))['neptune_toolchain']
 print(tool['url'], tool['sha256'])
 PY
 )
+NGX_CERT="$SRC/src/virtio/neptune/ngx/signing/brinewell-ngx-v1.pem"
+NGX_SIGNING_DIR="${BRINEWELL_NGX_SIGNING_DIR:-$HOME/.config/brinewell-signing/ngx-v1}"
+NGX_SIGN_RECIPE=1
+NGX_CERT_SHA256="$(openssl x509 -in "$NGX_CERT" -outform DER | shasum -a 256 | awk '{print $1}')"
+NGX_SIGNER_VERSION=none
+NGX_SIGN_MODE=unsigned
+if [[ -r "$NGX_SIGNING_DIR/private.pem" && -r "$NGX_SIGNING_DIR/public.pem" ]]; then
+    NGX_SIGN_MODE=signed
+else
+    warn "no ngx signing key in $NGX_SIGNING_DIR; nvngx.dll will be unsigned"
+fi
+if [[ "$NGX_SIGN_MODE" == signed ]]; then
+    require_cmd openssl osslsigncode
+    [[ "$(openssl x509 -in "$NGX_SIGNING_DIR/public.pem" -outform DER | shasum -a 256 | awk '{print $1}')" == "$NGX_CERT_SHA256" ]] \
+        || die "$NGX_SIGNING_DIR/public.pem does not match $NGX_CERT"
+    key_pub="$(openssl pkey -in "$NGX_SIGNING_DIR/private.pem" -pubout 2>/dev/null)" \
+        || die "cannot read ngx signing key $NGX_SIGNING_DIR/private.pem"
+    [[ "$key_pub" == "$(openssl x509 -in "$NGX_CERT" -pubkey -noout)" ]] \
+        || die "$NGX_SIGNING_DIR/private.pem does not match $NGX_CERT"
+    key_perm="$(stat -f %Lp "$NGX_SIGNING_DIR/private.pem")"
+    [[ "$key_perm" == 400 || "$key_perm" == 600 ]] \
+        || die "$NGX_SIGNING_DIR/private.pem has insecure permissions $key_perm (want 600)"
+    NGX_SIGNER_VERSION="$(osslsigncode --version | head -1)"
+fi
 INPUT="$(input_digest "$NAME" source "$SOURCE_INPUT" \
     recipe "$(sha256_file "$0")" builder "$(sha256_file "$DOCKERFILE")" \
-    toolchain "$TOOLCHAIN_SHA" target x86_64-and-arm64-wine)"
+    toolchain "$TOOLCHAIN_SHA" target x86_64-and-arm64-wine \
+    ngx_sign_mode "$NGX_SIGN_MODE" ngx_cert "$NGX_CERT_SHA256" \
+    ngx_sign_recipe "$NGX_SIGN_RECIPE" ngx_signer "$NGX_SIGNER_VERSION")"
 if component_should_reuse "$NAME" "$INPUT" "$OUTDIR/root.tar"; then exit 0; fi
 
 require_builder
@@ -169,7 +195,39 @@ for arch in x86_64 aarch64; do
 done
 BUILD
 
-python3 - "$OUTDIR/root/usr/lib/brinewell/neptune" "$SOURCE_COMMIT" "$SOURCE_INPUT" "$TOOLCHAIN_SHA" "$INPUT" <<'PY'
+NGX_DLL="$OUTDIR/root/usr/lib/brinewell/neptune/x86_64-windows/nvngx.dll"
+if [[ "$NGX_SIGN_MODE" == signed ]]; then
+    NGX_TMP="$(mktemp -d "$OUTDIR/.ngx-sign.XXXXXX")"
+    trap 'rm -rf "$NGX_TMP"' EXIT
+    log "sign nvngx.dll"
+    osslsigncode sign -certs "$NGX_CERT" -key "$NGX_SIGNING_DIR/private.pem" \
+        -n "Brinewell NGX" -h sha256 -in "$NGX_DLL" -out "$NGX_TMP/nvngx.dll" \
+        || die "osslsigncode sign failed"
+    osslsigncode verify -CAfile "$NGX_CERT" -in "$NGX_TMP/nvngx.dll" >/dev/null \
+        || die "signed nvngx.dll failed osslsigncode verify"
+    osslsigncode extract-signature -in "$NGX_TMP/nvngx.dll" -out "$NGX_TMP/sig.der" \
+        || die "cannot extract embedded signature from signed nvngx.dll"
+    openssl pkcs7 -inform DER -in "$NGX_TMP/sig.der" -print_certs -out "$NGX_TMP/signers.pem" \
+        || die "cannot decode embedded signer certificates"
+    leaf_sha="$(awk '/-----BEGIN CERTIFICATE-----/{n++} n==1' "$NGX_TMP/signers.pem" \
+        | openssl x509 -outform DER | shasum -a 256 | awk '{print $1}')"
+    [[ "$leaf_sha" == "$NGX_CERT_SHA256" ]] \
+        || die "embedded signer certificate does not match $NGX_CERT"
+    xcrun llvm-objdump -p "$NGX_TMP/nvngx.dll" > "$NGX_TMP/nvngx.txt" \
+        || die "cannot inspect signed nvngx.dll"
+    grep -q 'file format coff-x86-64' "$NGX_TMP/nvngx.txt" \
+        || die "signed nvngx.dll is not a coff-x86-64 PE"
+    [[ "$(grep -c 'NVSDK_NGX_D3D12_' "$NGX_TMP/nvngx.txt")" == 16 ]] \
+        || die "signed nvngx.dll no longer exports the 16 NVSDK_NGX_D3D12_* symbols"
+    read -r _ _ sec_rva sec_size _ < <(grep 'Security Directory' "$NGX_TMP/nvngx.txt" || true)
+    [[ -n "${sec_rva:-}" && "$sec_rva" != 0000000000000000 && "${sec_size:-}" != 00000000 ]] \
+        || die "signed nvngx.dll has an empty security directory"
+    mv "$NGX_TMP/nvngx.dll" "$NGX_DLL"
+    rm -rf "$NGX_TMP"
+    trap - EXIT
+fi
+
+python3 - "$OUTDIR/root/usr/lib/brinewell/neptune" "$SOURCE_COMMIT" "$SOURCE_INPUT" "$TOOLCHAIN_SHA" "$INPUT" "$NGX_SIGN_MODE" "$NGX_CERT_SHA256" <<'PY'
 import hashlib, json, struct, sys
 from pathlib import Path
 root = Path(sys.argv[1])
@@ -193,7 +251,8 @@ for arch, elf_machine in [('x86_64', 62), ('aarch64', 183)]:
     assert data[:6] == b'\x7fELF\x02\x01' and struct.unpack_from('<H', data, 18)[0] == elf_machine, relative
     files[relative] = hashlib.sha256(data).hexdigest()
 manifest = {'schema': 1, 'source_commit': sys.argv[2], 'source_sha256': sys.argv[3],
-            'toolchain_sha256': sys.argv[4], 'build_input': sys.argv[5], 'files': files}
+            'toolchain_sha256': sys.argv[4], 'build_input': sys.argv[5],
+            'ngx_signing': {'mode': sys.argv[6], 'cert_sha256': sys.argv[7]}, 'files': files}
 (root / 'payload.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
 PY
 tar -C "$OUTDIR/root" -cf "$OUTDIR/root.tar" .
