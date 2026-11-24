@@ -72,6 +72,8 @@ class GraphicsWrapTests(unittest.TestCase):
         # Existing tests must never see a real home-dir dev payload.
         self.dev = self.root / "neptune-dev"
         patch.object(wrap, "DEV_PAYLOAD", self.dev).start()
+        self.hdr = self.root / "hdr"
+        patch.object(wrap, "HDR_DIR", self.hdr).start()
 
     def _make_tool(self, tool, arch):
         tool.mkdir(parents=True, exist_ok=True)
@@ -101,9 +103,10 @@ class GraphicsWrapTests(unittest.TestCase):
                 "STEAM_COMPAT_DATA_PATH": str(self.compat),
                 **(extra or {})}
 
-    def run_wrap(self, cmd, env=None, mode="venus", tool=None, fex=True):
+    def run_wrap(self, cmd, env=None, mode="venus", tool=None, fex=True,
+                 fd=9, bwrap_args=()):
         tool = tool or self.tool
-        argv = ["--args", "9", str(self.pv), "--opt=x", "--"]
+        argv = ["--args", str(fd), *bwrap_args, str(self.pv), "--opt=x", "--"]
         if fex:
             argv += ["FEXCompatTool"]
         argv += [str(tool / "proton"), *cmd]
@@ -147,25 +150,121 @@ class GraphicsWrapTests(unittest.TestCase):
 
     # --- passthrough ---
 
-    def test_venus_passes_tail_and_args_exact(self):
-        argv = self.game()
-        self.assertEqual(self.execed[-1][0], str(self.bwrap))
-        # Venus injects nothing: the original argv passes through untouched.
-        self.assertEqual(argv, ["--args", "9", str(self.pv), "--opt=x", "--",
-                                "FEXCompatTool", str(self.tool / "proton"),
-                                "waitforexitandrun", "/game/game.exe", "--opt"])
+    def test_hdr_directory_bind_for_validated_games_only(self):
+        for mode in ("venus", "neptune", "mullion"):
+            with self.subTest(mode=mode):
+                self.assertNotIn(str(self.hdr), self.game(mode=mode))
+        self.hdr.mkdir()
+        for mode in ("venus", "neptune", "mullion"):
+            with self.subTest(mode=mode):
+                argv = self.game(mode=mode)
+                index = argv.index(str(self.hdr))
+                self.assertEqual(argv[index - 1:index + 2],
+                                 ["--ro-bind", str(self.hdr), "/run/brinewell/hdr"])
+        self.assertNotIn(str(self.hdr), self.game(verb="runinprefix"))
+
+    def test_venus_injects_hdr_and_preserves_tail(self):
+        with tempfile.TemporaryFile() as argfile:
+            argv = self.game(fd=argfile.fileno())
+            self.assertEqual(self.execed[-1][0], str(self.bwrap))
+            self.assertEqual(argv, ["--args", str(argfile.fileno()), "--setenv", "ENABLE_GAMESCOPE_WSI", "1",
+                                    "--setenv", "DXVK_HDR", "1", str(self.pv), "--opt=x", "--",
+                                    "FEXCompatTool", str(self.tool / "proton"),
+                                    "waitforexitandrun", "/game/game.exe", "--opt"])
+
+    def test_venus_overrides_inherited_wsi_disable(self):
+        with tempfile.TemporaryFile() as argfile:
+            argv = self.game(fd=argfile.fileno(), env={"ENABLE_GAMESCOPE_WSI": "0"})
+            self.assertEqual(self._setenvs(argv), {"ENABLE_GAMESCOPE_WSI": "1", "DXVK_HDR": "1"})
+
+    def test_argfile_offset_and_non_game_passthrough(self):
+        with tempfile.TemporaryFile() as argfile:
+            argfile.write(b"ignored\0--setenv\0DXVK_HDR\x000\0")
+            argfile.flush()
+            argfile.seek(8)
+            argv = self.game(fd=argfile.fileno())
+            self.assertNotIn("DXVK_HDR", self._setenvs(argv))
+            self.assertEqual(argfile.tell(), 8)
+            with patch.object(wrap.os, "lseek", side_effect=AssertionError("FD touched")):
+                self.run_wrap(["runinprefix", "x"], fd=argfile.fileno())
+            self.assertEqual(argfile.tell(), 8)
+
+    def test_argfile_unset_and_assignment_order(self):
+        with tempfile.TemporaryFile() as argfile:
+            argfile.write(b"--setenv\0DISABLE_GAMESCOPE_WSI\x001\0--unsetenv\0DISABLE_GAMESCOPE_WSI\0--unsetenv\0DXVK_HDR\0")
+            argfile.flush()
+            argfile.seek(0)
+            argv = self.game(fd=argfile.fileno())
+            self.assertEqual(self._setenvs(argv), {"ENABLE_GAMESCOPE_WSI": "1"})
+            argfile.seek(0)
+            argv = self.game(fd=argfile.fileno(), bwrap_args=["--setenv", "DISABLE_GAMESCOPE_WSI", "1"])
+            self.assertNotIn("ENABLE_GAMESCOPE_WSI", argv)
+
+    def test_nonseekable_argfile_is_not_consumed(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"--setenv\0DXVK_HDR\x000\0")
+            argv = self.game(fd=read_fd)
+            self.assertNotIn("DXVK_HDR", self._setenvs(argv))
+            self.assertEqual(os.read(read_fd, 64), b"--setenv\0DXVK_HDR\x000\0")
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_venus_preserves_explicit_dxvk_hdr(self):
+        for value in ("0", ""):
+            with self.subTest(value=value):
+                argv = self.game(env={"DXVK_HDR": value})
+                self.assertEqual(self._setenvs(argv), {"ENABLE_GAMESCOPE_WSI": "1"})
+
+    def test_venus_respects_argfile_setenv_and_rewinds_fd(self):
+        for key, value, expected in (
+                ("DXVK_HDR", "0", {"ENABLE_GAMESCOPE_WSI": "1"}),
+                ("DISABLE_GAMESCOPE_WSI", "1", {}),
+                ("BRINEWELL_HDR", "0", {}),
+                ("ENABLE_GAMESCOPE_WSI", "0", {"ENABLE_GAMESCOPE_WSI": "1", "DXVK_HDR": "1"})):
+            with self.subTest(key=key), tempfile.TemporaryFile() as argfile:
+                content = b"\0".join(os.fsencode(word) for word in
+                                      ("--setenv", key, value)) + b"\0"
+                argfile.write(content)
+                argfile.flush()
+                argfile.seek(0)
+                argv = self.game(fd=argfile.fileno())
+                self.assertEqual(self._setenvs(argv), expected)
+                self.assertEqual(argfile.tell(), 0)
+                self.assertEqual(argfile.read(), content)
+
+    def test_venus_respects_outer_bwrap_setenv(self):
+        for key, value in (("DXVK_HDR", "0"), ("DISABLE_GAMESCOPE_WSI", "1"),
+                           ("BRINEWELL_HDR", "0")):
+            with self.subTest(key=key):
+                explicit = ["--setenv", key, value]
+                argv = self.game(bwrap_args=explicit)
+                self.assertEqual(argv.count(key), 1)
+                if key != "DXVK_HDR":
+                    self.assertNotIn("ENABLE_GAMESCOPE_WSI", argv)
+                    self.assertNotIn("DXVK_HDR", argv)
+
+    def test_venus_hdr_opt_out_preserves_arguments(self):
+        expected = ["--args", "9", str(self.pv), "--opt=x", "--",
+                    "FEXCompatTool", str(self.tool / "proton"),
+                    "waitforexitandrun", "/game/game.exe", "--opt"]
+        for env in ({"DISABLE_GAMESCOPE_WSI": "1"}, {"BRINEWELL_HDR": "0"}):
+            with self.subTest(env=env):
+                self.assertEqual(self.game(env=env), expected)
 
     def test_non_game_and_probe_verbs_pass_byte_identical(self):
-        for tail in (["uname", "-a"], ["getcompatpath", "/game"],
-                     ["runinprefix", "x"], ["--verb=run"]):
-            argv = ["--args", "9", str(self.pv), "--opt=x", "--", *tail]
-            with patch.object(wrap, "_mode", lambda: "neptune"), \
-                 patch.object(wrap, "_delegate", lambda: str(self.bwrap)), \
-                 patch.object(graphics, "PAYLOAD", self.payload), \
-                 patch.object(wrap.os, "execv", self._exec), \
-                 patch.dict(os.environ, self._env(self.tool), clear=True):
-                wrap.main(argv)
-            self.assertEqual(self.execed[-1][1], [str(self.bwrap), *argv])
+        for mode in ("venus", "neptune"):
+            for tail in (["uname", "-a"], ["steam"], ["getcompatpath", "/game"],
+                         ["runinprefix", "x"], ["--verb=run"]):
+                argv = ["--args", "9", str(self.pv), "--opt=x", "--", *tail]
+                with patch.object(wrap, "_mode", lambda: mode), \
+                     patch.object(wrap, "_delegate", lambda: str(self.bwrap)), \
+                     patch.object(graphics, "PAYLOAD", self.payload), \
+                     patch.object(wrap.os, "execv", self._exec), \
+                     patch.dict(os.environ, self._env(self.tool), clear=True):
+                    wrap.main(argv)
+                self.assertEqual(self.execed[-1][1], [str(self.bwrap), *argv])
         # argv without the recognized boundary also passes byte-identical.
         argv = ["--args", "9", str(self.pv)]
         with patch.object(wrap, "_delegate", lambda: str(self.bwrap)), \
@@ -192,13 +291,17 @@ class GraphicsWrapTests(unittest.TestCase):
         argv_template = ["--args", "9", str(self.pv), "--opt=x", "--",
                          "FEXCompatTool", str(self.tool / "proton"),
                          "waitforexitandrun", "/game/game.exe"]
-        for env in full_envs:
-            self.execed.clear()
-            with patch.object(wrap, "_mode", lambda: "neptune"),                  patch.object(wrap, "PAYLOAD", self.payload),                  patch.object(wrap, "_delegate", lambda: str(self.bwrap)),                  patch.object(graphics, "PAYLOAD", self.payload),                  patch.object(wrap.os, "execv", self._exec),                  patch.dict(os.environ, env, clear=True):
-                wrap.main(argv_template)
-            argv = self.execed[-1][1][1:]
-            self.assertNotIn("--ro-bind", argv)
-            self.assertNotIn("WINEDLLOVERRIDES", argv)
+        for mode in ("venus", "neptune"):
+            for env in full_envs:
+                self.execed.clear()
+                with patch.object(wrap, "_mode", lambda: mode), \
+                     patch.object(wrap, "PAYLOAD", self.payload), \
+                     patch.object(wrap, "_delegate", lambda: str(self.bwrap)), \
+                     patch.object(graphics, "PAYLOAD", self.payload), \
+                     patch.object(wrap.os, "execv", self._exec), \
+                     patch.dict(os.environ, env, clear=True):
+                    wrap.main(argv_template)
+                self.assertEqual(self.execed[-1][1], [str(self.bwrap), *argv_template])
 
     def test_grouped_and_wildcard_overrides_no_extra(self):
         for value in ("d3d12,dxgi=n", "D3D11.DLL=b", "d3d*=n"):
@@ -368,7 +471,7 @@ class GraphicsWrapTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("WINEDLLPATH") + 1].split(":")[0],
                          "/run/host/" + str(self.payload.relative_to(self.root)) + "/bridge/x86_64")
 
-    def test_dev_payload_venus_injects_nothing(self):
+    def test_dev_payload_venus_does_not_inject_neptune(self):
         self._make_dev_payload()
         argv = self.game(mode="venus")
         self.assertNotIn("--ro-bind", argv)

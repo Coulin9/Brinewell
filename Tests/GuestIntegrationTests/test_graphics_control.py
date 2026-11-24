@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 import select
@@ -34,6 +35,9 @@ class GraphicsControlTests(unittest.TestCase):
         patcher = patch.object(control, "STATE", str(self.state))
         self.addCleanup(patcher.stop)
         patcher.start()
+        hdr_patcher = patch.object(control, "HDR_STATE", str(self.root / "hdr/display.json"))
+        self.addCleanup(hdr_patcher.stop)
+        hdr_patcher.start()
         self.thread = threading.Thread(
             target=lambda: self.result.append(control.serve(self.f)), daemon=True)
         self.host_file = self.host.makefile("rwb", buffering=0)
@@ -64,6 +68,37 @@ class GraphicsControlTests(unittest.TestCase):
         self.host_file.flush()
         self.assertEqual(self.host_file.readline().strip(), b"applied neptune")
         self.assertEqual(self.state.read_text().strip(), "neptune")
+
+    def test_hdr_atomic_publication_and_validation(self):
+        target = Path(control.HDR_STATE)
+        self.host_file.write(b"hdr 1 576 576 50 480\n")
+        self.assertEqual(self.host_file.readline(), b"applied hdr\n")
+        self.assertEqual(json.loads(target.read_text()), {
+            "supported": True, "max_nits": 576, "max_fall_nits": 576,
+            "min_nits_10000ths": 50, "sdr_nits": 480})
+        self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(target.parent.stat().st_mode & 0o777, 0o755)
+        inode = target.stat().st_ino
+        self.host_file.write(b"hdr 2 10 10 0 10\nhdr 1 -1 10 0 10\n"
+                             b"hdr 1 +1 10 0 10\nhdr 0 0 0 0 0\n")
+        self.assertEqual(self.host_file.readline(), b"applied hdr\n")
+        self.assertNotEqual(target.stat().st_ino, inode)
+        self.assertFalse(json.loads(target.read_text())["supported"])
+        self.assertEqual(list(target.parent.iterdir()), [target])
+
+    def test_hdr_uint16_bounds(self):
+        target = Path(control.HDR_STATE)
+        for index in range(4):
+            values = [0, 0, 0, 0]
+            values[index] = 65536
+            self.host_file.write(("hdr 1 " + " ".join(map(str, values)) + "\n").encode())
+        self.host_file.write(b"hdr 1 65535 65535 65535 65535\n")
+        self.assertEqual(self.host_file.readline(), b"applied hdr\n")
+        self.assertEqual(json.loads(target.read_text()), {
+            "supported": True, "max_nits": 65535, "max_fall_nits": 65535,
+            "min_nits_10000ths": 65535, "sdr_nits": 65535})
+        self.host_file.write(b"backend venus\n")
+        self.assertEqual(self.host_file.readline(), b"applied venus\n")
 
     def test_backend_rewrite_is_atomic_per_request(self):
         for mode in ("venus", "neptune", "mullion", "venus"):

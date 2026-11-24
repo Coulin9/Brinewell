@@ -73,6 +73,10 @@ GAMESCOPE_ARGS=(
   --xwayland-count 2
 )
 
+if [[ "${BRINEWELL_GAMESCOPE_BACKEND:-drm}" == drm && "${GAMESCOPE_HDR:-1}" == 1 ]]; then
+  GAMESCOPE_ARGS+=(--hdr-enabled --sdr-gamut-wideness "${GAMESCOPE_SDR_GAMUT_WIDENESS:-0}")
+fi
+
 GAMESCOPE_SESSION_TARGET="${GAMESCOPE_SESSION_TARGET:-gamescope-session.target}"
 WATCH_SERVICE=
 if [[ "${GAMESCOPE_SESSION_TARGET}" == "gamescope-session.target" ]]; then

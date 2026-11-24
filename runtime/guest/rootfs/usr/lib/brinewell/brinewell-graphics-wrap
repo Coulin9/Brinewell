@@ -6,7 +6,7 @@ only when the inherited/user configuration does not already name a delegate.
 The recognized game boundary is `--args FD pv-adverb ... -- [FEXCompatTool]
 <tool>/proton <verb> ...`: bwrap's parse_args_recurse continues the outer argv
 after the nested argfile list, so injected options go between `--args FD` and
-the pv-adverb tail; the original argv and fd are never read or rewritten. Any
+the pv-adverb tail; the original argv is preserved and argfile offsets are preserved. Any
 launch that is not a validated Proton game under an exact STEAM_COMPAT_TOOL_PATHS
 tool root executes the delegate with byte-identical arguments.
 """
@@ -41,6 +41,7 @@ NGX_MANAGED = ("nvngx.dll",)
 NGX_LEGACY = ("nvapi64.dll",)
 NGX_MARKER = ".brinewell-ngx-sr.json"
 NGX_LOCK = ".brinewell-ngx-sr.lock"
+HDR_DIR = Path("/run/brinewell/hdr")
 
 
 def _log(message):
@@ -687,17 +688,76 @@ def _ngx_install(compat, env, root, tool):
             "--unsetenv", "BRINEWELL_NGX_SR_ACTIVE"]
 
 
-def _injection(mode, cmd, env):
+def _bwrap_setenvs(args, seen=None):
+    """Return ordered assignments and whether every argfile was readable."""
+    if seen is None:
+        seen = set()
+    assignments = []
+    complete = True
+    i = 0
+    while i < len(args):
+        if args[i] == "--setenv" and i + 2 < len(args):
+            assignments.append((args[i + 1], args[i + 2]))
+            i += 3
+        elif args[i] == "--unsetenv" and i + 1 < len(args):
+            assignments.append((args[i + 1], None))
+            i += 2
+        elif args[i] == "--args" and i + 1 < len(args) and args[i + 1].isdecimal():
+            fd = int(args[i + 1])
+            if fd in seen:
+                complete = False
+            else:
+                seen.add(fd)
+                try:
+                    orig = os.lseek(fd, 0, os.SEEK_CUR)
+                    try:
+                        chunks = []
+                        while True:
+                            chunk = os.read(fd, 65536)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                    finally:
+                        os.lseek(fd, orig, os.SEEK_SET)
+                    words = [os.fsdecode(word) for word in b"".join(chunks).split(b"\0")]
+                    nested, readable = _bwrap_setenvs(words, seen)
+                    assignments.extend(nested)
+                    complete = complete and readable
+                except OSError:
+                    complete = False
+            i += 2
+        else:
+            i += 1
+    return assignments, complete
+
+
+def _injection(mode, cmd, env, bwrap_env=(), bwrap_complete=True):
     """Extra bwrap options for a recognized Proton game launch, else []."""
     info = graphics.proton_invocation(cmd, env)
     if not info:
         return []
     tool, verb_index = info
+    hdr_bind = ["--ro-bind", str(HDR_DIR), "/run/brinewell/hdr"] if HDR_DIR.is_dir() else []
     compat = Path(env["STEAM_COMPAT_DATA_PATH"])
+    if mode == "venus":
+        _ngx_cleanup(compat)
+        effective = dict(env)
+        for key, value in bwrap_env:
+            if value is None:
+                effective.pop(key, None)
+            else:
+                effective[key] = value
+        if effective.get("DISABLE_GAMESCOPE_WSI") == "1" or effective.get("BRINEWELL_HDR") == "0":
+            return hdr_bind
+        inject = hdr_bind + ["--setenv", "ENABLE_GAMESCOPE_WSI", "1"]
+        if bwrap_complete and "DXVK_HDR" not in effective and not any(key == "DXVK_HDR" for key, _ in bwrap_env):
+            inject += ["--setenv", "DXVK_HDR", "1"]
+        return inject
     inject = _neptune_injection(mode, cmd, env, tool)
     if not inject:
         _ngx_cleanup(compat)
-        return inject
+        return hdr_bind
+    inject += hdr_bind
     candidate = None
     executable = cmd[verb_index + 1] if verb_index + 1 < len(cmd) else ""
     is_32bit = graphics._pe_machine(executable) == 0x14c
@@ -784,10 +844,15 @@ def main(argv):
         print('brinewell: could not locate bubblewrap', file=sys.stderr)
         return 126
     extra = []
-    if (len(argv) > 4 and argv[0] == '--args' and argv[1].isdecimal()
-            and Path(argv[2]).name == 'pv-adverb' and '--' in argv[3:]):
-        command = argv[argv.index('--', 3) + 1:]
-        extra = _injection(_mode(), command, os.environ)
+    if len(argv) > 4 and argv[0] == '--args' and argv[1].isdecimal():
+        pv = next((i for i in range(2, len(argv))
+                   if Path(argv[i]).name == 'pv-adverb'), None)
+        if pv is not None and '--' in argv[pv + 1:]:
+            command = argv[argv.index('--', pv + 1) + 1:]
+            if graphics.proton_invocation(command, os.environ):
+                mode = _mode()
+                bwrap_env, complete = _bwrap_setenvs(argv[:pv]) if mode == 'venus' else ((), True)
+                extra = _injection(mode, command, os.environ, bwrap_env, complete)
     args = argv[:2] + extra + argv[2:] if extra else argv
     os.execv(delegate, [delegate, *args])
 

@@ -6,11 +6,14 @@ nonzero so systemd restarts and re-announces readiness. Overlong lines are
 drained to the newline and rejected without corrupting the pending buffer.
 """
 
+import json
 import os
 import sys
+import tempfile
 
 DEVICE = "/dev/virtio-ports/fx.graphics"
 STATE = "/run/brinewell/graphics-backend"
+HDR_STATE = "/run/brinewell/hdr/display.json"
 MODES = {"venus", "neptune", "mullion"}
 MAX_LINE = 4096
 
@@ -37,6 +40,26 @@ def _apply(mode, f):
     os.chmod(tmp, 0o644)
     os.replace(tmp, STATE)
     _write_all(f, ("applied " + mode + "\n").encode())
+
+
+def _apply_hdr(values, f):
+    directory = os.path.dirname(HDR_STATE)
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    os.chmod(directory, 0o755)
+    data = dict(zip(("supported", "max_nits", "max_fall_nits",
+                     "min_nits_10000ths", "sdr_nits"), values))
+    data["supported"] = bool(data["supported"])
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".display-")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(data, handle)
+            handle.write("\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, HDR_STATE)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    _write_all(f, b"applied hdr\n")
 
 
 def serve(f):
@@ -73,6 +96,18 @@ def serve(f):
                 _apply(parts[1], f)
             except OSError as error:
                 _log(f"apply failed: {error}")
+        elif (len(parts) == 6 and parts[0] == "hdr"
+              and parts[1] in ("0", "1")
+              and all(part and all("0" <= c <= "9" for c in part)
+                      for part in parts[2:])):
+            try:
+                values = [int(part) for part in parts[1:]]
+                if any(value > 65535 for value in values[1:]):
+                    _log("HDR value out of range")
+                    continue
+                _apply_hdr(values, f)
+            except (OSError, ValueError) as error:
+                _log(f"HDR apply failed: {error}")
         else:
             _log(f"unknown request rejected: {parts[0][:32]}")
 

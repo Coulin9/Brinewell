@@ -38,6 +38,23 @@ def run_shell(script, shell="/bin/sh", check=True, **env):
                           check=check, capture_output=True, text=True)
 
 
+class GamescopeHDRArgumentsTests(unittest.TestCase):
+    def test_hdr_gamut_defaults_override_and_gating(self):
+        source = GAMESCOPE_SESSION.read_text()
+        block = re.search(r'(?ms)^if \[\[ "\$\{BRINEWELL_GAMESCOPE_BACKEND:-drm\}" == drm.*?^fi$', source)
+        self.assertIsNotNone(block)
+        script = 'GAMESCOPE_ARGS=()\n' + block.group(0) + '\nprintf "%s\\n" "${GAMESCOPE_ARGS[@]}"'
+        for backend, hdr, wideness, expected in (
+            ('drm', '1', '', ['--hdr-enabled', '--sdr-gamut-wideness', '0']),
+            ('drm', '1', '0.4', ['--hdr-enabled', '--sdr-gamut-wideness', '0.4']),
+            ('drm', '0', '', []),
+            ('sdl', '1', '', []),
+        ):
+            result = run_shell(script, shell='/bin/bash', BRINEWELL_GAMESCOPE_BACKEND=backend,
+                               GAMESCOPE_HDR=hdr, GAMESCOPE_SDR_GAMUT_WIDENESS=wideness)
+            self.assertEqual(result.stdout.splitlines(), expected if expected else [''])
+
+
 class EspStateDirTests(unittest.TestCase):
     """A/B state follows the bootenv FILE, not the state directory."""
     def setUp(self):
