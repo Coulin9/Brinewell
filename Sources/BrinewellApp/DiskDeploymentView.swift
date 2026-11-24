@@ -15,8 +15,15 @@ struct DiskDeploymentView: View {
             Form {
                 if !installing {
                     Section {
-                        Text("No usable system disk was found.")
+                        if case .missingConfigured(let url) = model.setupReadiness.disk {
+                            Text("The configured system disk is missing. Reconnect its drive or choose an existing disk.")
+                                .foregroundStyle(.orange)
+                            Text(url.path).textSelection(.enabled)
+                        } else {
+                            Text("No usable system disk was found.")
+                        }
                         Button("Choose Existing System Disk") { model.chooseDisk(startAfterSelection: true) }
+                            .buttonStyle(.borderedProminent)
                         Text("Use an existing Brinewell system disk.").font(.callout).foregroundStyle(.secondary)
                     }
                     Section {
@@ -80,10 +87,10 @@ struct DiskDeploymentView: View {
                 if deployment.busy {
                     Button("Stop Installation") { Task { await deployment.cancel() } }.buttonStyle(.bordered)
                 } else {
-                    Button("Cancel") { model.showDeployment = false }
+                    Button("Cancel") { model.dismissSetup() }
                         .buttonStyle(.bordered).keyboardShortcut(.cancelAction)
                     if installing {
-                        Button(deployment.phase == .paused ? String(localized: "Resume Installation") : String(localized: "Install and Start")) { deployment.install() }
+                        Button(deployment.phase == .paused ? String(localized: "Resume Installation") : String(localized: "Install")) { deployment.install() }
                             .buttonStyle(.borderedProminent)
                             .keyboardShortcut(.defaultAction)
                             .disabled(deployment.source == .local && deployment.installerURL == nil)

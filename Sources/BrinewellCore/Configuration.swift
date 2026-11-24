@@ -297,6 +297,42 @@ public struct ConfigurationStore: Sendable {
             .appendingPathComponent("configuration.json")
     }
 
+    public static var applicationSupportDirectory: URL {
+        get throws { try defaultURL().deletingLastPathComponent() }
+    }
+
+    public static var managedFrameworksDirectory: URL {
+        get throws { try applicationSupportDirectory.appendingPathComponent("Frameworks", isDirectory: true) }
+    }
+
+    public static var managedD3DMetalFrameworkURL: URL {
+        get throws { try managedFrameworksDirectory.appendingPathComponent("D3DMetal.framework", isDirectory: true) }
+    }
+
+    /// Serialize read-modify-write transactions across store instances and processes.
+    @discardableResult
+    public func update(for host: HostCapabilities = .detect(), _ transform: (inout VMConfiguration) throws -> Void) throws -> VMConfiguration {
+        let directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let lockURL = directory.appendingPathComponent(".\(url.lastPathComponent).lock")
+        let fd = open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { throw CocoaError(.fileWriteUnknown) }
+        defer { close(fd) }
+        while flock(fd, LOCK_EX) != 0 {
+            if errno != EINTR { throw CocoaError(.fileWriteUnknown) }
+        }
+        defer { flock(fd, LOCK_UN) }
+        var configuration: VMConfiguration
+        do {
+            configuration = try decode()
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            configuration = .defaults(for: host)
+        }
+        try transform(&configuration)
+        try save(configuration, for: host)
+        return configuration
+    }
+
     public func load(for host: HostCapabilities) throws -> VMConfiguration {
         let data: Data
         do {

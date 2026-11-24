@@ -1,3 +1,35 @@
+/* Graphics setup and Apple downloads */
+"SteamOS System Disk" = "SteamOS 系统盘";
+"Graphics Setup" = "图形环境配置";
+"Neptune uses Apple’s D3DMetal (Game Porting Toolkit) for DirectX 11 and 12 games. Sign in with a free Apple Account to download, verify, and configure it automatically." = "Neptune 使用 Apple 的 D3DMetal（Game Porting Toolkit）运行 DirectX 11 和 12 游戏。登录免费的 Apple 账号，即可自动下载、验证并配置。";
+"Rosetta 2 Required" = "需要 Rosetta 2";
+"Rosetta 2 is required to run D3DMetal on Apple Silicon." = "在 Apple Silicon 上运行 D3DMetal 需要 Rosetta 2。";
+"Copy" = "复制";
+"Recheck" = "重新检测";
+"The previously configured D3DMetal framework could not be used:" = "无法使用之前配置的 D3DMetal 框架：";
+"Apple’s Game Porting Toolkit is downloaded directly from Apple and is subject to Apple’s Software License Agreement. Brinewell does not bundle Apple software." = "Game Porting Toolkit 直接从 Apple 下载，并受 Apple 软件许可协议约束。Brinewell 不捆绑 Apple 软件。";
+"Sign in to Apple Account" = "登录 Apple 账号";
+"Retry" = "重试";
+"Other Options" = "其他选项";
+"Import Local DMG or Framework…" = "导入本地 DMG 或 Framework…";
+"Open Apple Downloads in Browser" = "在浏览器中打开 Apple 下载页";
+"Use Built-in Venus (KosmicKrisp) Instead" = "改用内置 Venus (KosmicKrisp) 图形后端";
+"Signing in to Apple Account…" = "正在登录 Apple 账号…";
+"Querying Apple Developer Downloads…" = "正在查询 Apple 官方下载目录…";
+"Mounting disk image…" = "正在挂载磁盘镜像…";
+"Extracting D3DMetal…" = "正在提取 D3DMetal…";
+"Verifying D3DMetal…" = "正在验证 D3DMetal…";
+"Installing D3DMetal…" = "正在安装 D3DMetal…";
+"Download from Apple" = "从 Apple 下载";
+"Update from Apple" = "从 Apple 更新";
+"Import Local File" = "导入本地文件";
+"Version" = "版本";
+"Rosetta missing" = "缺少 Rosetta";
+"Sign in with a free Apple Account to automatically download and configure D3DMetal." = "登录免费的 Apple 账号，自动下载并配置 D3DMetal。";
+"Matching the official Apple installation package…" = "正在匹配 Apple 官方安装包…";
+"The package could not be matched automatically. Click a Game Porting Toolkit DMG download link below and the app will take over installation." = "无法自动匹配安装包。请点击下方 Game Porting Toolkit 的 DMG 下载链接，应用将接管安装。";
+"The Apple download URL could not be verified." = "无法验证 Apple 下载地址。";
+
 " (%@)" = "（%@）";
 " To enable sharing, allow the Brinewell background service in Login Items & Extensions in System Settings, then restart the virtual machine." = " 如需启用共享，请在系统设置的登录项与扩展中允许 Brinewell 后台服务，再重启虚拟机。";
 " · about %lldh %lldm remaining" = " · 约 %lldh %lldm";
@@ -332,3 +364,14 @@
 "The guest did not confirm the graphics backend change." = "客体未确认图形后端更改。";
 "The system disk was replaced while it was being resized. Try again." = "调整大小期间系统磁盘已被替换，请重试。";
 "Could not save the resized disk image to storage." = "无法将调整后的磁盘镜像写入存储。";
+
+"Unknown" = "未知";
+"Not configured" = "未配置";
+"Standard rendering" = "标准渲染";
+"4.0b3 context integration (subject to runtime verification)" = "4.0b3 上下文集成（以运行时验证为准）";
+"D3DMetal is installed." = "D3DMetal 已安装。";
+
+"The configured system disk is missing. Reconnect its drive or choose an existing disk." = "配置的系统磁盘不可用。请重新连接磁盘所在驱动器，或选择现有磁盘。";
+"The Apple download redirect could not be verified." = "无法验证 Apple 下载重定向。";
+"The Apple download returned an invalid response." = "Apple 下载返回了无效响应。";
+"The Apple download exceeds the maximum permitted size." = "Apple 下载超过允许的最大大小。";

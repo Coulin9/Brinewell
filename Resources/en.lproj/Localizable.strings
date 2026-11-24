@@ -1,4 +1,38 @@
 /* English UI text is defined in Swift. These keys are messages from SteamOS. */
+
+/* Graphics setup and Apple downloads */
+"SteamOS System Disk" = "SteamOS System Disk";
+"Graphics Setup" = "Graphics Setup";
+"Neptune uses Apple’s D3DMetal (Game Porting Toolkit) for DirectX 11 and 12 games. Sign in with a free Apple Account to download, verify, and configure it automatically." = "Neptune uses Apple’s D3DMetal (Game Porting Toolkit) for DirectX 11 and 12 games. Sign in with a free Apple Account to download, verify, and configure it automatically.";
+"Rosetta 2 Required" = "Rosetta 2 Required";
+"Rosetta 2 is required to run D3DMetal on Apple Silicon." = "Rosetta 2 is required to run D3DMetal on Apple Silicon.";
+"Copy" = "Copy";
+"Recheck" = "Recheck";
+"The previously configured D3DMetal framework could not be used:" = "The previously configured D3DMetal framework could not be used:";
+"Apple’s Game Porting Toolkit is downloaded directly from Apple and is subject to Apple’s Software License Agreement. Brinewell does not bundle Apple software." = "Apple’s Game Porting Toolkit is downloaded directly from Apple and is subject to Apple’s Software License Agreement. Brinewell does not bundle Apple software.";
+"Sign in to Apple Account" = "Sign in to Apple Account";
+"Retry" = "Retry";
+"Other Options" = "Other Options";
+"Import Local DMG or Framework…" = "Import Local DMG or Framework…";
+"Open Apple Downloads in Browser" = "Open Apple Downloads in Browser";
+"Use Built-in Venus (KosmicKrisp) Instead" = "Use Built-in Venus (KosmicKrisp) Instead";
+"Signing in to Apple Account…" = "Signing in to Apple Account…";
+"Querying Apple Developer Downloads…" = "Querying Apple Developer Downloads…";
+"Mounting disk image…" = "Mounting disk image…";
+"Extracting D3DMetal…" = "Extracting D3DMetal…";
+"Verifying D3DMetal…" = "Verifying D3DMetal…";
+"Installing D3DMetal…" = "Installing D3DMetal…";
+"Download from Apple" = "Download from Apple";
+"Update from Apple" = "Update from Apple";
+"Import Local File" = "Import Local File";
+"Version" = "Version";
+"Rosetta missing" = "Rosetta missing";
+"Sign in with a free Apple Account to automatically download and configure D3DMetal." = "Sign in with a free Apple Account to automatically download and configure D3DMetal.";
+"Matching the official Apple installation package…" = "Matching the official Apple installation package…";
+"The package could not be matched automatically. Click a Game Porting Toolkit DMG download link below and the app will take over installation." = "The package could not be matched automatically. Click a Game Porting Toolkit DMG download link below and the app will take over installation.";
+"The Apple download URL could not be verified." = "The Apple download URL could not be verified.";
+
+/* Messages from SteamOS */
 "Brinewell 运行库不完整，请重新安装最新 Brinewell" = "Brinewell runtime libraries are missing. Reinstall the latest version of Brinewell.";
 "Steam 安装元数据不完整。" = "The Steam installation metadata is incomplete.";
 "SteamOS 的 TUN 网络设备不可用" = "The SteamOS TUN network device is unavailable.";
@@ -38,3 +72,14 @@
 "正在配置独立运行库和网络组件" = "Configuring runtime libraries and network components.";
 "此安装功能仅支持 Brinewell 的 ARM64 SteamOS" = "This installer supports Brinewell’s ARM64 SteamOS only.";
 "现有 UU 服务为链接或已被屏蔽，请检查系统服务配置" = "The existing UU service is a symlink or is masked. Check the system service configuration.";
+
+"Unknown" = "Unknown";
+"Not configured" = "Not configured";
+"Standard rendering" = "Standard rendering";
+"4.0b3 context integration (subject to runtime verification)" = "4.0b3 context integration (subject to runtime verification)";
+"D3DMetal is installed." = "D3DMetal is installed.";
+
+"The configured system disk is missing. Reconnect its drive or choose an existing disk." = "The configured system disk is missing. Reconnect its drive or choose an existing disk.";
+"The Apple download redirect could not be verified." = "The Apple download redirect could not be verified.";
+"The Apple download returned an invalid response." = "The Apple download returned an invalid response.";
+"The Apple download exceeds the maximum permitted size." = "The Apple download exceeds the maximum permitted size.";

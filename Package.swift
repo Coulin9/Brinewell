@@ -34,7 +34,7 @@ let package = Package(
                 linkerSettings: [.unsafeFlags(["-L", frameworks, "-lkrun.1", "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks", "-Xlinker", "-rpath", "-Xlinker", frameworks]), .linkedFramework("AppKit"), .linkedFramework("GameController"), .linkedFramework("SystemConfiguration")]),
         .executableTarget(name: "BrinewellApp", dependencies: ["BrinewellCore", "BrinewellVMRuntime"],
                           swiftSettings: [.unsafeFlags(["-Xcc", "-I\(include)"])],
-                          linkerSettings: [.unsafeFlags(["-L", frameworks, "-lkrun.1", "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks", "-Xlinker", "-rpath", "-Xlinker", frameworks]), .linkedFramework("SwiftUI"), .linkedFramework("AppKit"), .linkedFramework("GameController")]),
+                          linkerSettings: [.unsafeFlags(["-L", frameworks, "-lkrun.1", "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks", "-Xlinker", "-rpath", "-Xlinker", frameworks]), .linkedFramework("SwiftUI"), .linkedFramework("AppKit"), .linkedFramework("GameController"), .linkedFramework("WebKit")]),
         .executableTarget(name: "BrinewellVM", dependencies: ["BrinewellVMRuntime"],
                           swiftSettings: [.unsafeFlags(["-Xcc", "-I\(include)"])],
                           linkerSettings: [.unsafeFlags(["-L", frameworks, "-lkrun.1", "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks", "-Xlinker", "-rpath", "-Xlinker", frameworks]), .linkedFramework("AppKit"), .linkedFramework("GameController")]),

@@ -7,7 +7,12 @@ final class AppModel: ObservableObject {
     let host: HostCapabilities
     let vm = VMProcess()
     let deployment = DiskDeployment()
-    @Published var showDeployment = false
+    let d3dMetalDeployment = D3DMetalDeployment()
+    @Published var isShowingSetupSheet = false
+    @Published var currentSetupStep: SetupStep = .systemDisk
+    @Published var pendingStartAfterSetup = false
+    @Published private(set) var setupReadiness: SetupReadiness
+    private var dismissedReadiness: SetupReadiness?
     @Published private(set) var hasUsableDisk = false
     @Published private(set) var diskUsage: SystemDiskUsage?
     @Published private(set) var diskResizing = false
@@ -15,6 +20,11 @@ final class AppModel: ObservableObject {
     @Published var configuration: VMConfiguration {
         didSet {
             if configuration.diskImagePath != oldValue.diskImagePath { refreshDiskAvailability() }
+            if configuration.diskImagePath != oldValue.diskImagePath ||
+                configuration.graphicsBackend != oldValue.graphicsBackend ||
+                configuration.d3dMetalFrameworkPath != oldValue.d3dMetalFrameworkPath {
+                evaluateSetupReadiness()
+            }
             // Automatic adaptation (for example a host display change) must not
             // persist over a blocked migration or a broken stored configuration:
             // the save would overwrite the user's file and clear loadError.
@@ -22,7 +32,7 @@ final class AppModel: ObservableObject {
             let automaticWhileBlocked = applyingAutomaticChange
                 && (migrationBlocked || loadError != nil)
             if configuration != oldValue && !isReloading && !automaticWhileBlocked {
-                save()
+                saveChanges(from: oldValue)
             }
         }
     }
@@ -36,6 +46,8 @@ final class AppModel: ObservableObject {
     private var applyingAutomaticChange = false
     private var commandLineStartPending = CommandLine.arguments.dropFirst().contains("--start-vm")
     private var starting = false
+    private var isTerminating = false
+    func setTerminating(_ terminating: Bool) { isTerminating = terminating }
     let migrationReport: LegacyInstallationMigration.Report?
     private var migrationBlocked: Bool { migrationReport?.needsAttention == true }
     private var migrationAlertPresented = false
@@ -48,8 +60,16 @@ final class AppModel: ObservableObject {
         self.migrationReport = migrationReport
         host = HostCapabilities.detect()
         configuration = .defaults(for: host)
+        setupReadiness = SetupReadiness(backend: .neptune, disk: .notConfigured, graphics: .d3dMetalMissing)
         reload()
         deployment.onInstalled = { [weak self] url in self?.useDisk(url, startAfterSelection: true) }
+        d3dMetalDeployment.configurationStore = store
+        d3dMetalDeployment.onInstalled = { [weak self] _ in self?.graphicsSetupChanged(reload: true) }
+        d3dMetalDeployment.onUnsuccessfulFinish = { [weak self] in
+            guard let self, self.isShowingSetupSheet else { return }
+            self.refreshDiskAvailability()
+            self.reconcileActiveSetupSheet()
+        }
         vm.onSettled = { [weak self] in
             self?.refreshDiskAvailability()
             self?.finishPendingDiskShrink()
@@ -72,24 +92,85 @@ final class AppModel: ObservableObject {
         return (try? SteamOSDisk.validateSystem(at: URL(fileURLWithPath: path))) != nil
     }
     func refreshDiskAvailability() {
-        let wasAvailable = hasUsableDisk
         hasUsableDisk = diskIsUsable
         if let path = configuration.diskImagePath, hasUsableDisk {
             diskUsage = try? SteamOSDisk.systemDiskUsage(at: URL(fileURLWithPath: path))
         } else { diskUsage = nil }
-        if wasAvailable && !hasUsableDisk && !vm.busy && !deployment.busy && !diskResizing
-            && canAutoPresentOnboarding {
-            showDeployment = true
+    }
+    func evaluateSetupReadiness() {
+        setupReadiness = SetupReadiness.evaluate(configuration, rosettaAvailable: { self.d3dMetalDeployment.rosettaAvailable })
+    }
+    func offerSetupIfNeeded(startAfterSetup: Bool = false, explicit: Bool = false) {
+        guard canAutoPresentOnboarding, !isReloading, !vm.busy, !starting,
+              !diskResizing, !deployment.busy, !d3dMetalDeployment.isActive, !isShowingSetupSheet else { return }
+        evaluateSetupReadiness()
+        if setupReadiness.isReadyToStart {
+            dismissedReadiness = nil
+            if startAfterSetup { start() }
+            return
+        }
+        guard explicit || startAfterSetup || dismissedReadiness != setupReadiness else { return }
+        currentSetupStep = setupReadiness.initialStep ?? .systemDisk
+        pendingStartAfterSetup = startAfterSetup
+        isShowingSetupSheet = true
+    }
+    func dismissSetup() {
+        dismissedReadiness = setupReadiness
+        pendingStartAfterSetup = false
+        isShowingSetupSheet = false
+        Task { await deployment.cancel(); await d3dMetalDeployment.cancelAndWait() }
+    }
+    func graphicsSetupChanged(reload: Bool = false) {
+        if reload, let store {
+            do {
+                let updated = try store.load(for: host)
+                isReloading = true
+                configuration = updated
+                isReloading = false
+            } catch { saveError = error.localizedDescription; return }
+        }
+        reconcileActiveSetupSheet()
+    }
+    func reconcileActiveSetupSheet() {
+        evaluateSetupReadiness()
+        guard isShowingSetupSheet else { return }
+        if setupReadiness.isReadyToStart {
+            let shouldStart = pendingStartAfterSetup
+            pendingStartAfterSetup = false
+            isShowingSetupSheet = false
+            dismissedReadiness = nil
+            if shouldStart { start() }
+        } else if currentSetupStep == .systemDisk && setupReadiness.disk.isReady && !setupReadiness.graphics.isReady {
+            currentSetupStep = .graphics
+        } else if currentSetupStep == .graphics && setupReadiness.graphics.isReady && !setupReadiness.disk.isReady {
+            currentSetupStep = .systemDisk
         }
     }
-    func offerDeploymentIfNeeded() {
-        guard canAutoPresentOnboarding else { return }
+    func useVenusForSetup() {
+        setGraphicsBackend(.venus)
+        guard saveError == nil else { return }
+        graphicsSetupChanged()
+    }
+    func recheckRosetta() {
+        d3dMetalDeployment.refreshRosettaStatus()
+        graphicsSetupChanged()
+    }
+    func volumeChanged() {
+        guard !deployment.busy, !d3dMetalDeployment.isActive else { return }
         refreshDiskAvailability()
-        if !vm.busy && !hasUsableDisk { showDeployment = true }
+        if isShowingSetupSheet { reconcileActiveSetupSheet() }
+        else { offerSetupIfNeeded() }
     }
     private var startAfterDiskResize = false
     func start() {
-        guard !vm.busy, !deployment.busy, !starting else { return }
+        guard !isTerminating, !vm.busy, !deployment.busy, !d3dMetalDeployment.isActive, !starting else { return }
+        guard !diskResizing else { return }
+        refreshDiskAvailability()
+        evaluateSetupReadiness()
+        guard setupReadiness.isReadyToStart else {
+            offerSetupIfNeeded(startAfterSetup: true, explicit: true)
+            return
+        }
         if pendingDiskShrink?.bootStarted == true {
             // The guest already shrank its file system on the previous boot;
             // finish the host-side shrink before the disk can be used again.
@@ -99,9 +180,6 @@ final class AppModel: ObservableObject {
             }
             return
         }
-        guard !diskResizing else { return }
-        refreshDiskAvailability()
-        guard hasUsableDisk, configuration.diskImagePath != nil else { showDeployment = true; return }
         starting = true
         defer { starting = false }
         var shrinkHomeKiB: UInt64?
@@ -131,23 +209,24 @@ final class AppModel: ObservableObject {
     }
 
     func startFromCommandLineIfRequested() {
-        guard commandLineStartPending else { return }
-        guard canAutoPresentOnboarding else { return }
-        if pendingDiskShrink?.bootStarted == true {
-            finishPendingDiskShrink()
-            return
-        }
+        guard !isTerminating, commandLineStartPending else { return }
+        guard canAutoPresentOnboarding, !diskResizing else { return }
         commandLineStartPending = false
         start()
     }
     private func useDisk(_ url: URL, startAfterSelection: Bool) {
-        configuration.pendingDiskShrink = nil
-        configuration.diskImagePath = url.path
-        guard saveError == nil, loadError == nil else { return }
-        if startAfterSelection {
-            showDeployment = false
-            start()
-        }
+        guard let store else { return }
+        do {
+            let updated = try store.update(for: host) { config in
+                config.pendingDiskShrink = nil
+                config.diskImagePath = url.path
+            }
+            isReloading = true
+            configuration = updated
+            isReloading = false
+            saveError = nil
+            graphicsSetupChanged()
+        } catch { saveError = error.localizedDescription }
     }
     func reload() {
         guard !vm.busy, !deployment.busy else { return }
@@ -157,6 +236,7 @@ final class AppModel: ObservableObject {
         do {
             let store = ConfigurationStore(url: try ConfigurationStore.defaultURL())
             self.store = store
+            d3dMetalDeployment.configurationStore = store
             let loaded = try store.load(for: host)
             configuration = loaded
             loadError = nil
@@ -170,12 +250,30 @@ final class AppModel: ObservableObject {
         refreshDiskAvailability()
         finishPendingDiskShrink()
     }
-    private func save() {
+    private func saveChanges(from old: VMConfiguration) {
         guard !vm.busy, let store else { return }
+        let changed = configuration
         do {
             guard let displayCapabilities else { throw DisplayUnavailable() }
-            try displayCapabilities.validate(configuration.display)
-            try store.save(configuration, for: host)
+            try displayCapabilities.validate(changed.display)
+            let updated = try store.update(for: host) { fresh in
+                if changed.diskImagePath != old.diskImagePath { fresh.diskImagePath = changed.diskImagePath }
+                if changed.cpuCount != old.cpuCount { fresh.cpuCount = changed.cpuCount }
+                if changed.memoryGiB != old.memoryGiB { fresh.memoryGiB = changed.memoryGiB }
+                if changed.display != old.display { fresh.display = changed.display }
+                if changed.graphicsBackend != old.graphicsBackend { fresh.graphicsBackend = changed.graphicsBackend }
+                if changed.d3dMetalFrameworkPath != old.d3dMetalFrameworkPath { fresh.d3dMetalFrameworkPath = changed.d3dMetalFrameworkPath }
+                if changed.neptuneApertureMiB != old.neptuneApertureMiB { fresh.neptuneApertureMiB = changed.neptuneApertureMiB }
+                if changed.neptuneMultiRing != old.neptuneMultiRing { fresh.neptuneMultiRing = changed.neptuneMultiRing }
+                if changed.gameHUDLevel != old.gameHUDLevel { fresh.gameHUDLevel = changed.gameHUDLevel }
+                if changed.gameHUDPosition != old.gameHUDPosition { fresh.gameHUDPosition = changed.gameHUDPosition }
+                if changed.sharedFolder != old.sharedFolder { fresh.sharedFolder = changed.sharedFolder }
+                if changed.network != old.network { fresh.network = changed.network }
+                if changed.pendingDiskShrink != old.pendingDiskShrink { fresh.pendingDiskShrink = changed.pendingDiskShrink }
+            }
+            isReloading = true
+            configuration = updated
+            isReloading = false
             loadError = nil
             saveError = nil
         } catch { saveError = String(localized: "Could not save configuration (\(store.url.path)): \(error.localizedDescription)") }
@@ -190,7 +288,13 @@ final class AppModel: ObservableObject {
         vm.setGameHUD(level: updated.gameHUDLevel, position: updated.gameHUDPosition)
         guard vm.busy, let store else { return }
         do {
-            try store.setGameHUD(level: updated.gameHUDLevel, position: updated.gameHUDPosition, for: host)
+            let fresh = try store.update(for: host) {
+                $0.gameHUDLevel = updated.gameHUDLevel
+                $0.gameHUDPosition = updated.gameHUDPosition
+            }
+            isReloading = true
+            configuration = fresh
+            isReloading = false
             saveError = nil
         } catch { saveError = String(localized: "Could not save configuration (\(store.url.path)): \(error.localizedDescription)") }
     }
@@ -205,10 +309,12 @@ final class AppModel: ObservableObject {
             // refusal so the stored choice still matches reality.
             guard vm.state == .running, vm.setGraphicsBackend(backend) else { return }
         }
-        configuration.graphicsBackend = backend
         guard let store else { return }
         do {
-            try store.setGraphicsBackend(backend, for: host)
+            let updated = try store.update(for: host) { $0.graphicsBackend = backend }
+            isReloading = true
+            configuration = updated
+            isReloading = false
             saveError = nil
         } catch { saveError = String(localized: "Could not save configuration (\(store.url.path)): \(error.localizedDescription)") }
     }
@@ -258,15 +364,30 @@ final class AppModel: ObservableObject {
         var errorDescription: String? { String(localized: "Could not read the available display modes for the host display.") }
     }
     func chooseD3DMetalFramework() {
-        guard !vm.busy, !deployment.busy else { return }
+        guard !vm.busy, !deployment.busy, !diskResizing, !d3dMetalDeployment.isActive else { return }
         let panel = NSOpenPanel()
-        panel.title = String(localized: "Select D3DMetal.framework")
+        panel.title = String(localized: "Import Local File")
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.treatsFilePackagesAsDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        configuration.d3dMetalFrameworkPath = url.path
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return }
+        if isDirectory.boolValue || url.pathExtension.lowercased() == "dmg" {
+            d3dMetalDeployment.importLocalItem(at: url)
+        } else {
+            do {
+                _ = try D3DMetalFramework.inspect(at: url, allowBareBinary: true)
+                guard let store else { return }
+                let updated = try store.update(for: host) { $0.d3dMetalFrameworkPath = url.path }
+                isReloading = true
+                configuration = updated
+                isReloading = false
+                saveError = nil
+                graphicsSetupChanged()
+            } catch { saveError = error.localizedDescription }
+        }
     }
 
     func chooseSharedFolder() {
@@ -304,6 +425,7 @@ final class AppModel: ObservableObject {
 
     private var diskResizeTask: Task<Void, Never>?
     var onDiskResizeFinished: (() -> Void)?
+    func waitForDiskResize() async { await diskResizeTask?.value }
 
     var pendingDiskShrink: PendingDiskShrink? {
         guard let pending = configuration.pendingDiskShrink,
@@ -314,7 +436,7 @@ final class AppModel: ObservableObject {
     /// Grow applies on the host immediately; shrink is scheduled for the next
     /// boot so the guest can reduce its home file system first.
     func applyDiskCapacity(_ newCapacityGiB: Int) {
-        guard !vm.busy, !deployment.busy, !diskResizing,
+        guard !vm.busy, !deployment.busy, !diskResizing, !d3dMetalDeployment.isActive,
               let usage = diskUsage, let path = configuration.diskImagePath,
               newCapacityGiB >= usage.minimumCapacityGiB,
               newCapacityGiB <= usage.maximumCapacityGiB else { return }
@@ -393,8 +515,10 @@ final class AppModel: ObservableObject {
             done?()
             let relaunch = startAfterDiskResize
             startAfterDiskResize = false
-            if relaunch { start() }
-            startFromCommandLineIfRequested()
+            if !isTerminating {
+                if relaunch { start() }
+                startFromCommandLineIfRequested()
+            }
         }
     }
 }
@@ -408,24 +532,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.regular)
     }
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if let model, model.diskResizing {
-            if !quitting {
-                quitting = true
-                model.onDiskResizeFinished = { [weak self, weak sender] in
-                    self?.quitting = false
-                    sender?.reply(toApplicationShouldTerminate: true)
-                }
+    private func finishTermination(_ sender: NSApplication) {
+        Task { @MainActor in
+            if let model {
+                await model.waitForDiskResize()
+                await model.deployment.cancel()
+                await model.d3dMetalDeployment.cancelAndWait()
             }
-            return .terminateLater
+            if let vm, vm.busy {
+                vm.onExit = { [weak self, weak sender] in
+                    guard let self, let sender else { return }
+                    self.finishTermination(sender)
+                }
+                vm.stop()
+                return
+            }
+            quitting = false
+            sender.reply(toApplicationShouldTerminate: true)
         }
-        if let deployment, deployment.busy {
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        model?.setTerminating(true)
+        if let model, model.diskResizing || model.deployment.busy || model.d3dMetalDeployment.isActive {
             if !quitting {
                 quitting = true
-                Task { @MainActor in
-                    await deployment.cancel()
-                    sender.reply(toApplicationShouldTerminate: true)
-                }
+                finishTermination(sender)
             }
             return .terminateLater
         }
@@ -436,21 +567,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = String(localized: "Shut down the virtual machine before quitting Brinewell?")
         alert.addButton(withTitle: String(localized: "Shut Down and Quit"))
         alert.addButton(withTitle: String(localized: "Cancel"))
-        guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            model?.setTerminating(false)
+            return .terminateCancel
+        }
         guard vm.busy else { return .terminateNow }
         quitting = true
         vm.onExit = { [weak self, weak sender] in
-            // A pending disk-shrink finalize may start just before this exit
-            // callback fires; wait for it before letting the app quit.
-            if self?.model?.diskResizing == true {
-                self?.model?.onDiskResizeFinished = { [weak self, weak sender] in
-                    self?.quitting = false
-                    sender?.reply(toApplicationShouldTerminate: true)
-                }
-            } else {
-                self?.quitting = false
-                sender?.reply(toApplicationShouldTerminate: true)
-            }
+            guard let self, let sender else { return }
+            self.finishTermination(sender)
         }
         vm.stop()
         return .terminateLater
@@ -520,7 +645,7 @@ private struct MainView: View {
             Section("Configuration") {
                 LabeledContent("Disk", value: model.hasUsableDisk ? (model.configuration.diskImagePath ?? "") : String(localized: "No usable system disk")).textSelection(.enabled)
                 if !model.hasUsableDisk {
-                    Button("Choose System Disk or Install SteamOS") { model.showDeployment = true }.disabled(vm.busy || model.diskResizing)
+                    Button("Choose System Disk or Install SteamOS") { model.offerSetupIfNeeded(explicit: true) }.disabled(vm.busy || model.diskResizing)
                 }
                 if let error = model.loadError {
                     Text(error).foregroundStyle(.red).textSelection(.enabled)
@@ -534,17 +659,19 @@ private struct MainView: View {
             bindDelegate()
             model.presentMigrationAlertIfNeeded()
             model.refreshDisplayCapabilities()
-            model.offerDeploymentIfNeeded()
             model.startFromCommandLineIfRequested()
+            if !model.setupReadiness.isReadyToStart { model.offerSetupIfNeeded(startAfterSetup: true) }
         }
-        .sheet(isPresented: $model.showDeployment) {
-            DiskDeploymentView(model: model, deployment: deployment)
+        .sheet(isPresented: $model.isShowingSetupSheet, onDismiss: { model.dismissSetup() }) {
+            SetupView(model: model, diskDeployment: deployment, d3dMetalDeployment: model.d3dMetalDeployment,
+                      readiness: model.setupReadiness, currentStep: $model.currentSetupStep,
+                      onUseVenus: { model.useVenusForSetup() }, onDismiss: { model.dismissSetup() })
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeScreenNotification)) { _ in model.refreshDisplayCapabilities() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in model.refreshDisplayCapabilities() }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.refreshDiskAvailability() }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in model.refreshDiskAvailability() }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in model.refreshDiskAvailability() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.volumeChanged() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in model.volumeChanged() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in model.volumeChanged() }
         .onChange(of: vm.hostDisplayID) { model.refreshDisplayCapabilities() }
         .confirmationDialog("Force stopping may corrupt guest data.", isPresented: $confirmForce) {
             Button("Force Stop Virtual Machine", role: .destructive) { vm.forceStop() }
@@ -560,6 +687,14 @@ private struct SettingsView: View {
     @State private var language = AppLanguage.selected
     @State private var requestedGiB: Int?
     @State private var confirmApply = false
+    @ObservedObject private var graphicsDeployment: D3DMetalDeployment
+
+    init(model: AppModel, vm: VMProcess, deployment: DiskDeployment) {
+        self.model = model
+        self.vm = vm
+        self.deployment = deployment
+        self.graphicsDeployment = model.d3dMetalDeployment
+    }
 
     private var capacityValid: Bool {
         guard let request = requestedGiB, let usage = model.diskUsage else { return false }
@@ -636,15 +771,17 @@ private struct SettingsView: View {
                                  : String(localized: "Shrinking to \(pending.capacityGiB) GB is scheduled for the next startup."))
                                 .font(.callout).foregroundStyle(.secondary)
                             Button("Cancel Shrink") { model.cancelDiskShrink() }
+                                .disabled(graphicsDeployment.isActive)
                         } else {
                             HStack {
                                 TextField("New Capacity", value: $requestedGiB, format: .number)
+                                    .disabled(graphicsDeployment.isActive)
                                 Text("GB").foregroundStyle(.secondary)
                             }
                             Text("Between \(usage.minimumCapacityGiB) and \(usage.maximumCapacityGiB) GB.")
                                 .font(.callout).foregroundStyle(.secondary)
                             Button("Apply…") { confirmApply = true }
-                                .disabled(!capacityValid || vm.busy || deployment.busy || model.diskResizing)
+                                .disabled(!capacityValid || vm.busy || deployment.busy || model.diskResizing || graphicsDeployment.isActive)
                         }
                     }
                     if model.diskResizing {
@@ -723,7 +860,7 @@ private struct SettingsView: View {
                     Text("Neptune / D3DMetal").tag(GraphicsBackend.neptune)
                     Text("Neptune / Mullion").tag(GraphicsBackend.mullion)
                     Text("Venus Only").tag(GraphicsBackend.venus)
-                }
+                }.disabled(graphicsDeployment.isActive)
                 if vm.state == .running {
                     Text("Backend changes apply to the next game launch; the framework, aperture, and multi-ring settings still only apply at boot.")
                         .font(.callout).foregroundStyle(.secondary)
@@ -734,15 +871,42 @@ private struct SettingsView: View {
                 }
                 Group {
                     if model.configuration.graphicsBackend == .neptune {
-                        LabeledContent("D3DMetal") {
-                            Text(model.configuration.d3dMetalFrameworkPath ?? String(localized: "None selected"))
-                                .textSelection(.enabled)
-                        }
-                        HStack {
-                            Button("Choose Framework") { model.chooseD3DMetalFramework() }
-                            if model.configuration.d3dMetalFrameworkPath != nil {
-                                Button("Clear") { model.configuration.d3dMetalFrameworkPath = nil }
+                        if let path = model.configuration.d3dMetalFrameworkPath {
+                            if let inspection = try? D3DMetalFramework.inspect(at: URL(fileURLWithPath: path), allowBareBinary: true) {
+                                LabeledContent("Version", value: inspection.version?.displayVersion ?? String(localized: "Unknown"))
+                                Text(inspection.version?.isRecommendedContextVersion == true
+                                     ? String(localized: "4.0b3 context integration (subject to runtime verification)")
+                                     : String(localized: "Standard rendering"))
+                                    .font(.callout).foregroundStyle(.secondary)
+                            } else {
+                                Text(String(localized: "The previously configured D3DMetal framework could not be used:"))
+                                    .foregroundStyle(.red)
+                                if case .d3dMetalInvalid(let reason) = model.setupReadiness.graphics { Text(reason).foregroundStyle(.red) }
                             }
+                            Text(path).textSelection(.enabled)
+                        } else { Text("Not configured").foregroundStyle(.secondary) }
+                        if !graphicsDeployment.rosettaAvailable {
+                            Text("Rosetta 2 is required to run D3DMetal on Apple Silicon.").foregroundStyle(.orange)
+                            Button("Recheck") { model.recheckRosetta() }
+                        }
+                        if graphicsDeployment.isActive {
+                            if case .downloading(let name, let received, let total) = graphicsDeployment.phase,
+                               let total, total > 0 {
+                                Text(name)
+                                ProgressView(value: Double(received) / Double(total))
+                            } else {
+                                ProgressView()
+                            }
+                            Button("Cancel") { Task { await graphicsDeployment.cancelAndWait() } }
+                        } else {
+                            if case .failed(let message) = graphicsDeployment.phase { Text(message).foregroundStyle(.red) }
+                            HStack {
+                                Button(model.configuration.d3dMetalFrameworkPath == nil ? String(localized: "Download from Apple") : String(localized: "Update from Apple")) { graphicsDeployment.startAppleDownload() }
+                                Button("Import Local File") { model.chooseD3DMetalFramework() }
+                                if model.configuration.d3dMetalFrameworkPath != nil {
+                                    Button("Clear") { model.configuration.d3dMetalFrameworkPath = nil; model.evaluateSetupReadiness() }
+                                }
+                            }.disabled(vm.busy || model.diskResizing || model.isShowingSetupSheet)
                         }
                     }
                     if model.configuration.graphicsBackend != .venus {
@@ -750,7 +914,7 @@ private struct SettingsView: View {
                                 value: $model.configuration.neptuneApertureMiB, in: 8192...65536, step: 8192)
                         Toggle("Experimental Multi-Ring (Global)", isOn: $model.configuration.neptuneMultiRing)
                     }
-                }.disabled(vm.busy)
+                }.disabled(vm.busy || model.diskResizing)
             }
             Section("Game Performance") {
                 Picker("Overlay Level", selection: Binding(
@@ -793,5 +957,24 @@ private struct SettingsView: View {
                 Text(applyMessage)
             }
             .onChange(of: model.diskUsage) { requestedGiB = nil }
+            .sheet(isPresented: Binding(
+                get: { graphicsDeployment.isPresentingLoginSheet && !model.isShowingSetupSheet },
+                set: { graphicsDeployment.isPresentingLoginSheet = $0 }
+            ), onDismiss: {
+                if case .signingIn = graphicsDeployment.phase { Task { await graphicsDeployment.cancelAndWait() } }
+            }) {
+                AppleDeveloperLoginView(stagingDirectory: D3DMetalDeployment.downloadDirectory, deployment: graphicsDeployment) { event in
+                    switch event {
+                    case .authorizedForNativeDownload(let artifact, let authorization):
+                        graphicsDeployment.handleAuthorizedDownload(artifact: artifact, authorization: authorization)
+                    case .downloadedToLocalFile(let url, let name):
+                        graphicsDeployment.handleWebKitDownloadedDMG(fileURL: url, artifactName: name)
+                    case .cancelled: Task { await graphicsDeployment.cancelAndWait() }
+                    case .failed(let message):
+                        graphicsDeployment.isPresentingLoginSheet = false
+                        graphicsDeployment.phase = .failed(message)
+                    }
+                }
+            }
     }
 }

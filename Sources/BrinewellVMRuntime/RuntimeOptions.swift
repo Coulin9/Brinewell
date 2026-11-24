@@ -391,19 +391,7 @@ public struct RuntimeOptions {
     }
 
     private static func resolveFrameworkBinary(_ url: URL) -> URL? {
-        let manager = FileManager.default
-        var isDirectory: ObjCBool = false
-        guard manager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return nil }
-        if isDirectory.boolValue {
-            for candidate in [
-                url.appendingPathComponent("Versions/A/D3DMetal"),
-                url.appendingPathComponent("D3DMetal"),
-            ] where manager.isReadableFile(atPath: candidate.path) {
-                return candidate
-            }
-            return nil
-        }
-        return manager.isReadableFile(atPath: url.path) ? url : nil
+        try? D3DMetalFramework.resolve(at: url).binaryURL
     }
 
     private static func frameworkVersion(_ url: URL) -> String? {
@@ -425,17 +413,6 @@ public struct RuntimeOptions {
     }
 
     private static func rosettaAvailable() -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/arch")
-        process.arguments = ["-x86_64", "/usr/bin/true"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
-        } catch {
-            return false
-        }
+        D3DMetalFramework.isRosettaAvailable()
     }
 }

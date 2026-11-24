@@ -193,6 +193,10 @@ stamp_write "$name" "$input" "$@"
     assert (app / 'Contents/registered-marker').is_file(), 'bundle was not published'
     assert app.stat().st_mtime > old_mtime, 'outer bundle mtime stayed stale'
     assert not sentinel.exists(), 'old executable remained in published bundle'
+    for path in app.rglob('*'):
+        name = path.name.lower()
+        assert name != 'd3dmetal.framework', f'Apple framework bundled: {path}'
+        assert not (path.is_file() and name.endswith('.dmg')), f'Disk image bundled: {path}'
     for name in ('MacOS/Brinewell', 'MacOS/brinewell-vm', 'MacOS/brinewell-diagnostics',
                  'Helpers/virgl_render_server', 'Frameworks/libvirglrenderer.1.dylib'):
         assert (app / 'Contents' / name).read_bytes() == b'fixture', f'incorrect packaged {name}'
