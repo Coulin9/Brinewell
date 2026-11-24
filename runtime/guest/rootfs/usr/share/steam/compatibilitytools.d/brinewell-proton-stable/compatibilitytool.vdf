@@ -1,0 +1,17 @@
+"compatibilitytools"
+{
+	"compat_tools"
+	{
+		"proton-stable"
+		{
+			"install_path"	"."
+			"display_name"	"Proton 11.0 (x86-64)"
+			"appid"	"4628710"
+			"depotid"	"4628711"
+			"require_tool_appid"	"4183110"
+			"from_oslist"	"windows"
+			"to_oslist"	"linux"
+			"unlisted"	"1"
+		}
+	}
+}
