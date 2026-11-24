@@ -8,10 +8,29 @@ public struct HostDisplayCapabilities: Equatable, Sendable {
     public let maximumResolution: DisplayResolution
     public let maximumRefreshRate: Int
     public let resolutions: [DisplayResolution]
+    public let hdrSupported: Bool
+    public let maxPotentialEDR: CGFloat
+    public let currentEDR: CGFloat
+    public let sdrReferenceNits: UInt16
+    public let maxLuminanceNits: UInt16
+    public let maxFrameAverageLuminanceNits: UInt16
+    public let minLuminance10000ths: UInt16
     private let nativeRefreshRates: [Int]
 
     public init(id: UInt32, name: String, maximumResolution: DisplayResolution, maximumRefreshRate: Int,
-                availableResolutions: [DisplayResolution], availableRefreshRates: [Int]) {
+                availableResolutions: [DisplayResolution], availableRefreshRates: [Int], maxPotentialEDR: CGFloat = 1.0,
+                currentEDR: CGFloat = 1.0, referenceEDR: CGFloat = 1.0, isBuiltin: Bool = false,
+                builtinCurrentSDRNits: Double? = nil, builtinRealtimePeakNits: Double? = nil) {
+        self.maxPotentialEDR = maxPotentialEDR
+        self.currentEDR = currentEDR
+        let metrics = Self.computeHDRMetrics(maxPotentialEDR: maxPotentialEDR, currentEDR: currentEDR,
+            referenceEDR: referenceEDR, isBuiltin: isBuiltin, builtinCurrentSDRNits: builtinCurrentSDRNits,
+            builtinRealtimePeakNits: builtinRealtimePeakNits)
+        hdrSupported = metrics.hdrSupported
+        maxLuminanceNits = metrics.maxLuminanceNits
+        maxFrameAverageLuminanceNits = metrics.maxFrameAverageLuminanceNits
+        minLuminance10000ths = metrics.minLuminance10000ths
+        sdrReferenceNits = metrics.sdrReferenceNits
         self.id = id
         self.name = name
         self.maximumResolution = maximumResolution
@@ -25,6 +44,49 @@ public struct HostDisplayCapabilities: Equatable, Sendable {
             let leftArea = $0.width * $0.height, rightArea = $1.width * $1.height
             return leftArea == rightArea ? $0.width < $1.width : leftArea < rightArea
         }
+    }
+
+    public static func computeHDRMetrics(maxPotentialEDR: CGFloat, currentEDR: CGFloat, referenceEDR: CGFloat,
+        isBuiltin: Bool, builtinCurrentSDRNits: Double?, builtinRealtimePeakNits: Double?) ->
+        (hdrSupported: Bool, maxLuminanceNits: UInt16, maxFrameAverageLuminanceNits: UInt16,
+         minLuminance10000ths: UInt16, sdrReferenceNits: UInt16) {
+        guard maxPotentialEDR > 1.05 else { return (false, 0, 0, 0, 0) }
+        let sdr: Double, peak: Double
+        if referenceEDR > 1.05 {
+            sdr = 100
+            peak = Double(referenceEDR) * 100
+        } else if isBuiltin {
+            peak = builtinRealtimePeakNits.flatMap { (200...10000).contains($0) ? $0 : nil }
+                ?? min(1600, max(400, Double(maxPotentialEDR) * 100))
+            sdr = builtinCurrentSDRNits.flatMap { (10...1000).contains($0) ? $0 : nil } ?? 203
+        } else {
+            sdr = 203
+            peak = min(4000, max(400, max(Double(maxPotentialEDR) * 100, Double(currentEDR) * 203)))
+        }
+        let maxNits = UInt16(min(Double(UInt16.max), peak.rounded()))
+        return (true, maxNits, min(maxNits, 1000), 50, UInt16(sdr.rounded()))
+    }
+
+    private static func builtinBrightness(displayID: UInt32) -> (Double?, Double?) {
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOMobileFramebuffer"), &iterator) == KERN_SUCCESS else { return (nil, nil) }
+        defer { IOObjectRelease(iterator) }
+        var fallback: (Double?, Double?)?
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            defer { IOObjectRelease(service) }
+            var properties: Unmanaged<CFMutableDictionary>?
+            guard IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+                  let values = properties?.takeRetainedValue() as? [String: Any] else { continue }
+            let product = (values["DisplayAttributes"] as? [String: Any])?["ProductAttributes"] as? [String: Any]
+            func fixed(_ key: String) -> Double? { (values[key] as? NSNumber).map { $0.doubleValue / 65536.0 } }
+            let peak = ["RTPLCBLNitsCap", "limit_max_physical_brightness"]
+                .compactMap { fixed($0) }.first { (200...10000).contains($0) }
+            let brightness = (fixed("IOMFBBrightnessLevel"), peak)
+            if let vendor = product?["LegacyManufacturerID"] as? NSNumber,
+               vendor.uint32Value == CGDisplayVendorNumber(displayID) { return brightness }
+            if fallback == nil, (values["IONameMatched"] as? String)?.hasPrefix("disp0") == true { fallback = brightness }
+        }
+        return fallback ?? (nil, nil)
     }
 
     public static func screenID(_ screen: NSScreen) -> UInt32? {
@@ -42,13 +104,18 @@ public struct HostDisplayCapabilities: Equatable, Sendable {
         }) else { return nil }
         let maximum = DisplayResolution(width: largest.pixelWidth, height: largest.pixelHeight)
         let rates = modes.map { Int($0.refreshRate.rounded()) }.filter { $0 > 0 }
+        let isBuiltin = CGDisplayIsBuiltin(id) != 0
+        let brightness = isBuiltin ? builtinBrightness(displayID: id) : (nil, nil)
         return HostDisplayCapabilities(
             id: id, name: screen.localizedName, maximumResolution: maximum,
             maximumRefreshRate: max(screen.maximumFramesPerSecond, rates.max() ?? 0),
             availableResolutions: modes.flatMap {
                 [DisplayResolution(width: $0.width, height: $0.height),
                  DisplayResolution(width: $0.pixelWidth, height: $0.pixelHeight)]
-            }, availableRefreshRates: rates
+            }, availableRefreshRates: rates, maxPotentialEDR: screen.maximumPotentialExtendedDynamicRangeColorComponentValue,
+            currentEDR: screen.maximumExtendedDynamicRangeColorComponentValue,
+            referenceEDR: screen.maximumReferenceExtendedDynamicRangeColorComponentValue, isBuiltin: isBuiltin,
+            builtinCurrentSDRNits: brightness.0, builtinRealtimePeakNits: brightness.1
         )
     }
 

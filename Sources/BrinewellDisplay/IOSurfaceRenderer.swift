@@ -30,6 +30,13 @@ public enum DisplayFrame: Sendable {
         }
     }
 
+    public var colorState: DisplayColorState {
+        switch self {
+        case .surface(let frame): frame.colorState
+        case .metal(let frame): frame.colorState
+        }
+    }
+
     /// Marks the frame as no longer read by the GPU. Native frames release
     /// their producer lease here; the texture stays valid through this frame's
     /// own strong reference until the frame is deallocated.
@@ -62,13 +69,48 @@ public struct FrameSnapshot {
 public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
     public private(set) var lastError: String?
 
+    private final class MetalLease: @unchecked Sendable {
+        let frame: MetalFrame
+        private let lock = NSLock()
+        private var inFlightDraws = 0
+        private var retired = false
+
+        init(_ frame: MetalFrame) { self.frame = frame }
+        deinit { frame.finish() }
+
+        func beginDraw() {
+            lock.lock()
+            inFlightDraws += 1
+            lock.unlock()
+        }
+
+        func endDraw() {
+            lock.lock()
+            inFlightDraws -= 1
+            let shouldFinish = retired && inFlightDraws == 0
+            lock.unlock()
+            if shouldFinish { frame.finish() }
+        }
+
+        func retire() {
+            lock.lock()
+            retired = true
+            let shouldFinish = inFlightDraws == 0
+            lock.unlock()
+            if shouldFinish { frame.finish() }
+        }
+    }
+
     private let device: any MTLDevice
     private let queue: any MTLCommandQueue
     private let pipeline: any MTLRenderPipelineState
     private let textureDescriptor: MTLTextureDescriptor
     private weak var view: MTKView?
     private var frame: DisplayFrame?
+    private var currentMetalLease: MetalLease?
     private var texture: (any MTLTexture)?
+    private var appliedColorSpaceName: CFString?
+    private var appliedEDR: Bool?
 
     public init(device: (any MTLDevice)? = MTLCreateSystemDefaultDevice()) throws {
         guard let device else {
@@ -90,7 +132,7 @@ public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
         let pipelineDescriptor = MTLRenderPipelineDescriptor()
         pipelineDescriptor.vertexFunction = vertex
         pipelineDescriptor.fragmentFunction = fragment
-        pipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        pipelineDescriptor.colorAttachments[0].pixelFormat = .rgba16Float
         let pipeline: any MTLRenderPipelineState
         do {
             pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
@@ -127,7 +169,18 @@ public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
         case .metal(let metalFrame):
             self.texture = metalFrame.texture
         }
+        let previousLease = currentMetalLease
+        if case .metal(let metalFrame) = frame {
+            if previousLease?.frame !== metalFrame {
+                currentMetalLease = MetalLease(metalFrame)
+                previousLease?.retire()
+            }
+        } else {
+            currentMetalLease = nil
+            previousLease?.retire()
+        }
         self.frame = frame
+        updateLayerColor()
         lastError = nil
         let size = frame.pixelSize
         FrameTimingLog.shared.log(
@@ -141,8 +194,11 @@ public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Drops the current lease and requests a black frame. In-flight GPU work
     /// retains its own lease until its command buffer completes.
     public func clear() {
+        currentMetalLease?.retire()
+        currentMetalLease = nil
         frame = nil
         texture = nil
+        updateLayerColor()
         lastError = nil
         view?.needsDisplay = true
     }
@@ -182,16 +238,42 @@ public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
         if let error = commandBuffer.error {
             throw DisplayError.gpu(error.localizedDescription)
         }
-        let bytesPerRow = width * 4
-        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
-        pixels.withUnsafeMutableBytes { buffer in
-            guard let base = buffer.baseAddress else { return }
-            destination.getBytes(
-                base, bytesPerRow: bytesPerRow,
-                from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0
-            )
+        switch texture.pixelFormat {
+        case .rgba16Float, .rgb10a2Unorm, .bgr10a2Unorm, .rgba8Unorm, .rgba8Unorm_srgb, .bgra8Unorm, .bgra8Unorm_srgb: break
+        default: throw DisplayError.textureUnavailable
         }
-        let swap = texture.pixelFormat == .bgra8Unorm || texture.pixelFormat == .bgra8Unorm_srgb
+        let bytesPerPixel = texture.pixelFormat == .rgba16Float ? 8 : 4
+        let bytesPerRow = width * bytesPerPixel
+        var raw = [UInt8](repeating: 0, count: bytesPerRow * height)
+        raw.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            destination.getBytes(base, bytesPerRow: bytesPerRow,
+                                 from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        }
+        var pixels = [UInt8](repeating: 0, count: width * 4 * height)
+        var swap = texture.pixelFormat == .bgra8Unorm || texture.pixelFormat == .bgra8Unorm_srgb
+        switch texture.pixelFormat {
+        case .rgb10a2Unorm, .bgr10a2Unorm:
+            for i in 0..<(width * height) {
+                let j = i * 4
+                let word = UInt32(raw[j]) | UInt32(raw[j + 1]) << 8 | UInt32(raw[j + 2]) << 16 | UInt32(raw[j + 3]) << 24
+                pixels[j] = UInt8(((word & 1023) * 255 + 511) / 1023)
+                pixels[j + 1] = UInt8((((word >> 10) & UInt32(1023)) * UInt32(255) + UInt32(511)) / UInt32(1023))
+                pixels[j + 2] = UInt8((((word >> 20) & UInt32(1023)) * UInt32(255) + UInt32(511)) / UInt32(1023))
+                pixels[j + 3] = UInt8((word >> 30) * 85)
+            }
+            swap = texture.pixelFormat == .bgr10a2Unorm
+        case .rgba16Float:
+            for i in 0..<(width * height * 4) {
+                let bits = UInt16(raw[i * 2]) | UInt16(raw[i * 2 + 1]) << 8
+                let value = Float(Float16(bitPattern: bits))
+                pixels[i] = value.isFinite ? UInt8((min(1, max(0, value)) * 255).rounded()) : 0
+            }
+        case .rgba8Unorm, .rgba8Unorm_srgb, .bgra8Unorm, .bgra8Unorm_srgb:
+            pixels = raw
+        default:
+            throw DisplayError.textureUnavailable
+        }
         return FrameSnapshot(width: width, height: height, swapRedBlue: swap, pixels: pixels)
     }
 
@@ -199,7 +281,8 @@ public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
         precondition(self.view == nil || self.view === view, "A renderer supports one view at a time")
         self.view = view
         view.device = device
-        view.colorPixelFormat = .bgra8Unorm
+        view.colorPixelFormat = .rgba16Float
+        updateLayerColor()
         view.clearColor = MTLClearColorMake(0, 0, 0, 1)
         view.isPaused = true
         view.enableSetNeedsDisplay = true
@@ -215,14 +298,36 @@ public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
         if self.view === view {
             view.delegate = nil
             self.view = nil
+            appliedColorSpaceName = nil
+            appliedEDR = nil
+            clear()
         }
     }
+
+    private func updateLayerColor() {
+        guard let layer = view?.layer as? CAMetalLayer else { return }
+        let color = frame?.colorState ?? .sdr
+        let hdr = color.isPQ || color.isHLG
+        let name = color.isPQ ? CGColorSpace.itur_2100_PQ :
+            (color.isHLG ? CGColorSpace.itur_2100_HLG : CGColorSpace.extendedLinearSRGB)
+        let colorspace = CGColorSpace(name: name)
+        let changed = layer.wantsExtendedDynamicRangeContent != hdr || layer.colorspace != colorspace || layer.edrMetadata != nil
+        guard changed || appliedColorSpaceName != name || appliedEDR != hdr else { return }
+        layer.wantsExtendedDynamicRangeContent = hdr
+        layer.colorspace = colorspace
+        layer.edrMetadata = nil
+        appliedColorSpaceName = name
+        appliedEDR = hdr
+    }
+
+    public func requestRedraw() { view?.needsDisplay = true }
 
     public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         view.needsDisplay = true
     }
 
     public func draw(in view: MTKView) {
+        updateLayerColor()
         // A hidden or occluded window may have no drawable; this is not an error.
         guard let pass = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable else { return }
@@ -256,14 +361,17 @@ public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
             ))
             encoder.setRenderPipelineState(pipeline)
             encoder.setFragmentTexture(texture, index: 0)
+            let color = currentFrame?.colorState ?? .sdr
+            var uniforms = DisplayColorUniforms(eotf: color.eotf, colorspace: color.colorspace)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<DisplayColorUniforms>.size, index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         }
         encoder.endEncoding()
         commandBuffer.present(drawable)
-        commandBuffer.addCompletedHandler { [currentFrame] buffer in
-            // The lease (and the producer's handle) lives at least until the
-            // GPU has finished sampling it; release it as soon as that is true.
-            currentFrame?.finish()
+        let lease = currentMetalLease
+        lease?.beginDraw()
+        commandBuffer.addCompletedHandler { [currentFrame, lease] buffer in
+            lease?.endDraw()
             if let currentFrame {
                 let size = currentFrame.pixelSize
                 FrameTimingLog.shared.log(
@@ -282,6 +390,11 @@ public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
         commandBuffer.commit()
     }
 
+    private struct DisplayColorUniforms {
+        var eotf: UInt32
+        var colorspace: UInt32
+    }
+
     private static let shaderSource = """
     #include <metal_stdlib>
     using namespace metal;
@@ -291,9 +404,32 @@ public final class IOSurfaceRenderer: NSObject, MTKViewDelegate {
         const float2 uvs[] = { float2(0, 1), float2(2, 1), float2(0, -1) };
         return { float4(positions[id], 0, 1), uvs[id] };
     }
-    fragment float4 displayFragment(VertexOut in [[stage_in]], texture2d<float> image [[texture(0)]]) {
+    struct DisplayColorUniforms { uint eotf; uint colorspace; };
+    fragment float4 displayFragment(VertexOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
+                                    constant DisplayColorUniforms &u [[buffer(0)]]) {
         constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
-        return image.sample(s, in.uv);
+        float3 c = tex.sample(s, in.uv).rgb;
+        if (u.eotf == 3 || (u.eotf == 2 && u.colorspace == 9)) return float4(c, 1.0);
+        if (u.eotf == 2) {
+            const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
+            const float c1 = 3424.0 / 4096.0, c2 = 2413.0 / 128.0, c3 = 2392.0 / 128.0;
+            float3 p = pow(clamp(c, 0.0, 1.0), float3(1.0 / m2));
+            float3 x = pow(max(p - c1, 0.0) / (c2 - c3 * p), float3(1.0 / m1));
+            c = float3(0.6274040*x.r + 0.3292820*x.g + 0.0433136*x.b,
+                       0.0690970*x.r + 0.9195400*x.g + 0.0113612*x.b,
+                       0.0163916*x.r + 0.0880132*x.g + 0.8955950*x.b);
+            p = pow(max(c, 0.0), float3(m1));
+            c = pow((c1 + c2 * p) / (1.0 + c3 * p), float3(m2));
+        } else {
+            c = select(pow(max((c + 0.055) / 1.055, 0.0), float3(2.4)), c / 12.92, c <= 0.04045);
+            if (u.colorspace == 9) {
+                float3 x = c;
+                c = float3(1.6604910*x.r - 0.5876411*x.g - 0.0728499*x.b,
+                          -0.1245505*x.r + 1.1328999*x.g - 0.0083494*x.b,
+                          -0.0181508*x.r - 0.1005789*x.g + 1.1187297*x.b);
+            }
+        }
+        return float4(c, 1.0);
     }
     """
 }

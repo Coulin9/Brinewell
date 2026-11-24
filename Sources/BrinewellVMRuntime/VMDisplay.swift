@@ -67,6 +67,25 @@ final class VMDisplay: @unchecked Sendable {
             let base = IOSurfaceGetBaseAddress(surface)
             let destination = base.assumingMemoryBound(to: UInt8.self)
             let stride = IOSurfaceGetBytesPerRow(surface)
+            let isR10 = format == UInt32(KRUN_DISPLAY_FORMAT_R10G10B10A2_UNORM) || format == UInt32(KRUN_DISPLAY_FORMAT_R10G10B10X2_UNORM)
+            let isB10 = format == UInt32(KRUN_DISPLAY_FORMAT_B10G10R10A2_UNORM) || format == UInt32(KRUN_DISPLAY_FORMAT_B10G10R10X2_UNORM)
+            if isR10 || isB10 {
+                for y in 0..<height {
+                    let src = source + y * width * 4
+                    let dst = destination + y * stride
+                    for x in 0..<width {
+                        let i = x * 4
+                        let word = UInt32(src[i]) | UInt32(src[i+1]) << 8 | UInt32(src[i+2]) << 16 | UInt32(src[i+3]) << 24
+                        let low = UInt8(((word & 1023) * 255 + 511) / 1023)
+                        let high = UInt8((((word >> 20) & UInt32(1023)) * UInt32(255) + UInt32(511)) / UInt32(1023))
+                        dst[i] = isR10 ? high : low
+                        dst[i+1] = UInt8((((word >> 10) & UInt32(1023)) * UInt32(255) + UInt32(511)) / UInt32(1023))
+                        dst[i+2] = isR10 ? low : high
+                        dst[i+3] = 255
+                    }
+                }
+                return true
+            }
             let offsets: (Int, Int, Int, Int?)
             switch Int32(format) {
             case KRUN_DISPLAY_FORMAT_B8G8R8A8_UNORM: offsets = (0, 1, 2, 3)
@@ -104,6 +123,7 @@ final class VMDisplay: @unchecked Sendable {
     private var allocated: [UInt32: Slot] = [:]
     private var nextID: UInt32 = 0
     private var sequence: UInt64 = 0
+    private var colorState: DisplayColorState = .sdr
     private var latest: DisplayFrame?
     private var deliveryScheduled = false
     @MainActor private let renderer: IOSurfaceRenderer
@@ -124,6 +144,8 @@ final class VMDisplay: @unchecked Sendable {
     @MainActor private var fittingWindow = false
     @MainActor private var refitWindow = false
     private var screenObserver: NSObjectProtocol?
+    @MainActor private var hdrTimer: Timer?
+    @MainActor private var sampledCapabilities: HostDisplayCapabilities?
 
     @MainActor init() throws {
         renderer = try IOSurfaceRenderer()
@@ -163,6 +185,13 @@ final class VMDisplay: @unchecked Sendable {
             return Unmanaged<VMDisplay>.fromOpaque(instance).takeUnretainedValue()
                 .presentNative(frame.pointee)
         }
+        backend.vtable.basic_framebuffer.set_scanout_color = { instance, id, color in
+            guard let instance, id == 0, let color else { return }
+            let display = Unmanaged<VMDisplay>.fromOpaque(instance).takeUnretainedValue()
+            display.lock.lock()
+            display.colorState = VMDisplay.colorState(from: color.pointee)
+            display.lock.unlock()
+        }
         return backend
     }
 
@@ -174,7 +203,9 @@ final class VMDisplay: @unchecked Sendable {
         case KRUN_DISPLAY_FORMAT_B8G8R8A8_UNORM, KRUN_DISPLAY_FORMAT_B8G8R8X8_UNORM,
              KRUN_DISPLAY_FORMAT_A8R8G8B8_UNORM, KRUN_DISPLAY_FORMAT_X8R8G8B8_UNORM,
              KRUN_DISPLAY_FORMAT_R8G8B8A8_UNORM, KRUN_DISPLAY_FORMAT_X8B8G8R8_UNORM,
-             KRUN_DISPLAY_FORMAT_A8B8G8R8_UNORM, KRUN_DISPLAY_FORMAT_R8G8B8X8_UNORM: break
+             KRUN_DISPLAY_FORMAT_A8B8G8R8_UNORM, KRUN_DISPLAY_FORMAT_R8G8B8X8_UNORM,
+             KRUN_DISPLAY_FORMAT_R10G10B10A2_UNORM, KRUN_DISPLAY_FORMAT_B10G10R10A2_UNORM,
+             KRUN_DISPLAY_FORMAT_B10G10R10X2_UNORM, KRUN_DISPLAY_FORMAT_R10G10B10X2_UNORM: break
         default: return KRUN_DISPLAY_ERR_METHOD_UNSUPPORTED
         }
         lock.lock()
@@ -257,7 +288,7 @@ final class VMDisplay: @unchecked Sendable {
         }
         sequence &+= 1
         do {
-            let frame = try IOSurfaceFrame(surface: slot.surface, sequenceNumber: sequence) { [weak self, slot] in
+            let frame = try IOSurfaceFrame(surface: slot.surface, sequenceNumber: sequence, colorState: colorState) { [weak self, slot] in
                 guard let self else { return }
                 self.lock.lock()
                 slot.busy = false
@@ -270,6 +301,13 @@ final class VMDisplay: @unchecked Sendable {
             slot.busy = false
             return KRUN_DISPLAY_ERR_INTERNAL
         }
+    }
+
+    private static func colorState(from color: krun_display_color_state) -> DisplayColorState {
+        DisplayColorState(colorspace: color.colorspace, eotf: color.eotf, flags: color.flags,
+            maxDisplayMasteringLuminance: color.max_display_mastering_luminance,
+            minDisplayMasteringLuminance: color.min_display_mastering_luminance,
+            maxCll: color.max_cll, maxFall: color.max_fall)
     }
 
     /// Called by libkrun on the GPU worker thread with a retained native
@@ -295,7 +333,8 @@ final class VMDisplay: @unchecked Sendable {
             texture: texture,
             sequenceNumber: frame.sequence,
             width: Int(frame.width),
-            height: Int(frame.height)
+            height: Int(frame.height),
+            colorState: Self.colorState(from: frame.color)
         ) {
             release?(UnsafeMutableRawPointer(bitPattern: userdata))
         }
@@ -337,7 +376,7 @@ final class VMDisplay: @unchecked Sendable {
     }
 
     @MainActor func show(input: VMInput, mode: VMDisplayConfiguration, screenID: UInt32,
-                         onScreenChange: @escaping (NSScreen) -> Void,
+                         onScreenChange: @escaping @MainActor @Sendable (HostDisplayCapabilities) -> Void,
                          onActivity: @escaping (Bool) -> Void, onClose: @escaping () -> Void) {
         if let window { window.makeKeyAndOrderFront(nil); return }
         let screen = NSScreen.screens.first { HostDisplayCapabilities.screenID($0) == screenID }
@@ -352,7 +391,25 @@ final class VMDisplay: @unchecked Sendable {
         window.onScreenChange = { [weak self, weak window] in
             guard let self, let window else { return }
             guard let screen = window.screen ?? NSScreen.main else { return }
-            onScreenChange(screen)
+            self.renderer.requestRedraw()
+            guard let id = HostDisplayCapabilities.screenID(screen),
+                  let capabilities = HostDisplayCapabilities.detect(displayID: id) else { return }
+            self.sampledCapabilities = capabilities
+            onScreenChange(capabilities)
+            self.hdrTimer?.invalidate(); self.hdrTimer = nil
+            if capabilities.hdrSupported {
+                let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+                    Task { @MainActor in
+                        guard let self, let window = self.window, window.isVisible,
+                              let screen = window.screen, let id = HostDisplayCapabilities.screenID(screen),
+                              let next = HostDisplayCapabilities.detect(displayID: id), next != self.sampledCapabilities else { return }
+                        self.sampledCapabilities = next
+                        onScreenChange(next)
+                    }
+                }
+                self.hdrTimer = timer
+                RunLoop.main.add(timer, forMode: .common)
+            }
             self.fitWindowToContent()
         }
         window.onExitFullScreen = { [weak self] in
@@ -396,6 +453,7 @@ final class VMDisplay: @unchecked Sendable {
     }
 
     @MainActor func stopInput() {
+        hdrTimer?.invalidate(); hdrTimer = nil
         inputView?.stop()
     }
 

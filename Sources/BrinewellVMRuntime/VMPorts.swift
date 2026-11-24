@@ -37,6 +37,7 @@ final class VMPorts {
     // early UI changes, and never marked applied on a stale acknowledgement.
     private var graphicsDesired: GraphicsBackend?
     private var graphicsApplied: GraphicsBackend?
+    private var desiredDisplayHDR: String?
     var onGraphicsApplied: ((GraphicsBackend) -> Void)?
     var onGraphicsRequest: ((GraphicsBackend) throws -> Void)?
     private var telemetryRead: Int32 = -1
@@ -334,8 +335,17 @@ final class VMPorts {
 
     private func sendGraphicsBackend() {
         guard graphicsReady, let backend = graphicsDesired else { return }
-        graphicsPending = Array(("backend \(backend.rawValue)\n".utf8))
+        graphicsPending.append(contentsOf: "backend \(backend.rawValue)\n".utf8)
         flushGraphics()
+    }
+
+    public func sendDisplayHDR(supported: Bool, maxLuminanceNits: UInt16,
+        maxFrameAverageLuminanceNits: UInt16, minLuminance10000ths: UInt16, sdrReferenceNits: UInt16) {
+        guard !closed else { return }
+        let line = "hdr \(supported ? 1 : 0) \(maxLuminanceNits) \(maxFrameAverageLuminanceNits) \(minLuminance10000ths) \(sdrReferenceNits)\n"
+        guard line != desiredDisplayHDR else { return }
+        desiredDisplayHDR = line
+        if graphicsReady { graphicsPending.append(contentsOf: line.utf8); flushGraphics() }
     }
 
     private func flushGraphics() {
@@ -372,8 +382,10 @@ final class VMPorts {
             if line == "ready" {
                 graphicsReady = true
                 sendGraphicsBackend()
+                if let line = desiredDisplayHDR { graphicsPending.append(contentsOf: line.utf8); flushGraphics() }
                 continue
             }
+            if line == "applied hdr" { continue }
             let words = line.split(separator: " ")
             if words.count == 2, words[0] == "applied",
                let mode = GraphicsBackend(rawValue: String(words[1])) {

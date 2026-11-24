@@ -28,6 +28,10 @@ public final class Runtime {
     private var ready = false
     private var currentDisplayMode: VMDisplayConfiguration
     private let initialScreenID: UInt32
+    private var hdrWork: DispatchWorkItem?
+    private var guestHDRCapabilities: HostDisplayCapabilities?
+    private var edidCapabilities: HostDisplayCapabilities?
+    private var hostCapabilities: HostDisplayCapabilities
 
     /// If krun_start_enter returns, called after the main actor has closed the
     /// guest window and runtime services. libkrun may terminate the process on
@@ -47,6 +51,7 @@ public final class Runtime {
         try capabilities.validate(options.display)
         currentDisplayMode = options.display
         initialScreenID = capabilities.id
+        hostCapabilities = capabilities
         display = try VMDisplay()
         display.displayRefreshRate = Double(options.display.refreshRate)
         display.setGameHUD(level: options.gameHUDLevel, position: options.gameHUDPosition)
@@ -153,6 +158,11 @@ public final class Runtime {
             try krunCheck("krun_set_gpu_options2", krun_set_gpu_options2(ctx, gpuFlags, UInt64(apertureMiB) << 20))
             let mode = options.display
             let displayID = UInt32(try krunCheck("krun_add_display", krun_add_display(ctx, UInt32(mode.width), UInt32(mode.height))))
+            try krunCheck("krun_display_set_hdr_capabilities", krun_display_set_hdr_capabilities(
+                ctx, displayID, hostCapabilities.hdrSupported, hostCapabilities.maxLuminanceNits,
+                hostCapabilities.maxFrameAverageLuminanceNits, hostCapabilities.minLuminance10000ths))
+            edidCapabilities = hostCapabilities
+            sendHDR(hostCapabilities)
             try krunCheck("krun_display_set_refresh_rate", krun_display_set_refresh_rate(ctx, displayID, UInt32(mode.refreshRate)))
             try krunCheck("krun_display_set_physical_size", krun_display_set_physical_size(ctx, displayID, 339, 212))
             report("BRINEWELL display width=\(mode.width) height=\(mode.height) refresh_rate=\(mode.refreshRate)")
@@ -191,6 +201,7 @@ public final class Runtime {
                 let result = krun_start_enter(ctx)
                 Task { @MainActor in
                     if result != 0 { report("BRINEWELL error krun_start_enter returned \(result)") }
+                    self.hdrWork?.cancel(); self.hdrWork = nil
                     self.started = false
                     self.workContext.stop()
                     self.context = nil // krun_start_enter consumed the context.
@@ -208,6 +219,7 @@ public final class Runtime {
             thread.qualityOfService = .userInteractive
             thread.start()
         } catch {
+            hdrWork?.cancel(); hdrWork = nil
             workContext.stop()
             display.close()
             input.setActive(false)
@@ -228,10 +240,48 @@ public final class Runtime {
         if diskFD >= 0 { Darwin.close(diskFD) }
     }
 
-    private func hostScreenChanged(_ screen: NSScreen) {
-        guard !stopping, let id = HostDisplayCapabilities.screenID(screen),
-              let capabilities = HostDisplayCapabilities.detect(displayID: id) else { return }
-        report("BRINEWELL display screen \(id)")
+    private func sendHDR(_ capabilities: HostDisplayCapabilities) {
+        ports.sendDisplayHDR(supported: capabilities.hdrSupported, maxLuminanceNits: capabilities.maxLuminanceNits,
+            maxFrameAverageLuminanceNits: capabilities.maxFrameAverageLuminanceNits,
+            minLuminance10000ths: capabilities.minLuminance10000ths, sdrReferenceNits: capabilities.sdrReferenceNits)
+        guestHDRCapabilities = capabilities
+    }
+
+    private func updateEDID(_ capabilities: HostDisplayCapabilities) {
+        guard !stopping, let context else { return }
+        do {
+            try krunCheck("krun_display_set_hdr_capabilities", krun_display_set_hdr_capabilities(
+                context, 0, capabilities.hdrSupported, capabilities.maxLuminanceNits,
+                capabilities.maxFrameAverageLuminanceNits, capabilities.minLuminance10000ths))
+            edidCapabilities = capabilities
+        } catch {
+            report("BRINEWELL error \(error)")
+            shutdown()
+        }
+    }
+
+    private func hostScreenChanged(_ capabilities: HostDisplayCapabilities) {
+        guard !stopping else { return }
+        func changed(_ a: UInt16, _ b: UInt16, by threshold: Int) -> Bool { abs(Int(a) - Int(b)) >= threshold }
+        if let previous = guestHDRCapabilities {
+            if previous.hdrSupported != capabilities.hdrSupported
+                || changed(previous.maxLuminanceNits, capabilities.maxLuminanceNits, by: 10)
+                || changed(previous.maxFrameAverageLuminanceNits, capabilities.maxFrameAverageLuminanceNits, by: 10)
+                || changed(previous.sdrReferenceNits, capabilities.sdrReferenceNits, by: 10) {
+                sendHDR(capabilities)
+            }
+        } else { sendHDR(capabilities) }
+        if let previous = edidCapabilities {
+            let flipped = previous.hdrSupported != capabilities.hdrSupported
+            hdrWork?.cancel(); hdrWork = nil
+            if flipped { updateEDID(capabilities) }
+            else if changed(previous.maxLuminanceNits, capabilities.maxLuminanceNits, by: 50) {
+                let item = DispatchWorkItem { [weak self] in self?.updateEDID(capabilities) }
+                hdrWork = item
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
+            }
+        }
+        hostCapabilities = capabilities
         guard (try? capabilities.validate(currentDisplayMode)) == nil,
               let mode = capabilities.preferredMode(for: currentDisplayMode), let context else { return }
         do {
@@ -288,6 +338,7 @@ public final class Runtime {
     public func shutdown() {
         guard !stopping else { return }
         stopping = true
+        hdrWork?.cancel(); hdrWork = nil
         // Registration may be awaiting launchd. The startup continuation will
         // clean up without creating a VM when it resumes.
         guard started else {

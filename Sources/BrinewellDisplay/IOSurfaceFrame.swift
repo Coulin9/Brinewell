@@ -5,6 +5,7 @@ import IOSurface
 /// reuse the surface until the last reference to this frame has been released.
 /// `onRelease` may run on any thread, including a Metal completion thread.
 public final class IOSurfaceFrame: @unchecked Sendable {
+    public let colorState: DisplayColorState
     public let surface: IOSurfaceRef
     public let sequenceNumber: UInt64
     private let onRelease: (@Sendable () -> Void)?
@@ -12,6 +13,7 @@ public final class IOSurfaceFrame: @unchecked Sendable {
     public init(
         surface: IOSurfaceRef,
         sequenceNumber: UInt64,
+        colorState: DisplayColorState = .sdr,
         onRelease: (@Sendable () -> Void)? = nil
     ) throws {
         let width = IOSurfaceGetWidth(surface)
@@ -25,6 +27,7 @@ public final class IOSurfaceFrame: @unchecked Sendable {
               !overflow, IOSurfaceGetBytesPerRow(surface) >= minimumStride else {
             throw DisplayError.invalidSurface
         }
+        self.colorState = colorState
         self.surface = surface
         self.sequenceNumber = sequenceNumber
         self.onRelease = onRelease
