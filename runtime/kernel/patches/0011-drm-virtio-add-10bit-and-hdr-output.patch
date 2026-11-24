@@ -1,0 +1,340 @@
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -213,6 +213,9 @@
+ 	int cur_x;
+ 	int cur_y;
+ 	bool needs_modeset;
++	struct virtio_gpu_set_scanout_color last_color;
++	bool color_sent;
++	bool color_changed_this_commit;
+ };
+ #define drm_crtc_to_virtio_gpu_output(x) \
+ 	container_of(x, struct virtio_gpu_output, crtc)
+@@ -287,6 +290,7 @@
+ 	bool has_host_visible;
+ 	bool has_context_init;
+ 	bool has_blob_alignment;
++	bool has_scanout_color;
+ 	bool has_doorbell;
+ 	struct virtio_shm_region host_visible_region;
+ 	struct virtio_shm_region doorbell_region;
+@@ -396,6 +400,8 @@
+ 				   uint32_t width, uint32_t height,
+ 				   struct virtio_gpu_object_array *objs,
+ 				   struct virtio_gpu_fence *fence);
++void virtio_gpu_cmd_set_scanout_color(struct virtio_gpu_device *vgdev,
++				    const struct virtio_gpu_set_scanout_color *color);
+ void virtio_gpu_cmd_set_scanout(struct virtio_gpu_device *vgdev,
+ 				uint32_t scanout_id, uint32_t resource_id,
+ 				uint32_t width, uint32_t height,
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
+@@ -175,6 +175,7 @@
+ 	VIRTIO_GPU_F_RESOURCE_BLOB,
+ 	VIRTIO_GPU_F_CONTEXT_INIT,
+ 	VIRTIO_GPU_F_BLOB_ALIGNMENT,
++	VIRTIO_GPU_F_SCANOUT_COLOR,
+ };
+ static struct virtio_driver virtio_gpu_driver = {
+ 	.feature_table = features,
+--- a/drivers/gpu/drm/virtio/virtgpu_kms.c
++++ b/drivers/gpu/drm/virtio/virtgpu_kms.c
+@@ -218,6 +218,9 @@
+ 		vgdev->blob_alignment = blob_alignment;
+ 	}
+ 
++	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_SCANOUT_COLOR))
++		vgdev->has_scanout_color = true;
++
+ 	DRM_INFO("features: %cvirgl %cedid %cresource_blob %chost_visible",
+ 		 vgdev->has_virgl_3d    ? '+' : '-',
+ 		 vgdev->has_edid        ? '+' : '-',
+--- a/drivers/gpu/drm/virtio/virtgpu_plane.c
++++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+@@ -38,6 +38,14 @@
+ 	DRM_FORMAT_HOST_XRGB8888,
+ };
+ 
++static const uint32_t virtio_gpu_color_formats[] = {
++	DRM_FORMAT_HOST_XRGB8888,
++	DRM_FORMAT_XRGB2101010,
++	DRM_FORMAT_ARGB2101010,
++	DRM_FORMAT_XBGR2101010,
++	DRM_FORMAT_ABGR2101010,
++};
++
+ static const uint32_t virtio_gpu_cursor_formats[] = {
+ 	DRM_FORMAT_HOST_ARGB8888,
+ };
+@@ -59,6 +67,18 @@
+ 	case DRM_FORMAT_BGRA8888:
+ 		format = VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM;
+ 		break;
++	case DRM_FORMAT_ABGR2101010:
++		format = VIRTIO_GPU_FORMAT_R10G10B10A2_UNORM;
++		break;
++	case DRM_FORMAT_ARGB2101010:
++		format = VIRTIO_GPU_FORMAT_B10G10R10A2_UNORM;
++		break;
++	case DRM_FORMAT_XRGB2101010:
++		format = VIRTIO_GPU_FORMAT_B10G10R10X2_UNORM;
++		break;
++	case DRM_FORMAT_XBGR2101010:
++		format = VIRTIO_GPU_FORMAT_R10G10B10X2_UNORM;
++		break;
+ 	default:
+ 		/*
+ 		 * This should not happen, we handle everything listed
+@@ -230,6 +250,7 @@
+ 					      width, height, NULL, NULL);
+ 		virtio_gpu_notify(vgdev);
+ 	}
++	drm_crtc_to_virtio_gpu_output(plane->state->crtc)->color_changed_this_commit = false;
+ }
+ 
+ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
+@@ -593,6 +614,10 @@
+ 		formats = virtio_gpu_cursor_formats;
+ 		nformats = ARRAY_SIZE(virtio_gpu_cursor_formats);
+ 		funcs = &virtio_gpu_cursor_helper_funcs;
++	} else if (vgdev->has_scanout_color) {
++		formats = virtio_gpu_color_formats;
++		nformats = ARRAY_SIZE(virtio_gpu_color_formats);
++		funcs = &virtio_gpu_primary_helper_funcs;
+ 	} else {
+ 		formats = virtio_gpu_formats;
+ 		nformats = ARRAY_SIZE(virtio_gpu_formats);
+--- a/drivers/gpu/drm/virtio/virtgpu_display.c
++++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+@@ -123,6 +123,55 @@
+ 					struct drm_atomic_commit *state)
+ {
+ 	return 0;
++}
++
++static void virtio_gpu_crtc_atomic_begin(struct drm_crtc *crtc,
++					 struct drm_atomic_commit *state)
++{
++	struct virtio_gpu_device *vgdev = crtc->dev->dev_private;
++	struct virtio_gpu_output *output = drm_crtc_to_virtio_gpu_output(crtc);
++	struct drm_connector_state *conn_state;
++	struct virtio_gpu_set_scanout_color next_color = {};
++	const struct hdr_output_metadata *meta;
++	const struct hdr_metadata_infoframe *hdr;
++	int i;
++
++	if (!vgdev->has_scanout_color)
++		return;
++	conn_state = drm_atomic_get_new_connector_state(state, &output->conn);
++	if (!conn_state)
++		return;
++
++	next_color.scanout_id = cpu_to_le32(output->index);
++	next_color.colorspace = cpu_to_le32(conn_state->colorspace);
++	if (conn_state->hdr_output_metadata &&
++	    conn_state->hdr_output_metadata->data &&
++	    conn_state->hdr_output_metadata->length >= sizeof(*meta)) {
++		meta = conn_state->hdr_output_metadata->data;
++		if (meta->metadata_type == HDMI_STATIC_METADATA_TYPE1) {
++			hdr = &meta->hdmi_metadata_type1;
++			next_color.eotf = cpu_to_le32(hdr->eotf);
++			next_color.flags = cpu_to_le32(VIRTIO_GPU_SCANOUT_COLOR_FLAG_HAS_HDR_METADATA);
++			for (i = 0; i < 3; i++) {
++				next_color.display_primaries_x[i] = cpu_to_le16(hdr->display_primaries[i].x);
++				next_color.display_primaries_y[i] = cpu_to_le16(hdr->display_primaries[i].y);
++			}
++			next_color.white_point_x = cpu_to_le16(hdr->white_point.x);
++			next_color.white_point_y = cpu_to_le16(hdr->white_point.y);
++			next_color.max_display_mastering_luminance = cpu_to_le16(hdr->max_display_mastering_luminance);
++			next_color.min_display_mastering_luminance = cpu_to_le16(hdr->min_display_mastering_luminance);
++			next_color.max_cll = cpu_to_le16(hdr->max_cll);
++			next_color.max_fall = cpu_to_le16(hdr->max_fall);
++		}
++	}
++	if (!output->color_sent ||
++	    memcmp(&next_color.scanout_id, &output->last_color.scanout_id,
++		   sizeof(next_color) - sizeof(next_color.hdr))) {
++		virtio_gpu_cmd_set_scanout_color(vgdev, &next_color);
++		output->last_color = next_color;
++		output->color_sent = true;
++		output->color_changed_this_commit = true;
++	}
+ }
+ 
+ static void virtio_gpu_crtc_atomic_flush(struct drm_crtc *crtc,
+@@ -132,7 +181,21 @@
+ 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+ 	struct virtio_gpu_output *output = drm_crtc_to_virtio_gpu_output(crtc);
+ 	struct drm_pending_vblank_event *event;
++	struct drm_framebuffer *fb = crtc->primary->state->fb;
+ 
++	if (output->color_changed_this_commit) {
++		struct virtio_gpu_device *vgdev = dev->dev_private;
++
++		if (fb && fb->obj[0] && crtc_state->active) {
++			struct virtio_gpu_object *bo = gem_to_virtio_gpu_obj(fb->obj[0]);
++
++			virtio_gpu_cmd_resource_flush(vgdev, bo->hw_res_handle,
++						      0, 0, fb->width, fb->height, NULL, NULL);
++		}
++		virtio_gpu_notify(vgdev);
++		output->color_changed_this_commit = false;
++	}
++
+ 	/*
+ 	 * virtio-gpu can't do modeset and plane update operations
+ 	 * independent from each other.  So the actual modeset happens
+@@ -160,6 +223,7 @@
+ static const struct drm_crtc_helper_funcs virtio_gpu_crtc_helper_funcs = {
+ 	.mode_set_nofb = virtio_gpu_crtc_mode_set_nofb,
+ 	.atomic_check  = virtio_gpu_crtc_atomic_check,
++	.atomic_begin  = virtio_gpu_crtc_atomic_begin,
+ 	.atomic_flush  = virtio_gpu_crtc_atomic_flush,
+ 	.atomic_enable = virtio_gpu_crtc_atomic_enable,
+ 	.atomic_disable = virtio_gpu_crtc_atomic_disable,
+@@ -305,6 +369,14 @@
+ 	drm_connector_helper_add(connector, &virtio_gpu_conn_helper_funcs);
+ 	if (vgdev->has_edid)
+ 		drm_connector_attach_edid_property(connector);
++	if (vgdev->has_scanout_color) {
++		ret = drm_mode_create_hdmi_colorspace_property(connector,
++			BIT(DRM_MODE_COLORIMETRY_DEFAULT) |
++			BIT(DRM_MODE_COLORIMETRY_BT2020_RGB));
++		if (!ret)
++			drm_connector_attach_colorspace_property(connector);
++		drm_connector_attach_hdr_output_metadata_property(connector);
++	}
+ 
+ 	drm_simple_encoder_init(dev, encoder, DRM_MODE_ENCODER_VIRTUAL);
+ 	drm_encoder_helper_add(encoder, &virtio_gpu_enc_helper_funcs);
+@@ -321,19 +393,36 @@
+ 				   const struct drm_format_info *info,
+ 				   const struct drm_mode_fb_cmd2 *mode_cmd)
+ {
++	struct virtio_gpu_device *vgdev = dev->dev_private;
++	struct virtio_gpu_object *bo;
+ 	struct drm_gem_object *obj = NULL;
+ 	struct virtio_gpu_framebuffer *virtio_gpu_fb;
+ 	int ret;
+ 
+ 	if (mode_cmd->pixel_format != DRM_FORMAT_HOST_XRGB8888 &&
+-	    mode_cmd->pixel_format != DRM_FORMAT_HOST_ARGB8888)
++	    mode_cmd->pixel_format != DRM_FORMAT_HOST_ARGB8888 &&
++	    !(vgdev->has_scanout_color &&
++	      (mode_cmd->pixel_format == DRM_FORMAT_XRGB2101010 ||
++	       mode_cmd->pixel_format == DRM_FORMAT_ARGB2101010 ||
++	       mode_cmd->pixel_format == DRM_FORMAT_XBGR2101010 ||
++	       mode_cmd->pixel_format == DRM_FORMAT_ABGR2101010)))
+ 		return ERR_PTR(-ENOENT);
+ 
+ 	/* lookup object associated with res handle */
+ 	obj = drm_gem_object_lookup(file_priv, mode_cmd->handles[0]);
+ 	if (!obj)
+ 		return ERR_PTR(-EINVAL);
+ 
++	bo = gem_to_virtio_gpu_obj(obj);
++	if ((mode_cmd->pixel_format == DRM_FORMAT_XRGB2101010 ||
++	     mode_cmd->pixel_format == DRM_FORMAT_ARGB2101010 ||
++	     mode_cmd->pixel_format == DRM_FORMAT_XBGR2101010 ||
++	     mode_cmd->pixel_format == DRM_FORMAT_ABGR2101010) &&
++	    !(bo->host3d_blob || bo->guest_blob)) {
++		drm_gem_object_put(obj);
++		return ERR_PTR(-EINVAL);
++	}
++
+ 	virtio_gpu_fb = kzalloc_obj(*virtio_gpu_fb);
+ 	if (virtio_gpu_fb == NULL) {
+ 		drm_gem_object_put(obj);
+@@ -386,6 +475,11 @@
+ 		return ret;
+ 
+ 	drm_mode_config_reset(vgdev->ddev);
++	if (vgdev->has_scanout_color) {
++		for (i = 0; i < vgdev->num_scanouts; i++)
++			if (vgdev->outputs[i].conn.state)
++				drm_connector_attach_max_bpc_property(&vgdev->outputs[i].conn, 8, 10);
++	}
+ 	return 0;
+ }
+ 
+--- a/drivers/gpu/drm/virtio/virtgpu_vq.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vq.c
+@@ -1498,6 +1498,18 @@
+ 
+ 	if (nents)
+ 		bo->attached = true;
++}
++
++void virtio_gpu_cmd_set_scanout_color(struct virtio_gpu_device *vgdev,
++				    const struct virtio_gpu_set_scanout_color *color)
++{
++	struct virtio_gpu_set_scanout_color *cmd_p;
++	struct virtio_gpu_vbuffer *vbuf;
++
++	cmd_p = virtio_gpu_alloc_cmd(vgdev, &vbuf, sizeof(*cmd_p));
++	*cmd_p = *color;
++	cmd_p->hdr.type = cpu_to_le32(VIRTIO_GPU_CMD_SET_SCANOUT_COLOR);
++	virtio_gpu_queue_ctrl_buffer(vgdev, vbuf);
+ }
+ 
+ void virtio_gpu_cmd_set_scanout_blob(struct virtio_gpu_device *vgdev,
+--- a/include/uapi/linux/virtio_gpu.h
++++ b/include/uapi/linux/virtio_gpu.h
+@@ -72,6 +72,7 @@
+  * must be aligned to that value.
+  */
+ #define VIRTIO_GPU_F_BLOB_ALIGNMENT      5
++#define VIRTIO_GPU_F_SCANOUT_COLOR       16
+ 
+ enum virtio_gpu_ctrl_type {
+ 	VIRTIO_GPU_UNDEFINED = 0,
+@@ -91,6 +92,7 @@
+ 	VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID,
+ 	VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+ 	VIRTIO_GPU_CMD_SET_SCANOUT_BLOB,
++	VIRTIO_GPU_CMD_SET_SCANOUT_COLOR = 0x01ff,
+ 
+ 	/* 3d commands */
+ 	VIRTIO_GPU_CMD_CTX_CREATE = 0x0200,
+@@ -387,12 +389,16 @@
+ 	VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM  = 2,
+ 	VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM  = 3,
+ 	VIRTIO_GPU_FORMAT_X8R8G8B8_UNORM  = 4,
++	VIRTIO_GPU_FORMAT_R10G10B10A2_UNORM = 8,
+ 
+ 	VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM  = 67,
+ 	VIRTIO_GPU_FORMAT_X8B8G8R8_UNORM  = 68,
+ 
+ 	VIRTIO_GPU_FORMAT_A8B8G8R8_UNORM  = 121,
++	VIRTIO_GPU_FORMAT_B10G10R10A2_UNORM = 131,
+ 	VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM  = 134,
++	VIRTIO_GPU_FORMAT_B10G10R10X2_UNORM = 233,
++	VIRTIO_GPU_FORMAT_R10G10B10X2_UNORM = 308,
+ };
+ 
+ /* VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID */
+@@ -442,6 +448,24 @@
+ 	__le32 padding;
+ 	__le32 strides[4];
+ 	__le32 offsets[4];
++};
++
++#define VIRTIO_GPU_SCANOUT_COLOR_FLAG_HAS_HDR_METADATA (1 << 0)
++
++struct virtio_gpu_set_scanout_color {
++	struct virtio_gpu_ctrl_hdr hdr;
++	__le32 scanout_id;
++	__le32 colorspace;
++	__le32 eotf;
++	__le32 flags;
++	__le16 display_primaries_x[3];
++	__le16 display_primaries_y[3];
++	__le16 white_point_x;
++	__le16 white_point_y;
++	__le16 max_display_mastering_luminance;
++	__le16 min_display_mastering_luminance;
++	__le16 max_cll;
++	__le16 max_fall;
+ };
+ 
+ /* VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB */
