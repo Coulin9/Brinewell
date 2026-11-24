@@ -31,7 +31,7 @@ CONTAINER_PAYLOAD = graphics.CONTAINER_PAYLOAD
 DEV_PAYLOAD = Path.home() / ".local/share/brinewell/neptune-dev"
 GRAPHICS_DLLS = graphics.GRAPHICS_DLLS
 SRT_BWRAP_REL = "libexec/steam-runtime-tools-0/srt-bwrap"
-# Per-game opt-in NGX payload (BRINEWELL_NGX_SR=1): nvapi64.dll is bound over
+# Per-game NGX payload (enabled by default): nvapi64.dll is bound over
 # the selected tool's own copy source so Proton's setup_prefix installs it,
 # while nvngx.dll stays a managed single file inside the game prefix.
 NGX_KEYS = ("nvngx", "nvapi64", "_nvngx")
@@ -242,7 +242,7 @@ def _sha256_fd(fd):
 
 
 def _ngx_requested(env):
-    return env.get("BRINEWELL_NGX_SR", "").strip().lower() in ("1", "true", "yes")
+    return env.get("BRINEWELL_NGX_SR", "").strip().lower() in ("", "1", "true", "yes", "on")
 
 
 def _ngx_overridden(env):
@@ -406,7 +406,7 @@ def _ngx_prefix_busy(compat):
     """True when a live process still names this prefix in WINEPREFIX.
 
     The NGX lock is released before exec, so an opt-out launch racing a
-    just-started opt-in game could delete the DLLs before it maps them.
+    just-started NGX-enabled game could delete the DLLs before it maps them.
     This check only narrows that window: a launch whose Wine processes
     have not been created yet is still uncovered.
     """
@@ -618,15 +618,15 @@ def _ngx_publish(compat, cfd, sfd, source, digest):
 
 
 def _ngx_install(compat, env, root, tool):
-    """Validate the NGX opt-in and publish the managed nvngx.dll.
+    """Validate NGX eligibility and publish the managed nvngx.dll.
 
     nvapi64.dll is never written to the prefix: it is bound over the
     selected tool's own nvapi copy source so Proton's setup_prefix installs
     the payload copy. Only an empty nvngx slot or a file this helper
     installed earlier (marker digest match) is touched; a foreign
     nvngx/_nvngx is never overwritten, backed up or adopted. Returns the
-    extra bwrap options for a candidate launch, or None when the opt-in
-    cannot be fulfilled this launch.
+    extra bwrap options for a candidate launch, or None when NGX
+    cannot be enabled this launch.
     """
     if _ngx_overridden(env):
         _log("NGX SR refused: user WINEDLLOVERRIDES covers an NGX name")
@@ -692,14 +692,16 @@ def _injection(mode, cmd, env):
     info = graphics.proton_invocation(cmd, env)
     if not info:
         return []
-    tool, _ = info
+    tool, verb_index = info
     compat = Path(env["STEAM_COMPAT_DATA_PATH"])
     inject = _neptune_injection(mode, cmd, env, tool)
     if not inject:
         _ngx_cleanup(compat)
         return inject
     candidate = None
-    if _ngx_requested(env) and _backend(mode) == "d3dmetal":
+    executable = cmd[verb_index + 1] if verb_index + 1 < len(cmd) else ""
+    is_32bit = graphics._pe_machine(executable) == 0x14c
+    if _ngx_requested(env) and _backend(mode) == "d3dmetal" and not is_32bit:
         candidate = _ngx_install(compat, env, _payload()[0], tool)
     else:
         _ngx_cleanup(compat)
@@ -708,7 +710,7 @@ def _injection(mode, cmd, env):
         inject[at] = f"{inject[at]};nvngx=n;nvapi64=n"
         inject += candidate
     else:
-        # The wrapper owns the internal flags: a refused or non-opt-in
+        # The wrapper owns the internal flags: a refused or disabled
         # launch must not inherit candidate or ACTIVE values set by an
         # outer environment.
         inject += ["--unsetenv", "BRINEWELL_NGX_SR_CANDIDATE",

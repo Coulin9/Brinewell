@@ -30,7 +30,7 @@
 # --wrapper-check replays the real launch order against the REAL
 # brinewell-graphics-wrap code (imported as a module) and the real
 # selected Proton, on a dedicated scratch compatdata:
-#   1. wrapper _injection for an opt-in launch: managed nvngx.dll +
+#   1. wrapper _injection for a default-enabled launch: managed nvngx.dll +
 #      marker land in the scratch prefix's system32, and the returned
 #      bwrap args carry the nvapi64 ro-bind over the tool's copy source
 #      plus BRINEWELL_NGX_SR_CANDIDATE=1 and the two expected SHA-256s
@@ -43,7 +43,7 @@
 #      wrapper-issued env (candidate + digests + the merged
 #      WINEDLLOVERRIDES) and no app-local NGX DLLs — ACTIVE must be
 #      set by the payload's own process-side check, never by hand.
-# This is replayed three times on the same prefix: opt-in, opt-in again
+# This is replayed three times on the same prefix: unset, empty again
 # (prefix reuse), then opt-out — where the next simulated setup restores
 # the tool's stock nvapi64.dll (the ro-bind target path read without the
 # bind), the wrapper removes its nvngx.dll/marker, and the fixture must
@@ -133,7 +133,7 @@ sha256sum "$d"/out/nvngx.dll "$d"/out/nvapi64.dll
 SH
 }
 
-# The candidate env a real opt-in launch would carry, rebuilt from the
+# The candidate env a real enabled launch would carry, rebuilt from the
 # two NGX DLLs currently staged in the private prefix's system32.  The
 # process-side check hashes those same files, so digests computed here
 # always match; ACTIVE itself is only ever set by the payload.
@@ -276,12 +276,12 @@ wrapper)
         return "$rc"
     }
 
-    # Opt-in launch, replayed against the real wrapper: _injection, then
+    # Default-enabled launch, replayed against the real wrapper: _injection, then
     # the nvapi64.dll unlink+copy Proton's setup_prefix performs, where
     # the copy source is the ro-bind's source (what the tool path serves
     # inside the container).  $1: fresh wipes the scratch compatdata,
     # reuse keeps it like a second launch of the same game.
-    wrap_opt_in() { # fresh|reuse
+    wrap_enabled() { # fresh|reuse
         guest bash -s -- "$1" <<'SH'
 set -euo pipefail
 d=~/dx12-lab/ngx-sr-v1
@@ -294,9 +294,9 @@ if [[ "$1" == fresh ]]; then
     rm -rf "$compat"
     mkdir -p "$compat"
 fi
-python3 - "$compat" "$d" <<'PY'
+python3 - "$compat" "$d" "$1" <<'PY'
 import importlib.machinery, importlib.util, json, os, sys
-compat, d = sys.argv[1], sys.argv[2]
+compat, d, run = sys.argv[1:]
 loader = importlib.machinery.SourceFileLoader(
     "graphics_wrap", "/usr/lib/brinewell/brinewell-graphics-wrap")
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -307,12 +307,13 @@ proton = os.path.expanduser(
 env = {"STEAM_COMPAT_TOOL_PATHS": proton,
        "STEAM_COMPAT_APP_ID": "1",
        "STEAM_COMPAT_DATA_PATH": compat,
-       "BRINEWELL_NGX_SR": "1",
        # Hostile leftovers: the wrapper must overwrite or clear these.
        "BRINEWELL_NGX_SR_ACTIVE": "1",
        "BRINEWELL_NGX_SR_CANDIDATE": "1",
        "BRINEWELL_NGX_CORE_SHA256": "0" * 64,
        "BRINEWELL_NGX_NVAPI_SHA256": "0" * 64}
+if run == "reuse":
+    env["BRINEWELL_NGX_SR"] = ""
 cmd = ["FEXCompatTool", proton + "/proton",
        "waitforexitandrun", "/game/x.exe"]
 inject = wrap._injection(wrap._mode(), cmd, dict(env))
@@ -355,7 +356,7 @@ with open(os.path.join(d, "wrap-env.sh"), "w") as fh:
     fh.write("BRINEWELL_NGX_CORE_SHA256='%s'\n" % core)
     fh.write("BRINEWELL_NGX_NVAPI_SHA256='%s'\n" % nvapi)
     fh.write("WINEDLLOVERRIDES='%s'\n" % overrides)
-print("WRAPCHECK: opt-in _injection ok; nvapi bind %s -> %s" %
+print("WRAPCHECK: default-enabled _injection ok; nvapi bind %s -> %s" %
       (binds[nvapi_dst], nvapi_dst))
 print("WRAPCHECK: candidate digests core=%s nvapi=%s" % (core, nvapi))
 PY
@@ -385,7 +386,7 @@ PY
 SH
     }
 
-    # Opt-out launch: _injection with no opt-in cleans the managed
+    # Opt-out launch: _injection with BRINEWELL_NGX_SR=0 cleans the managed
     # nvngx.dll + marker and strips the candidate env, then the next
     # replayed setup restores the tool's stock nvapi64.dll (the bind
     # target read without the bind, i.e. the real tool file).
@@ -412,6 +413,7 @@ proton = os.path.expanduser(
 env = {"STEAM_COMPAT_TOOL_PATHS": proton,
        "STEAM_COMPAT_APP_ID": "1",
        "STEAM_COMPAT_DATA_PATH": compat,
+       "BRINEWELL_NGX_SR": "0",
        # Inherited candidate/ACTIVE values must not leak either.
        "BRINEWELL_NGX_SR_ACTIVE": "1",
        "BRINEWELL_NGX_SR_CANDIDATE": "1",
@@ -479,15 +481,15 @@ SH
             fail "$tag process-side verification did not set ACTIVE; see $out"
     }
 
-    step "wrapper-check pass 1: opt-in _injection + nvapi copy (fresh)" \
-        wrap_opt_in fresh || fail "opt-in injection pass 1 failed; see output above"
+    step "wrapper-check pass 1: default-enabled _injection + nvapi copy (fresh)" \
+        wrap_enabled fresh || fail "default-enabled injection pass 1 failed; see output above"
     say "positive 1: fixture in the wrapper-managed prefix"
     wrap_run_fixture on1 env ||
         fail "positive run 1 failed; see $EVIDENCE_DIR/last/wrap-on1.err"
     wrap_check_positive on1
 
-    step "wrapper-check pass 2: opt-in _injection + nvapi copy (reuse)" \
-        wrap_opt_in reuse || fail "opt-in injection pass 2 failed; see output above"
+    step "wrapper-check pass 2: default-enabled _injection + nvapi copy (reuse)" \
+        wrap_enabled reuse || fail "default-enabled injection pass 2 failed; see output above"
     say "positive 2: fixture again in the same prefix"
     wrap_run_fixture on2 env ||
         fail "positive run 2 failed; see $EVIDENCE_DIR/last/wrap-on2.err"

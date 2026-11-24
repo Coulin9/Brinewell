@@ -179,10 +179,11 @@ the VM. The framework path, aperture and multi-ring options remain boot-only.
 
 ### NGX super resolution
 
-Neptune / D3DMetal ships opt-in `nvngx.dll` and `nvapi64.dll` shims that let a
-game use D3DMetal's NGX super resolution. They are per-game: add
-`BRINEWELL_NGX_SR=1 %command%` to the game's Steam launch options. Nothing is
-installed system-wide, so Steam itself never loads nvapi64.
+Neptune / D3DMetal enables NGX super resolution by default for eligible x86-64
+Proton games using D3D11 or D3D12, with no Steam launch options needed. To
+disable it per game, set `BRINEWELL_NGX_SR=0 %command%` in Steam launch options
+(`false`, `no`, and `off` also disable it). Nothing is installed system-wide,
+so Steam itself never loads nvapi64.
 
 - Only recognized x86-64 Proton launches on the Neptune / D3DMetal backend are
   eligible; other backends and ARM64 tools ignore the option.
@@ -205,15 +206,17 @@ installed system-wide, so Steam itself never loads nvapi64.
   sets `BRINEWELL_NGX_SR_ACTIVE` for itself, so a child process cannot
   inherit activation and a stale prefix cannot fool the check.
 - Opting out takes full effect at the next Proton prefix setup: with the
-  launch option removed the bind is gone, so the tool's stock `nvapi64.dll`
+  launch option set to disable it the bind is gone, so the tool's stock `nvapi64.dll`
   is copied again on the next setup run, while the wrapper removes only its
   own `nvngx.dll` and marker on the next launch. A file you replaced
   afterwards is left alone.
 - Games that still do not expose an upscaler option are outside the
   supported scope: several SDK loaders check the core library's signature
-  or trust chain (the shipped `nvngx.dll` carries no embedded Authenticode
-  signature), and driver registry or Streamline plugin checks can gate the
-  feature independently of where the files came from.
+  or trust chain. `nvngx.dll` embeds an Authenticode signature when a signing
+  key and certificate are configured at build time, and is unsigned otherwise;
+  games requiring NVIDIA's official certificate chain may still reject it.
+  Driver registry or Streamline plugin checks can also gate the feature
+  independently of where the files came from.
 
 ### Anti-cheat (EAC)
 

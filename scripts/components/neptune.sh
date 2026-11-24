@@ -3,6 +3,19 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/lib/common.sh"
 
+ngx_expected_exports() {
+    local api name
+    for api in D3D11 D3D12; do
+        for name in Init Init_Ext Init_ProjectID Init_with_ProjectID Shutdown Shutdown1 \
+            AllocateParameters DestroyParameters GetParameters GetCapabilityParameters \
+            GetFeatureRequirements GetScratchBufferSize CreateFeature EvaluateFeature \
+            EvaluateFeature_C ReleaseFeature; do
+            printf 'NVSDK_NGX_%s_%s\n' "$api" "$name"
+        done
+    done
+    printf '%s\n' NVSDK_NGX_UpdateFeature
+}
+
 NAME=neptune
 SRC="$ROOT/../virtio-win-mesa"
 OUTDIR="$OUT/$NAME"
@@ -68,6 +81,18 @@ builder run --rm -i \
     -v "$OUTDIR:/out:rw" "$IMAGE" bash -s <<'BUILD'
 set -euo pipefail
 export PATH="/toolchain/bin:$PATH"
+ngx_expected_exports() {
+    local api name
+    for api in D3D11 D3D12; do
+        for name in Init Init_Ext Init_ProjectID Init_with_ProjectID Shutdown Shutdown1 \
+            AllocateParameters DestroyParameters GetParameters GetCapabilityParameters \
+            GetFeatureRequirements GetScratchBufferSize CreateFeature EvaluateFeature \
+            EvaluateFeature_C ReleaseFeature; do
+            printf 'NVSDK_NGX_%s_%s\n' "$api" "$name"
+        done
+    done
+    printf '%s\n' NVSDK_NGX_UpdateFeature
+}
 # Stage the build on the guest-local disk: virtio-fs timestamp conversion can
 # transiently report host times a few milliseconds ahead, which meson rejects
 # as clock skew. /out is only used for the finished payload.
@@ -126,11 +151,10 @@ CROSS
     if [[ $pe_target == x86_64 ]]; then
         cp "$build/src/virtio/neptune/"{nvngx,nvapi64}.dll \
             "$payload/$arch-windows/"
-        if ! llvm-readobj --coff-exports "$payload/$arch-windows/nvngx.dll" | awk '
-            $1 == "Name:" && $2 ~ /^NVSDK_NGX_D3D12_/ { count++ }
-            END { exit !(count == 16) }
-        '; then
-            echo "Neptune $pe_target nvngx.dll does not export the 16 NVSDK_NGX_D3D12_* symbols" >&2
+        llvm-readobj --coff-exports "$payload/$arch-windows/nvngx.dll" \
+            | awk '$1 == "Name:" { print $2 }' | LC_ALL=C sort > /tmp/nvngx-exports.txt
+        if ! cmp -s /tmp/nvngx-exports.txt <(ngx_expected_exports | LC_ALL=C sort); then
+            echo "Neptune $pe_target nvngx.dll has an incorrect NGX export set" >&2
             return 1
         fi
         if ! llvm-readobj --coff-exports "$payload/$arch-windows/nvapi64.dll" \
@@ -217,8 +241,10 @@ if [[ "$NGX_SIGN_MODE" == signed ]]; then
         || die "cannot inspect signed nvngx.dll"
     grep -q 'file format coff-x86-64' "$NGX_TMP/nvngx.txt" \
         || die "signed nvngx.dll is not a coff-x86-64 PE"
-    [[ "$(grep -c 'NVSDK_NGX_D3D12_' "$NGX_TMP/nvngx.txt")" == 16 ]] \
-        || die "signed nvngx.dll no longer exports the 16 NVSDK_NGX_D3D12_* symbols"
+    awk '/^Export Table:/{in_exports=1; next} in_exports && $1 ~ /^[0-9]+$/ && $2 ~ /^0x/ {print $3}' \
+        "$NGX_TMP/nvngx.txt" | LC_ALL=C sort > "$NGX_TMP/exports.txt"
+    cmp -s "$NGX_TMP/exports.txt" <(ngx_expected_exports | LC_ALL=C sort) \
+        || die "signed nvngx.dll has an incorrect NGX export set"
     read -r _ _ sec_rva sec_size _ < <(grep 'Security Directory' "$NGX_TMP/nvngx.txt" || true)
     [[ -n "${sec_rva:-}" && "$sec_rva" != 0000000000000000 && "${sec_size:-}" != 00000000 ]] \
         || die "signed nvngx.dll has an empty security directory"

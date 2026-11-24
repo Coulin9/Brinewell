@@ -148,9 +148,10 @@ Steam 启动前自动迁回其原始基底工具。
 
 ### NGX 超分辨率
 
-Neptune / D3DMetal 提供按需开启的 `nvngx.dll` 与 `nvapi64.dll`，让游戏使用 D3DMetal 的
-NGX 超分辨率。该功能按游戏开启：在该游戏的 Steam 启动选项中加入
-`BRINEWELL_NGX_SR=1 %command%`。不会做任何系统级安装，Steam 自身不会加载 nvapi64。
+Neptune / D3DMetal 默认对符合条件的 x86-64 Proton 游戏启用 NGX 超分辨率，支持 D3D11
+和 D3D12，无需配置 Steam 启动选项。要按游戏关闭，可在 Steam 启动选项中设置
+`BRINEWELL_NGX_SR=0 %command%`（也可用 `false`、`no`、`off`）。不会做系统级安装，
+Steam 自身不会加载 nvapi64。
 
 - 仅 Neptune / D3DMetal 后端下的 x86-64 Proton 启动生效；其他后端和 ARM64 工具会忽略该选项。
 - 符合条件的启动对两个 DLL 采用不同部署方式：`nvapi64.dll` 以只读方式绑定覆盖所选工具
@@ -164,12 +165,13 @@ NGX 超分辨率。该功能按游戏开启：在该游戏的 Steam 启动选项
   的预期 SHA-256，并清除继承来的 `BRINEWELL_NGX_SR_ACTIVE`。Neptune 的 Windows 侧随后
   在游戏进程内核验该进程从 System32 看到的两个文件的摘要；只有核验通过的进程才为自己
   设置 `BRINEWELL_NGX_SR_ACTIVE`，子进程不能靠继承获得激活，过期前缀也无法骗过核验。
-- 取消开启在*下一次* Proton 前缀 setup 后才完全生效：移除启动选项后绑定消失，工具自带的
+- 取消开启在*下一次* Proton 前缀 setup 后才完全生效：设置关闭选项后绑定消失，工具自带的
   原版 `nvapi64.dll` 在下一次 setup 时被重新复制；wrapper 则在下一次启动时只移除自己
   安装的 `nvngx.dll` 与 marker。被用户替换过的文件保留不动。
-- 仍不显示超分选项的游戏不在支持范围内：部分 SDK loader 会校验 core 库的签名或信任链
-  （随附的 `nvngx.dll` 没有内嵌 Authenticode 签名），驱动注册表或 Streamline 插件的
-  检查也可能独立于文件来源拦截该功能。
+- 仍不显示超分选项的游戏不在支持范围内：部分 SDK loader 会校验 core 库的签名或信任链。
+  构建时配置签名密钥和证书时 `nvngx.dll` 会内嵌 Authenticode 签名，否则不签名；
+  要求 NVIDIA 官方证书链的游戏仍可能拒绝。驱动注册表或 Streamline 插件的检查也可能
+  独立于文件来源拦截该功能。
 
 ### 反作弊（EAC）
 
