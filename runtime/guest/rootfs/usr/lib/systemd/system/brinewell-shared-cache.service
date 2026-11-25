@@ -1,0 +1,14 @@
+[Unit]
+Description=Brinewell local shadercache bind for shared Steam library
+After=local-fs.target home.mount
+RequiresMountsFor=/home
+Before=display-manager.service
+ConditionPathExists=/run/brinewell/share.meta
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/brinewell/brinewell-shared-cache
+
+[Install]
+WantedBy=multi-user.target

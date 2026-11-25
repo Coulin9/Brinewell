@@ -1114,7 +1114,8 @@ case "$SHARE_LABEL_HEX" in *[!0-9a-f]*) SHARE_LABEL_HEX= ;; esac
 case $SHARE_MODE in
     ro|rw)
         if [ "$SHARE_ID_VALID" -eq 1 ]; then
-            SHARE_TARGET="/run/media/brinewell-share-${SHARE_ID}"
+            SHARE_SHORT=$(printf '%.8s' "$SHARE_ID")
+            SHARE_TARGET="/run/media/bw-${SHARE_SHORT}"
             if mkdir -p /run/media /run/brinewell "$SHARE_TARGET" &&
                 chmod 0755 /run/media /run/brinewell "$SHARE_TARGET" &&
                 mount -t virtiofs -o "$SHARE_MODE,nosuid,nodev,exec" brinewell-share "$SHARE_TARGET"; then

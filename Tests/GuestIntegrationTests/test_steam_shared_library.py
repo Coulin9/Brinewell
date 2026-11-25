@@ -66,7 +66,7 @@ class SharedLibraryTests(unittest.TestCase):
     def write_meta(self, sid=None, label='Library', **changes):
         sid = self.sid if sid is None else sid
         fields = {'ID': sid, 'LABEL_HEX': label.encode().hex(),
-                  'MOUNT': '/run/media/brinewell-share-' + sid, 'MODE': 'rw'}
+                  'MOUNT': '/run/media/bw-' + sid[:8], 'MODE': 'rw'}
         fields.update(changes)
         self.meta.write_text(''.join(f'{k}={v}\n' for k, v in fields.items()))
         return shared.load_share_meta(self.meta)
@@ -368,6 +368,73 @@ class SharedLibraryTests(unittest.TestCase):
         self.assertIsNone(shared.load_ledger(self.state)['suppressed'])
         self.prepare()
         self.assertEqual(shared.load_ledger(self.state)['owned']['status'], 'pending')
+
+    def test_migrate_owned_legacy_path_with_both_libraries(self):
+        for suffix in ('', '/SteamLibrary'):
+            with self.subTest(suffix=suffix):
+                root = self.mount / ('SteamLibrary' if suffix else '')
+                (self.mount / 'steamapps').mkdir(exist_ok=True)
+                (self.mount / 'SteamLibrary/steamapps').mkdir(parents=True, exist_ok=True)
+                (root / 'libraryfolder.vdf').write_text('"libraryfolder" { "contentid" "123" }')
+                old = '/run/media/brinewell-share-' + self.sid + suffix
+                owned = {**self.owned(), 'library_path': old}
+                original = self.registry_text(('1', old, '123')).replace('\"contentid\" \"123\"', '\"contentid\" \"123\" \"apps\" { \"42\" \"1\" }')
+                master = self.write_registry(original)
+                mirror = self.steam / 'steamapps/libraryfolders.vdf'
+                mirror.parent.mkdir(parents=True, exist_ok=True)
+                mirror.write_text(original)
+                self.ledger(owned)
+                with mock.patch.object(shared, 'load_share_meta', return_value=self.share), \
+                     mock.patch.object(shared, 'verify_mountinfo', return_value=True):
+                    self.assertEqual(shared.cmd_prepare(), 0)
+                self.assertNotIn(old, master.read_text())
+                new_owned = shared.load_ledger(self.state)['owned']
+                self.assertEqual(new_owned['library_path'], str(root))
+                self.assertEqual(new_owned['status'], 'confirmed')
+                expected = shared.vdf.vdf_set(original, ['libraryfolders', '1', 'path'], str(root))
+                self.assertEqual(master.read_text(), expected)
+                self.assertEqual(mirror.read_text(), expected)
+                self.assertIn('\"apps\"', expected)
+
+    def test_first_boot_shadercache_is_valid_root(self):
+        (self.mount / 'steamapps/shadercache').mkdir(parents=True)
+        self.assertEqual(shared.select_library_root(self.mount, {}, self.sid), str(self.mount))
+        cid = shared.ensure_library_initialized(str(self.mount), 'Library', set())
+        self.assertTrue(shared.valid_contentid(cid))
+        self.assertEqual(shared.read_libraryfolder(self.mount / 'libraryfolder.vdf')['contentid'], cid)
+
+    def test_migration_rewrite_failure_preserves_registration(self):
+        old = '/run/media/brinewell-share-' + self.sid
+        owned = {**self.owned(), 'library_path': old}
+        original = self.registry_text(('4', old, '123'))
+        master = self.write_registry(original)
+        mirror = self.steam / 'steamapps/libraryfolders.vdf'
+        mirror.parent.mkdir(parents=True)
+        mirror.write_text(original)
+        self.ledger(owned)
+        (self.mount / 'libraryfolder.vdf').write_text('"libraryfolder" { "contentid" "123" }')
+        write = shared.vdf.atomic_write
+        def fail_mirror(path, text):
+            if path == mirror:
+                raise OSError('mirror write failure')
+            write(path, text)
+        with mock.patch.object(shared.vdf, 'atomic_write', side_effect=fail_mirror):
+            self.prepare()
+        self.assertEqual(master.read_text(), original)
+        self.assertEqual(mirror.read_text(), original)
+        self.assertEqual(shared.load_ledger(self.state)['owned'], owned)
+
+    def test_migration_probe_failure_preserves_registration(self):
+        old = '/run/media/brinewell-share-' + self.sid
+        owned = {**self.owned(), 'library_path': old}
+        original = self.registry_text(('4', old, '123'))
+        master = self.write_registry(original)
+        self.ledger(owned)
+        (self.mount / 'libraryfolder.vdf').write_text('\"libraryfolder\" { \"contentid\" \"123\" }')
+        with mock.patch.object(shared, 'probe_writable_target', return_value=False):
+            self.prepare()
+        self.assertEqual(master.read_text(), original)
+        self.assertEqual(shared.load_ledger(self.state)['owned'], owned)
 
     def test_same_name_swap_removes_old_and_prepares_new(self):
         master = self.write_registry(self.registry_text(('1', self.mount, '123')))

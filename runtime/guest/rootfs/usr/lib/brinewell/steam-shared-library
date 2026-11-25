@@ -53,7 +53,7 @@ def load_share_meta(meta_path):
         share_id = fields['ID']
         label_hex = fields['LABEL_HEX']
         if (not re.fullmatch(r'[0-9a-f]{32}', share_id)
-                or fields['MOUNT'] != '/run/media/brinewell-share-' + share_id
+                or fields['MOUNT'] != '/run/media/bw-' + share_id[:8]
                 or not re.fullmatch(r'(?:[0-9a-f]{2}){0,96}', label_hex)
                 or fields['MODE'] not in ('rw', 'ro')):
             return None
@@ -139,6 +139,9 @@ def select_library_root(mount_path, ledger, share_id):
         if root_valid and child_valid:
             owned = ledger.get('owned') or {}
             selected = owned.get('library_path')
+            old_mount = '/run/media/brinewell-share-' + share_id
+            if selected in (old_mount, old_mount + '/SteamLibrary'):
+                selected = mount_path + selected[len(old_mount):]
             if owned.get('share_id') == share_id and selected in (mount_path, candidate):
                 folder = read_libraryfolder(os.path.join(selected, 'libraryfolder.vdf'))
                 if folder and folder['contentid'] and folder['contentid'] == owned.get('contentid'):
@@ -362,6 +365,62 @@ def remove_owned_entry_from_registries(steam_root, owned):
         return False
 
 
+def migrate_owned_entry(steam_root, owned, library):
+    master = Path(steam_root) / 'config/libraryfolders.vdf'
+    mirror = Path(steam_root) / 'steamapps/libraryfolders.vdf'
+    try:
+        if master.is_symlink() or mirror.is_symlink():
+            link, target = (master, mirror) if master.is_symlink() else (mirror, master)
+            if target.is_symlink() or not target.is_file() or not os.path.samefile(link, target):
+                raise ValueError('unexpected Steam registry symlink')
+            if link == master:
+                master, mirror = mirror, master
+        entries, text = registry(master)
+        if entries is None or text is None:
+            return False
+        matches = [i for i, entry in entries.items() if i != '0'
+                   and entry['path'] == owned.get('library_path')
+                   and entry['contentid'] == owned.get('contentid')]
+        if len(matches) != 1 or any(e['path'] == library for e in entries.values()):
+            raise ValueError('missing or ambiguous owned registry entry')
+        index = matches[0]
+        changes = [(master, text, vdf.vdf_set(text, ['libraryfolders', index, 'path'], library))]
+        hardlink = mirror.exists() and not mirror.is_symlink() and os.path.samefile(master, mirror)
+        if mirror.exists() and not mirror.is_symlink() and not hardlink:
+            if not stat.S_ISREG(os.lstat(mirror).st_mode):
+                raise ValueError('invalid Steam registry mirror')
+            other, other_text = registry(mirror)
+            if other is None or other.get(index) != entries[index]:
+                raise ValueError('inconsistent Steam registry mirror')
+            changes.append((mirror, other_text, vdf.vdf_set(other_text, ['libraryfolders', index, 'path'], library)))
+        written = []
+        try:
+            for path, old, new in changes:
+                vdf.atomic_write(path, new)
+                written.append((path, old))
+            if hardlink:
+                fd, tmp = tempfile.mkstemp(prefix='.brinewell-link-', dir=mirror.parent)
+                os.close(fd)
+                os.unlink(tmp)
+                try:
+                    os.link(master, tmp)
+                    os.replace(tmp, mirror)
+                finally:
+                    if os.path.lexists(tmp):
+                        os.unlink(tmp)
+        except OSError:
+            for path, old in reversed(written):
+                vdf.atomic_write(path, old)
+            if hardlink and not os.path.samefile(master, mirror):
+                os.unlink(master)
+                os.link(mirror, master)
+            raise
+        return True
+    except (OSError, ValueError) as exc:
+        log('cannot migrate owned registry entry: ' + str(exc))
+        return False
+
+
 def get_steam_state(steam_root, steam_dot_dir):
     override = os.environ.get('BRINEWELL_STEAM_RUNNING')
     if override in ('0', '1'):
@@ -526,6 +585,22 @@ def cmd_prepare():
                 log('Steam is running; deferring stale library cleanup')
                 deferred = True
             else:
+                old_mount = '/run/media/brinewell-share-' + str(share_id)
+                old_path = owned.get('library_path')
+                if (share_id and owned.get('share_id') == share_id
+                        and old_path in (old_mount, old_mount + '/SteamLibrary')
+                        and library == share['mount_path'] + old_path[len(old_mount):]):
+                    folder = read_libraryfolder(os.path.join(library, 'libraryfolder.vdf'))
+                    if (not folder or not valid_contentid(folder['contentid'])
+                            or folder['contentid'] != owned.get('contentid')
+                            or not probe_writable_target(library, share['mount_path'])):
+                        return 0
+                    if not migrate_owned_entry(steam, owned, library):
+                        return 0
+                    owned['mount_path'] = share['mount_path']
+                    owned['library_path'] = library
+                    save_ledger(state, ledger)
+                    return 0
                 if not remove_owned_entry_from_registries(steam, owned):
                     return 0
                 ledger['owned'] = None

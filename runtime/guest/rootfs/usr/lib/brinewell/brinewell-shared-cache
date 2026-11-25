@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Put regenerable shared-library shader caches on persistent guest storage."""
+import os
+import ctypes
+from pathlib import Path
+import pwd
+import re
+import stat
+import sys
+
+META = Path('/run/brinewell/share.meta')
+MOUNTINFO = Path('/proc/self/mountinfo')
+HOME = Path('/home')
+
+
+def log(message):
+    print('brinewell: shared-cache: ' + str(message), file=sys.stderr)
+
+
+def metadata(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return None
+            data = stream.read(65537)
+        if len(data) > 65536:
+            return None
+        fields = {}
+        for line in data.decode('utf-8').splitlines():
+            key, value = line.split('=', 1)
+            if key in fields:
+                return None
+            fields[key] = value
+        sid = fields['ID']
+        if (not re.fullmatch(r'[0-9a-f]{32}', sid) or fields['MODE'] != 'rw'
+                or fields['MOUNT'] != '/run/media/bw-' + sid[:8]):
+            return None
+        return sid, Path(fields['MOUNT'])
+    except (OSError, UnicodeError, ValueError, KeyError):
+        return None
+
+
+def mounts(path):
+    result = []
+    for line in path.read_text().splitlines():
+        halves = line.split(' - ', 1)
+        if len(halves) != 2:
+            continue
+        left, right = (part.split() for part in halves)
+        if len(left) < 6 or len(right) < 3:
+            continue
+        unescape = lambda s: re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), s)
+        result.append((unescape(left[4]), left[5].split(','), right[0],
+                       unescape(right[1]), right[2].split(',')))
+    return result
+
+
+def covering_mount(entries, path):
+    path = str(path)
+    matches = [entry for entry in entries if path == entry[0] or
+               path.startswith(entry[0].rstrip('/') + '/')]
+    return max(enumerate(matches), key=lambda pair: (len(pair[1][0]), pair[0]))[1] if matches else None
+
+
+LOCAL_FILESYSTEMS = {'ext2', 'ext3', 'ext4', 'btrfs', 'xfs', 'f2fs', 'jfs', 'reiserfs'}
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def bind_mount(source_fd, target_fd):
+    # Both architectures supported by the guest use these syscall numbers.
+    libc = ctypes.CDLL(None, use_errno=True)
+    tree = libc.syscall(428, source_fd, ctypes.c_char_p(b''), 0x1000 | 1 | 0x80000)
+    if tree < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    try:
+        if libc.syscall(429, tree, ctypes.c_char_p(b''), target_fd,
+                        ctypes.c_char_p(b''), 0x4 | 0x40) < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+    finally:
+        os.close(tree)
+
+
+def child_dir(parent, name, dev, uid, gid, create=False):
+    # Validate the parent before any mutation and every opened child before use.
+    if os.fstat(parent).st_dev != dev:
+        raise OSError('foreign filesystem in directory path')
+    try:
+        fd = os.open(name, DIR_FLAGS, dir_fd=parent)
+        created = False
+    except FileNotFoundError:
+        if not create:
+            raise
+        os.mkdir(name, 0o755, dir_fd=parent)
+        fd = os.open(name, DIR_FLAGS, dir_fd=parent)
+        created = True
+    try:
+        if os.fstat(fd).st_dev != dev:
+            raise OSError('foreign filesystem in directory path')
+        if created:
+            os.fchmod(fd, 0o755)
+            os.fchown(fd, uid, gid)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def setup(meta_path=META, mountinfo_path=MOUNTINFO, home=HOME, bind_fn=bind_mount):
+    share = metadata(meta_path)
+    if not share:
+        return 0
+    sid, mount = share
+    fds = []
+    try:
+        entries = mounts(mountinfo_path)
+        shared = covering_mount(entries, mount)
+        local = covering_mount(entries, home)
+        def writable(entry):
+            return all('rw' in opts and 'ro' not in opts for opts in (entry[1], entry[4]))
+        if (not shared or shared[0] != str(mount) or shared[2:4] != ('virtiofs', 'brinewell-share')
+                or not writable(shared)):
+            log('shared folder is not a writable brinewell virtiofs mount')
+            return 0
+        if not local or local[0] != str(home) or local[2] not in LOCAL_FILESYSTEMS or not writable(local):
+            log('home is not on a writable persistent local filesystem')
+            return 0
+        home_fd = os.open(home, DIR_FLAGS)
+        fds.append(home_fd)
+        home_dev = os.fstat(home_fd).st_dev
+        share_fd = os.open(mount, DIR_FLAGS)
+        fds.append(share_fd)
+        share_dev = os.fstat(share_fd).st_dev
+        account = pwd.getpwnam('steamos')
+        uid, gid = account.pw_uid, account.pw_gid
+        names = os.listdir(share_fd)
+
+        def inspect(parent, name):
+            try:
+                fd = child_dir(parent, name, share_dev, uid, gid)
+            except FileNotFoundError:
+                return None
+            fds.append(fd)
+            return fd
+
+        root_apps = inspect(share_fd, 'steamapps')
+        nested = inspect(share_fd, 'SteamLibrary')
+        nested_apps = inspect(nested, 'steamapps') if nested is not None else None
+        if root_apps is not None and nested_apps is None:
+            apps, key = root_apps, sid
+        elif nested_apps is not None and root_apps is None:
+            apps, key = nested_apps, sid + '-SteamLibrary'
+        elif not names:
+            apps = child_dir(share_fd, 'steamapps', share_dev, uid, gid, create=True)
+            fds.append(apps)
+            key = sid
+        else:
+            return 0
+        # Do not create local state for a foreign target mount.
+        target = mount / ('SteamLibrary/steamapps' if key != sid else 'steamapps') / 'shadercache'
+        mounted = covering_mount(entries, target)
+        is_mountpoint = mounted is not None and mounted[0] == str(target)
+        try:
+            target_fd = os.open('shadercache', DIR_FLAGS, dir_fd=apps)
+        except FileNotFoundError:
+            target_fd = child_dir(apps, 'shadercache', share_dev, uid, gid, create=True)
+        fds.append(target_fd)
+        target_stat = os.fstat(target_fd)
+        if target_stat.st_dev != share_dev and (not is_mountpoint or target_stat.st_dev != home_dev):
+            log('shadercache is on an unexpected filesystem')
+            return 0
+        source_fd = home_fd
+        for part in ('steamos', '.local', 'share', 'brinewell', 'shared-shadercache', key):
+            source_fd = child_dir(source_fd, part, home_dev, uid, gid, create=not is_mountpoint)
+            fds.append(source_fd)
+        source_stat = os.fstat(source_fd)
+        if is_mountpoint:
+            if (target_stat.st_dev, target_stat.st_ino) == (source_stat.st_dev, source_stat.st_ino):
+                return 0
+            log('shadercache is already mounted from an unexpected source')
+            return 0
+        if target_stat.st_dev != share_dev:
+            log('shadercache is on an unexpected filesystem')
+            return 0
+        bind_fn(source_fd, target_fd)
+        log('bound local shadercache to ' + str(target))
+    except (OSError, KeyError, UnicodeError) as exc:
+        log('cannot set up shared shadercache: ' + str(exc))
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+    return 0
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 1:
+        log('takes no arguments')
+        sys.exit(2)
+    sys.exit(setup())
