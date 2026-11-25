@@ -139,11 +139,11 @@ class FexEacTests(unittest.TestCase):
 
 
 
-    def test_installed_template_enables_vulkan_thunk(self):
+    def test_installed_template_enables_graphics_thunks(self):
         fex_eac.apply()
         config = json.loads((self.tool / "ConfigTemplate.json").read_text())
         payload_config = json.loads((self.payload / "ConfigTemplate.json").read_text())
-        self.assertEqual(config["ThunksDB"], {"Vulkan": "1"})
+        self.assertEqual(config["ThunksDB"], {"Vulkan": "1", "GL": "1"})
         config.pop("ThunksDB")
         self.assertEqual(config, payload_config)
 
@@ -155,12 +155,34 @@ class FexEacTests(unittest.TestCase):
         self.assertEqual((after.st_ino, after.st_mtime_ns), (stat.st_ino, stat.st_mtime_ns))
         self.assertIn("installed", (self.state / "status").read_text())
 
-    def test_existing_vulkan_value_is_kept(self):
-        template = {"Config": {"DiskCache": "1"}, "ThunksDB": {"Vulkan": "0"}}
+    def test_reapply_preserves_installed_thunk_values(self):
+        fex_eac.apply()
+        path = self.tool / "ConfigTemplate.json"
+        config = json.loads(path.read_text())
+        config["ThunksDB"].update({"GL": "0", "Vulkan": "0"})
+        path.write_text(json.dumps(config, indent=4) + "\n")
+        stat = path.stat()
+        fex_eac.apply()
+        self.assertEqual((path.stat().st_ino, path.stat().st_mtime_ns),
+                         (stat.st_ino, stat.st_mtime_ns))
+        (self.tool / "usr/bin/FEX").write_bytes(b"changed")
+        fex_eac.apply()
+        self.assertEqual(json.loads(path.read_text())["ThunksDB"],
+                         {"Vulkan": "0", "GL": "0"})
+
+    def test_existing_thunk_values_are_kept(self):
+        template = {"Config": {"DiskCache": "1"}, "ThunksDB": {"Vulkan": "0", "GL": "0", "Other": "1"}}
         (self.payload / "ConfigTemplate.json").write_text(json.dumps(template))
         fex_eac.apply()
         config = json.loads((self.tool / "ConfigTemplate.json").read_text())
-        self.assertEqual(config["ThunksDB"]["Vulkan"], "0")
+        self.assertEqual(config["ThunksDB"], template["ThunksDB"])
+
+    def test_existing_vulkan_only_template_gains_gl(self):
+        template = {"ThunksDB": {"Vulkan": "0"}}
+        (self.payload / "ConfigTemplate.json").write_text(json.dumps(template))
+        fex_eac.apply()
+        config = json.loads((self.tool / "ConfigTemplate.json").read_text())
+        self.assertEqual(config["ThunksDB"], {"Vulkan": "0", "GL": "1"})
 
     def test_restore_writes_exact_valve_template_bytes(self):
         valve_bytes = (self.tool / "ConfigTemplate.json").read_bytes()

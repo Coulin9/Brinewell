@@ -54,20 +54,33 @@ def complete(root):
     return all((root / name).is_file() and (root / name).stat().st_size > 0 for name in FILES)
 
 
-def installed_bytes(source, name):
+def installed_bytes(source, name, dst=None):
     """Bytes that should be installed for a payload file. The base config
-    template gains the Vulkan thunk (the x86 rootfs only ships freedreno
-    ICDs); every other file installs verbatim."""
+    template gains Vulkan and GL thunks for native graphics; every other
+    file installs verbatim."""
     data = (source / name).read_bytes()
     if name == Path("ConfigTemplate.json") and source == payload_dir():
         config = json.loads(data)
-        config.setdefault("ThunksDB", {}).setdefault("Vulkan", "1")
+        thunks = config.setdefault("ThunksDB", {})
+        installed = dst if dst is not None else tool_dir() / name
+        try:
+            installed_config = json.loads(installed.read_bytes())
+        except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError):
+            installed_config = {}
+        installed_thunks = installed_config.get("ThunksDB", {}) if isinstance(installed_config, dict) else {}
+        if not isinstance(installed_thunks, dict):
+            installed_thunks = {}
+        for key in ("Vulkan", "GL"):
+            if key in installed_thunks:
+                thunks[key] = installed_thunks[key]
+            else:
+                thunks.setdefault(key, "1")
         data = (json.dumps(config, indent=4) + "\n").encode()
     return data
 
 
 def identical(source, dst, name):
-    return dst.is_file() and dst.read_bytes() == installed_bytes(source, name)
+    return dst.is_file() and dst.read_bytes() == installed_bytes(source, name, dst)
 
 
 def all_installed(payload, tool):
@@ -112,7 +125,7 @@ def swap_in(source, tool):
         dst = tool / name
         dst.parent.mkdir(parents=True, exist_ok=True)
         temporary = dst.with_name("." + dst.name + ".new")
-        temporary.write_bytes(installed_bytes(source, name))
+        temporary.write_bytes(installed_bytes(source, name, dst))
         shutil.copymode(src, temporary)
         temporary.replace(dst)
     for name in FILES:

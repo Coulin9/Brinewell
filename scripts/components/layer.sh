@@ -17,7 +17,7 @@ FEX_EAC="$OUT/fex-eac/root.tar"
 for f in "$OUT/guest-integration/rootfs.tar" "$OUT/mesa/root.tar" "$AGENT" "$CLIPBOARD" "$MANGOAPP" "$MANGOAPP_LICENSE" "$PROBE" "$GPU_PROBE" "$NEPTUNE" "$UU_RUNTIME" "$FEX_EAC"; do
     [[ -f "$f" ]] || die "missing layer input: ${f#"$ROOT"/}"
 done
-INPUT="$(input_digest "$NAME" guest "$(sha256_file "$OUT/guest-integration/rootfs.tar")" mesa "$(sha256_file "$OUT/mesa/root.tar")" agent "$(sha256_file "$AGENT")" clipboard "$(sha256_file "$CLIPBOARD")" mangoapp "$(sha256_file "$MANGOAPP")" mangoapp_license "$(sha256_file "$MANGOAPP_LICENSE")" probe "$(sha256_file "$PROBE")" gpu_probe "$(sha256_file "$GPU_PROBE")" neptune "$(sha256_file "$NEPTUNE")" uu_runtime "$(sha256_file "$UU_RUNTIME")" fex_eac "$(sha256_file "$FEX_EAC")" erofs "$(mkfs.erofs --version | head -1)")"
+INPUT="$(input_digest "$NAME" guest "$(sha256_file "$OUT/guest-integration/rootfs.tar")" mesa "$(sha256_file "$OUT/mesa/root.tar")" agent "$(sha256_file "$AGENT")" clipboard "$(sha256_file "$CLIPBOARD")" mangoapp "$(sha256_file "$MANGOAPP")" mangoapp_license "$(sha256_file "$MANGOAPP_LICENSE")" probe "$(sha256_file "$PROBE")" gpu_probe "$(sha256_file "$GPU_PROBE")" neptune "$(sha256_file "$NEPTUNE")" uu_runtime "$(sha256_file "$UU_RUNTIME")" fex_eac "$(sha256_file "$FEX_EAC")" erofs "$(mkfs.erofs --version | head -1)" xattr_policy stripped-v1)"
 if component_should_reuse "$NAME" "$INPUT" "$OUTDIR/brinewell-layer.img"; then exit 0; fi
 
 rm -rf "$OUTDIR"
@@ -41,8 +41,19 @@ install -m 0755 "$GPU_PROBE" "$OUTDIR/rootfs/usr/lib/brinewell/brinewell-gpu-pro
 if [[ ! -f "$OUTDIR/rootfs/usr/share/vulkan/icd.d/virtio_icd.aarch64.json" ]]; then
     die "Mesa install did not provide the virtio ICD JSON"
 fi
+for f in usr/share/guestos/fex-mesa/usr/lib32/libvulkan_virtio.so \
+         usr/share/guestos/fex-mesa/usr/share/vulkan/icd.d/virtio_icd.x86.json; do
+    [[ -f "$OUTDIR/rootfs/$f" ]] || die "missing 32-bit Mesa ICD: $f"
+done
 printf 'brinewell-layer current-source-overlay standalone-runtime-components\n' \
     > "$OUTDIR/rootfs/usr/lib/brinewell/layer-release"
+# Guest layer inputs do not require host xattrs; do not embed leaked Linux ACLs.
+xattr -cr "$OUTDIR/rootfs"
+for f in usr/share/guestos/fex-mesa/usr/lib32/libvulkan_virtio.so \
+         usr/share/guestos/fex-mesa/usr/share/vulkan/icd.d/virtio_icd.x86.json; do
+    attrs=$(xattr -l "$OUTDIR/rootfs/$f")
+    [[ "$attrs" != *system.posix_acl_access* ]] || die "unexpected POSIX ACL: $f"
+done
 mkfs.erofs -b 4096 -zlz4 -T "$SOURCE_DATE_EPOCH" --all-root \
     -U 5fea1f2a-0c6b-4d5e-9a1e-0000000000a2 \
     "$OUTDIR/brinewell-layer.img" "$OUTDIR/rootfs" >/dev/null
