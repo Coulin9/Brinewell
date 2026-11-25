@@ -190,6 +190,24 @@ final class RuntimeOptionsTests: XCTestCase {
         }
     }
 
+    func testSharedFolderKernelArgumentsAreSafe() throws {
+        try withRuntimeArguments { arguments, root in
+            let share = root.appendingPathComponent("共享 ' games")
+            try FileManager.default.createDirectory(at: share, withIntermediateDirectories: false)
+            for (flag, mode) in [("1", "ro"), ("0", "rw")] {
+                let options = try RuntimeOptions(arguments: arguments + ["--shared-folder", share.path, "--shared-folder-read-only", flag])
+                defer { close(options.diskFD) }
+                let folder = try XCTUnwrap(options.sharedFolder)
+                let tokens = sharedFolderKernelArguments(folder).split(separator: " ").map(String.init)
+                XCTAssertEqual(tokens, ["brinewell.share=\(mode)",
+                    "brinewell.share_id=\(VMSharedFolder.shareIdentifier(forResolvedPath: folder.path))",
+                    "brinewell.share_label_hex=\(VMSharedFolder.displayLabelHex(forResolvedPath: folder.path))"])
+                XCTAssertTrue(tokens.allSatisfy { $0.range(of: "^[a-z0-9._=]+$", options: .regularExpression) != nil })
+                XCTAssertFalse(tokens.joined().contains(folder.path))
+            }
+        }
+    }
+
     func testInvalidSharedFolderOptionsAreRejected() throws {
         try withRuntimeArguments { arguments, root in
             for flags in [

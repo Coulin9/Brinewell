@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import BrinewellCore
@@ -115,6 +116,50 @@ final class ConfigurationTests: XCTestCase {
             configuration.sharedFolder = nil
             try store.save(configuration, for: host())
             XCTAssertNil(try store.load(for: host()).sharedFolder)
+        }
+    }
+
+    func testSharedFolderIdentityAndFallback() throws {
+        try withTemporaryDirectory { root in
+            let fm = FileManager.default
+            let first = root.appendingPathComponent("one/name")
+            let second = root.appendingPathComponent("two/name")
+            try fm.createDirectory(at: first, withIntermediateDirectories: true)
+            try fm.createDirectory(at: second, withIntermediateDirectories: true)
+            let path = try VMSharedFolder(path: first.path).resolvedPath()
+            let id = VMSharedFolder.shareIdentifier(forResolvedPath: path)
+            XCTAssertEqual(id.count, 32)
+            XCTAssertNotNil(id.range(of: "^[0-9a-f]{32}$", options: .regularExpression))
+            XCTAssertEqual(id, VMSharedFolder.shareIdentifier(forResolvedPath: path))
+            XCTAssertNotEqual(id, VMSharedFolder.shareIdentifier(forResolvedPath: second.resolvingSymlinksInPath().path))
+            let link = root.appendingPathComponent("link")
+            try fm.createSymbolicLink(at: link, withDestinationURL: first)
+            XCTAssertEqual(id, VMSharedFolder.shareIdentifier(forResolvedPath: try VMSharedFolder(path: link.path).resolvedPath()))
+            let volume = try XCTUnwrap(try first.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString)
+            XCTAssertFalse(volume.isEmpty)
+            let renamed = first.deletingLastPathComponent().appendingPathComponent("renamed")
+            try fm.moveItem(at: first, to: renamed)
+            XCTAssertEqual(id, VMSharedFolder.shareIdentifier(forResolvedPath: renamed.resolvingSymlinksInPath().path))
+
+            let missing = root.appendingPathComponent("missing").path
+            let expected = SHA256.hash(data: Data("brinewell-share-v1\0path\0\(missing)".utf8))
+                .prefix(16).map { String(format: "%02x", $0) }.joined()
+            XCTAssertEqual(VMSharedFolder.shareIdentifier(forResolvedPath: missing), expected)
+        }
+    }
+
+    func testSharedFolderLabels() {
+        let cases = [("/tmp/Hello", "Hello"), ("/tmp/中文", "中文"),
+                     ("/tmp/  a\"b\n\t c  ", "a\"b c"), ("/", "Shared Folder"),
+                     ("/tmp/\n\t", "Shared Folder"), ("/tmp/e\u{301}", "é"),
+                     ("/tmp/" + String(repeating: "界", count: 17), String(repeating: "界", count: 16)),
+                     ("/tmp/" + String(repeating: "a", count: 47) + "👨‍👩‍👧", String(repeating: "a", count: 47))]
+        for (path, expected) in cases {
+            XCTAssertEqual(VMSharedFolder.displayLabel(forResolvedPath: path), expected)
+            let hex = VMSharedFolder.displayLabelHex(forResolvedPath: path)
+            XCTAssertEqual(hex, expected.utf8.map { String(format: "%02x", $0) }.joined())
+            XCTAssertLessThanOrEqual(hex.count, 96)
+            XCTAssertNotNil(hex.range(of: "^[0-9a-f]+$", options: .regularExpression))
         }
     }
 

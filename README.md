@@ -132,8 +132,17 @@ start.
   support UDP ASSOCIATE); HTTP(S) uses CONNECT and forwards TCP only. Guest DNS goes
   through the proxy over TCP. Failed connections never fall back to a direct connection,
   and ICMP is not tunnelled. Restart the VM after switching Wi-Fi or Ethernet.
-- **Shared folder.** Choose a Mac folder, read-only by default. In SteamOS it is mounted
-  at `/run/brinewell/shared`.
+- **Shared folder.** Choose a Mac folder, read-only by default, accessible at
+  `/run/brinewell/shared` (a symlink to `/run/media/brinewell-share-<id>`). Turn off
+  Read Only and restart the VM to make supported folders available as a Steam library
+  in Gaming Mode **Settings → Storage** for game downloads. The `/run/media/` mount
+  lets Steam and Proton containers access it. A folder that is empty (ignoring macOS
+  housekeeping files such as `.DS_Store`) or already contains a root Steam library
+  (`steamapps/` or `libraryfolder.vdf`) uses its root. Other non-empty folders use a
+  `SteamLibrary/` subfolder, leaving unrelated Mac files untouched. Case-sensitive APFS
+  is recommended. Avoid concurrent host and guest writes to the library, and shut down SteamOS cleanly
+  before ejecting an external drive. Proton, FEX, and runtime tools remain on the
+  internal SteamOS drive by default.
 - **VM display.** Resolution and integer refresh rate are limited by the host screen and
   the 8192-pixel guest DRM limit. High modes use DisplayID extended timings, so 5K/6K/8K
   work. Before the VM starts, the launcher's screen is used; afterwards, the VM window's

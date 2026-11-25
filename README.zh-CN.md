@@ -114,7 +114,15 @@ Brinewell 四轮显卡分数为 10548、10481、10463、10478，极差 0.8%；�
   须包含主机和端口，可带用户名和密码（`127.0.0.1` 指 Mac 宿主机）。SOCKS5 转发 TCP 和 UDP
   （服务端须支持 UDP ASSOCIATE）；HTTP(S) 通过 CONNECT 只转发 TCP。客体 DNS 通过 TCP 经代理
   查询。连接失败不会自动改为直连，也不提供 ICMP 隧道。切换 Wi-Fi 或网线后需重启虚拟机。
-- **共享文件夹**：选择一个 Mac 目录，默认只读。在 SteamOS 中挂载于 `/run/brinewell/shared`。
+- **共享文件夹**：选择一个 Mac 目录，默认只读，可通过 `/run/brinewell/shared` 访问
+  （它是指向 `/run/media/brinewell-share-<id>` 的符号链接）。关闭“只读”并重启虚拟机后，
+  支持的文件夹会出现在游戏模式的 **设置 → 存储** 中，可作为 Steam 库下载游戏；
+  `/run/media/` 挂载位置使 Steam 和 Proton 容器可以访问它。空文件夹（忽略 `.DS_Store` 等
+  macOS 系统文件）或根目录已有 Steam 库（`steamapps/` 或 `libraryfolder.vdf`）的文件夹直接
+  使用根目录；其他非空文件夹使用 `SteamLibrary/` 子目录，不影响无关的 Mac 文件。推荐使用
+  区分大小写的 APFS；避免宿主和客体同时写入同一个库，弹出外置磁盘前请正常关闭 SteamOS。
+  Proton、FEX 和运行时工具默认
+  仍保留在内部 SteamOS 磁盘上。
 - **虚拟机显示器**：分辨率和整数刷新率受宿主屏幕和客体 DRM 8192 像素上限限制。高分辨率、
   高刷新率模式使用 DisplayID 扩展时序，支持 5K/6K/8K。虚拟机启动前以启动器所在屏幕为准，
   启动后跟踪 VM 窗口所在屏幕；移到能力较低的屏幕时自动降低显示模式。

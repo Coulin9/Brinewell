@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""Prepare and register a verified writable Brinewell Steam library."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import quote
+
+import brinewell_vdf as vdf
+
+HOUSEKEEPING = {'.DS_Store', '._.DS_Store', '.Spotlight-V100', '.Trashes',
+                '.fseventsd', '.TemporaryItems'}
+
+
+def log(message):
+    print('brinewell: steam-shared-library: ' + str(message), file=sys.stderr)
+
+
+def paths():
+    home = Path.home()
+    return (Path(os.environ.get('BRINEWELL_STEAM_ROOT', home / '.local/share/Steam')),
+            Path(os.environ.get('BRINEWELL_STATE_DIR',
+                                Path(os.environ.get('XDG_STATE_HOME', home / '.local/state')) / 'brinewell')))
+
+
+def bounded_read(path):
+    with open(path, 'rb') as stream:
+        data = stream.read(65537)
+    if len(data) > 65536:
+        raise ValueError('file exceeds 64 KiB')
+    return data.decode('utf-8')
+
+
+def load_share_meta(meta_path):
+    try:
+        fields = {}
+        for line in bounded_read(meta_path).splitlines():
+            if '=' not in line:
+                return None
+            key, value = line.split('=', 1)
+            if key in fields:
+                return None
+            fields[key] = value
+        share_id = fields['ID']
+        label_hex = fields['LABEL_HEX']
+        if (not re.fullmatch(r'[0-9a-f]{32}', share_id)
+                or fields['MOUNT'] != '/run/media/brinewell-share-' + share_id
+                or not re.fullmatch(r'(?:[0-9a-f]{2}){0,96}', label_hex)
+                or fields['MODE'] not in ('rw', 'ro')):
+            return None
+        label = bytes.fromhex(label_hex).decode('utf-8')
+        label = ''.join(c for c in label if ord(c) >= 32 and ord(c) != 127).strip()
+        label = label.encode('utf-8')[:48].decode('utf-8', errors='ignore') or 'Shared Folder'
+        return {'mount_path': fields['MOUNT'], 'mode': fields['MODE'],
+                'share_id': share_id, 'label': label}
+    except (OSError, UnicodeError, KeyError, ValueError):
+        return None
+
+
+def verify_mountinfo(mount_path, mountinfo_path):
+    def unescape(value):
+        return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), value)
+    try:
+        match = None
+        for line in Path(mountinfo_path).read_text().splitlines():
+            parts = line.split(' - ', 1)
+            if len(parts) != 2:
+                continue
+            left, right = (part.split() for part in parts)
+            if len(left) >= 6 and len(right) >= 3 and unescape(left[4]) == str(mount_path):
+                match = (left[5].split(','), unescape(right[0]),
+                         unescape(right[1]), right[2].split(','))
+        if not match:
+            return False
+        opts, fs, source, superopts = match
+        return (fs == 'virtiofs' and source == 'brinewell-share'
+                and all('rw' in o and 'ro' not in o and 'noexec' not in o
+                        for o in (opts, superopts))
+                and not os.path.islink(mount_path) and os.path.isdir(mount_path))
+    except (OSError, UnicodeError):
+        return False
+
+
+def file_kind(path):
+    try:
+        return os.lstat(path).st_mode
+    except FileNotFoundError:
+        return None
+
+
+def read_libraryfolder(path):
+    try:
+        values, blocks, _ = vdf.vdf_entries(bounded_read(path))
+        if ('libraryfolder',) not in blocks and ('contentid',) not in values:
+            return None
+        contentid = values.get(('libraryfolder', 'contentid'), values.get(('contentid',), ('',)))[0]
+        label = values.get(('libraryfolder', 'label'), values.get(('label',), ('',)))[0]
+        return {'contentid': contentid, 'label': label}
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def is_valid_library_dir(dir_path):
+    mode = file_kind(dir_path)
+    if mode is None:
+        return 'absent'
+    if not stat.S_ISDIR(mode):
+        return 'invalid'
+    apps = file_kind(os.path.join(dir_path, 'steamapps'))
+    folder = file_kind(os.path.join(dir_path, 'libraryfolder.vdf'))
+    if apps is not None and not stat.S_ISDIR(apps):
+        return 'invalid'
+    if folder is not None and (not stat.S_ISREG(folder) or
+                               read_libraryfolder(os.path.join(dir_path, 'libraryfolder.vdf')) is None):
+        return 'invalid'
+    return 'valid' if apps is not None or folder is not None else 'absent'
+
+
+def select_library_root(mount_path, ledger, share_id):
+    mount_path = str(mount_path)
+    candidate = os.path.join(mount_path, 'SteamLibrary')
+    try:
+        root_status = is_valid_library_dir(mount_path)
+        child_status = is_valid_library_dir(candidate)
+        if 'invalid' in (root_status, child_status):
+            log('invalid Steam library on shared folder')
+            return None
+        root_valid = root_status == 'valid'
+        child_valid = child_status == 'valid'
+        if root_valid and child_valid:
+            owned = ledger.get('owned') or {}
+            selected = owned.get('library_path')
+            if owned.get('share_id') == share_id and selected in (mount_path, candidate):
+                folder = read_libraryfolder(os.path.join(selected, 'libraryfolder.vdf'))
+                if folder and folder['contentid'] and folder['contentid'] == owned.get('contentid'):
+                    return selected
+            log('conflicting Steam libraries on shared folder')
+            return None
+        if root_valid:
+            return mount_path
+        if child_valid:
+            return candidate
+        if not (set(os.listdir(mount_path)) - HOUSEKEEPING):
+            return mount_path
+        mode = file_kind(candidate)
+        if mode is None:
+            return candidate
+        if stat.S_ISDIR(mode) and not (set(os.listdir(candidate)) - HOUSEKEEPING):
+            return candidate
+        log('conflicting SteamLibrary on shared folder')
+    except OSError as exc:
+        log('cannot inspect shared folder: ' + str(exc))
+    return None
+
+
+def probe_writable_target(library_path, mount_path):
+    parent = library_path if os.path.lexists(library_path) else mount_path
+    scratch = None
+    try:
+        info = os.statvfs(parent)
+        if info.f_blocks <= 0 or (info.f_frsize or info.f_bsize) <= 0:
+            raise OSError('filesystem reports invalid capacity')
+        if info.f_bavail == 0:
+            log('warning: shared filesystem reports no available space')
+        scratch = tempfile.mkdtemp(prefix='.brinewell-probe-%d-' % os.getpid(), dir=parent)
+        first, second = os.path.join(scratch, 'first'), os.path.join(scratch, 'second')
+        with open(first, 'w') as stream:
+            stream.write('probe')
+        os.replace(first, second)
+        os.unlink(second)
+        link = os.path.join(scratch, 'dosdevices_c:')
+        os.symlink('../target', link)
+        if os.readlink(link) != '../target':
+            raise OSError('symlink verification failed')
+        with open(first, 'w') as stream:
+            stream.write('probe')
+        os.link(first, second)
+        os.unlink(second)
+        script = os.path.join(scratch, 'probe.sh')
+        with open(script, 'w') as stream:
+            stream.write('#!/bin/sh\nexit 0\n')
+        os.chmod(script, 0o755)
+        if subprocess.run([script], timeout=5, check=False).returncode != 0:
+            raise OSError('executable probe failed')
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        log('writable filesystem probe failed: ' + str(exc))
+        return False
+    finally:
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+def valid_contentid(value):
+    return bool(re.fullmatch(r'[1-9][0-9]{0,18}', value or '')) and int(value) < 2**63
+
+
+def ensure_library_initialized(library_path, label, existing_content_ids):
+    try:
+        for directory in (library_path, os.path.join(library_path, 'steamapps')):
+            try:
+                os.mkdir(directory)
+            except FileExistsError:
+                pass
+            if not stat.S_ISDIR(os.lstat(directory).st_mode):
+                raise OSError('not a real directory: ' + str(directory))
+        folder = os.path.join(library_path, 'libraryfolder.vdf')
+        mode = file_kind(folder)
+        if mode is not None:
+            if not stat.S_ISREG(mode):
+                raise OSError('libraryfolder.vdf is not a regular file')
+            data = read_libraryfolder(folder)
+            if not data or not valid_contentid(data['contentid']) or data['contentid'] in existing_content_ids:
+                raise OSError('libraryfolder.vdf has no valid contentid')
+            return data['contentid']
+        contentid = str(secrets.randbits(63))
+        while contentid == '0' or contentid in existing_content_ids:
+            contentid = str(secrets.randbits(63))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        fd = os.open(folder, flags, 0o644)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write('"libraryfolder"\n{\n\t"contentid"\t\t' + vdf.vdf_quote(contentid)
+                         + '\n\t"label"\t\t' + vdf.vdf_quote(label) + '\n}\n')
+        return contentid
+    except (OSError, ValueError) as exc:
+        log('cannot initialize library: ' + str(exc))
+        return None
+
+
+def parse_libraryfolders(text):
+    # The shared parser preserves spans but silently accepts duplicate blocks and
+    # skips stray quotes, so validate the token stream before using its spans.
+    token_re = re.compile(r'//[^\n]*|"(?:\\.|[^"\\])*"|[{}]|[^\s{}"]+')
+    tokens = []
+    pos = 0
+    for match in token_re.finditer(text):
+        if text[pos:match.start()].strip():
+            return None
+        pos = match.end()
+        if not match[0].startswith('//'):
+            tokens.append(match[0])
+    if text[pos:].strip():
+        return None
+    try:
+        seen = set()
+        stack = []
+        i = 0
+        while i < len(tokens):
+            if tokens[i] == '}':
+                if not stack:
+                    return None
+                stack.pop()
+                i += 1
+                continue
+            if tokens[i] == '{' or i + 1 >= len(tokens) or tokens[i + 1] == '}':
+                return None
+            key = vdf.vdf_unquote(tokens[i]).lower()
+            path = tuple(stack + [key])
+            if path in seen:
+                return None
+            seen.add(path)
+            if tokens[i + 1] == '{':
+                stack.append(key)
+            i += 2
+        if stack:
+            return None
+        values, blocks, _ = vdf.vdf_entries(text)
+        if ('libraryfolders',) not in blocks:
+            return None
+        result = {}
+        for path in blocks:
+            if len(path) == 2 and path[0] == 'libraryfolders' and path[1].isdigit():
+                result[path[1]] = {key: values.get((*path, key), ('',))[0]
+                                   for key in ('path', 'contentid', 'label')}
+        # Numeric scalar entries are legacy/ambiguous, not safe to rewrite.
+        if any(len(p) == 2 and p[0] == 'libraryfolders' and p[1].isdigit() for p in values):
+            return None
+        return result
+    except (ValueError, IndexError):
+        return None
+
+
+def registry(path):
+    try:
+        text = Path(path).read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return {}, None
+    except (OSError, UnicodeError) as exc:
+        log('cannot read registry: ' + str(exc))
+        return None, None
+    parsed = parse_libraryfolders(text)
+    if parsed is None:
+        log('malformed or ambiguous Steam library registry: ' + str(path))
+    return parsed, text
+
+
+def remove_owned_entry_from_registries(steam_root, owned):
+    master = Path(steam_root) / 'config/libraryfolders.vdf'
+    mirror = Path(steam_root) / 'steamapps/libraryfolders.vdf'
+    try:
+        if master.is_symlink() or mirror.is_symlink():
+            link, target = (master, mirror) if master.is_symlink() else (mirror, master)
+            if target.is_symlink() or not target.is_file() or not os.path.samefile(link, target):
+                log('unexpected Steam registry symlink')
+                return False
+            if link == master:
+                master, mirror = mirror, master
+        master_entries, master_text = registry(master)
+        if master_entries is None:
+            return False
+        mirror_exists = os.path.lexists(mirror)
+        symlink = mirror_exists and mirror.is_symlink()
+        if symlink and (not master.exists() or not os.path.samefile(master, mirror)):
+            log('unexpected Steam registry mirror symlink')
+            return False
+        hardlink = (mirror_exists and not symlink and not master.is_symlink()
+                    and master.exists() and os.path.samefile(master, mirror))
+        if mirror_exists and not symlink and not hardlink:
+            if not stat.S_ISREG(os.lstat(mirror).st_mode):
+                log('invalid Steam registry mirror')
+                return False
+            mirror_entries, mirror_text = registry(mirror)
+            if mirror_entries is None:
+                return False
+        else:
+            mirror_entries, mirror_text = {}, None
+        def updated(entries, text):
+            matches = [idx for idx, entry in entries.items()
+                       if idx != '0' and entry['path'] == owned.get('library_path')
+                       and entry['contentid'] == owned.get('contentid')]
+            if len(matches) > 1:
+                raise ValueError('multiple matching owned registry entries')
+            return vdf.vdf_remove(text, ['libraryfolders', matches[0]]) if matches else text
+        new_master = updated(master_entries, master_text)
+        new_mirror = updated(mirror_entries, mirror_text)
+        if new_master != master_text:
+            vdf.atomic_write(master, new_master)
+            if hardlink:
+                fd, tmp = tempfile.mkstemp(prefix='.brinewell-link-', dir=mirror.parent)
+                os.close(fd)
+                os.unlink(tmp)
+                try:
+                    os.link(master, tmp)
+                    os.replace(tmp, mirror)
+                finally:
+                    if os.path.lexists(tmp):
+                        os.unlink(tmp)
+        if new_mirror != mirror_text:
+            vdf.atomic_write(mirror, new_mirror)
+        return True
+    except (OSError, ValueError) as exc:
+        log('cannot remove owned registry entry: ' + str(exc))
+        return False
+
+
+def get_steam_state(steam_root, steam_dot_dir):
+    override = os.environ.get('BRINEWELL_STEAM_RUNNING')
+    if override in ('0', '1'):
+        return 'running' if override == '1' else 'stopped'
+    proc = Path('/proc')
+    for pidfile in (Path(steam_dot_dir) / 'steam.pid', Path(steam_root) / 'steam.pid'):
+        try:
+            pid = pidfile.read_text().strip()
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError):
+            return 'unknown'
+        if not re.fullmatch(r'[1-9][0-9]*', pid):
+            return 'unknown'
+        try:
+            process = proc / pid
+            process.stat()
+            for name in ('comm', 'cmdline'):
+                if b'steam' in (process / name).read_bytes().lower():
+                    return 'running'
+        except FileNotFoundError:
+            if not proc.is_dir():
+                return 'unknown'
+            continue
+        except OSError:
+            return 'unknown'
+    try:
+        for process in proc.iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                if process.stat().st_uid == os.getuid() and (process / 'comm').read_text().strip().lower() == 'steam':
+                    return 'running'
+            except FileNotFoundError:
+                continue
+            except (OSError, UnicodeError):
+                return 'unknown'
+    except OSError:
+        return 'unknown'
+    return 'stopped'
+
+
+def is_steam_ipc_ready(steam_root, steam_dot_dir):
+    if get_steam_state(steam_root, steam_dot_dir) != 'running':
+        return False
+    pipe = Path(steam_dot_dir) / 'steam.pipe'
+    if not os.path.lexists(pipe):
+        pipe = Path(steam_root) / 'steam.pipe'
+    try:
+        return (Path(steam_root) / 'config/libraryfolders.vdf').is_file() and stat.S_ISFIFO(pipe.stat().st_mode)
+    except OSError:
+        return False
+
+
+def get_boot_id():
+    if 'BRINEWELL_BOOT_ID' in os.environ:
+        return os.environ['BRINEWELL_BOOT_ID'].strip() or None
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text().strip() or None
+    except (OSError, UnicodeError):
+        return None
+
+
+def lock_with_timeout(lock):
+    deadline = time.monotonic() + max(0, float(os.environ.get('BRINEWELL_LOCK_TIMEOUT', '2')))
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                log('timed out acquiring ownership lock')
+                return False
+            time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+
+def load_ledger(state):
+    try:
+        data = json.loads((state / 'steam-shared-library.json').read_text())
+        if (not isinstance(data, dict) or data.get('version') != 1
+                or any(data.get(k) is not None and not isinstance(data[k], dict)
+                       for k in ('owned', 'suppressed'))):
+            raise ValueError('invalid ledger')
+        return data
+    except FileNotFoundError:
+        return {'version': 1, 'owned': None, 'suppressed': None}
+    except (OSError, ValueError) as exc:
+        raise ValueError('cannot read ownership ledger: ' + str(exc)) from exc
+
+
+def save_ledger(state, ledger):
+    path = state / 'steam-shared-library.json'
+    fd, temporary = tempfile.mkstemp(prefix=path.name + '.', dir=state)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(json.dumps(ledger, indent=2) + '\n')
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def eligible_share(ledger):
+    meta = load_share_meta(os.environ.get('BRINEWELL_SHARE_META', '/run/brinewell/share.meta'))
+    if not meta or meta['mode'] != 'rw' or not verify_mountinfo(
+            meta['mount_path'], os.environ.get('BRINEWELL_MOUNTINFO', '/proc/self/mountinfo')):
+        return None, None
+    return meta, select_library_root(meta['mount_path'], ledger, meta['share_id'])
+
+
+def matching_entry(entries, library_path, nested=False):
+    candidates = {library_path}
+    if nested:
+        candidates.add(os.path.join(library_path, 'SteamLibrary'))
+    matches = [entry for entry in entries.values() if entry['path'] in candidates]
+    return matches[0] if len(matches) == 1 else None
+
+
+def promote(state, ledger, share, library_path, entry):
+    owned = ledger.get('owned') or {}
+    if (owned.get('status') != 'pending' or owned.get('share_id') != share['share_id']
+            or owned.get('library_path') != library_path):
+        return
+    folder = read_libraryfolder(os.path.join(library_path, 'libraryfolder.vdf'))
+    cid = entry['contentid']
+    if not folder or not valid_contentid(cid) or cid != folder['contentid'] or cid != owned.get('contentid'):
+        log('registered library contentid differs from pending ownership; relinquishing claim')
+        ledger['owned'] = None
+    else:
+        owned['status'] = 'confirmed'
+    save_ledger(state, ledger)
+
+
+def cmd_prepare():
+    steam, state = paths()
+    state.mkdir(parents=True, exist_ok=True)
+    with open(state / 'steam-shared-library.lock', 'a') as lock:
+        if not lock_with_timeout(lock):
+            return 0
+        ledger = load_ledger(state)
+        share, library = eligible_share(ledger)
+        active_share_id = share['share_id'] if share else None
+        owned = ledger.get('owned')
+        suppressed = ledger.get('suppressed')
+        if (share and library is None
+                and any(record and record.get('share_id') == active_share_id
+                        for record in (owned, suppressed))):
+            log('same writable share could not be inspected; preserving ownership and suppression')
+            return 0
+        share_id = active_share_id if library else None
+        master = steam / 'config/libraryfolders.vdf'
+        entries, text = registry(master)
+        if text and '/run/brinewell/shared' in text:
+            log('legacy /run/brinewell/shared Steam library found; remove it in Steam if no longer needed')
+        if entries is None:
+            return 0
+        owned = ledger.get('owned')
+        deferred = False
+        if owned and (owned.get('share_id'), owned.get('library_path')) != (share_id, library):
+            if get_steam_state(steam, Path(os.environ.get('BRINEWELL_STEAM_DOT_DIR', Path.home() / '.steam'))) != 'stopped':
+                log('Steam is running; deferring stale library cleanup')
+                deferred = True
+            else:
+                if not remove_owned_entry_from_registries(steam, owned):
+                    return 0
+                ledger['owned'] = None
+                save_ledger(state, ledger)
+                entries, text = registry(master)
+                if entries is None:
+                    return 0
+        suppressed = ledger.get('suppressed')
+        if suppressed and suppressed.get('share_id') != share_id:
+            ledger['suppressed'] = None
+            save_ledger(state, ledger)
+        owned = ledger.get('owned') or {}
+        entry = matching_entry(entries, library) if library else None
+        if (share_id and owned.get('status') == 'confirmed'
+                and (owned.get('share_id'), owned.get('library_path')) == (share_id, library)
+                and text is not None and not any(e['path'] == library for e in entries.values())):
+            ledger['suppressed'] = {'share_id': share_id, 'library_path': library}
+            ledger['owned'] = None
+            save_ledger(state, ledger)
+            return 0
+        if not share_id or ledger.get('suppressed') or deferred:
+            return 0
+        if entry:
+            promote(state, ledger, share, library, entry)
+            return 0
+        if any(e['path'] == library for e in entries.values()):
+            log('ambiguous Steam registry library path')
+            return 0
+        if owned.get('status') == 'pending' and owned.get('prepared_boot_id'):
+            owned.pop('prepared_boot_id', None)
+            save_ledger(state, ledger)
+        if not probe_writable_target(library, share['mount_path']):
+            return 0
+        contentid = ensure_library_initialized(library, share['label'],
+                                               {e['contentid'] for e in entries.values() if e['path'] != library})
+        if contentid:
+            current_boot_id = get_boot_id()
+            ledger['owned'] = {'share_id': share_id, 'mount_path': share['mount_path'],
+                               'library_path': library, 'contentid': contentid, 'status': 'pending'}
+            if current_boot_id is None:
+                log('cannot read boot ID; notification receipt not recorded')
+            else:
+                ledger['owned']['prepared_boot_id'] = current_boot_id
+            save_ledger(state, ledger)
+    return 0
+
+
+class NotifyTimeout(Exception):
+    pass
+
+
+def cmd_notify():
+    timeout = max(0.0, float(os.environ.get('BRINEWELL_NOTIFY_TIMEOUT', '90')))
+    def expired(signum, frame):
+        raise NotifyTimeout('notify deadline exceeded')
+    previous_handler = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, timeout + 15)
+    try:
+        return notify_until_deadline(timeout)
+    except NotifyTimeout as exc:
+        log(str(exc))
+        return 0
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def notify_until_deadline(timeout):
+    steam, state = paths()
+    dot = Path(os.environ.get('BRINEWELL_STEAM_DOT_DIR', Path.home() / '.steam'))
+    state.mkdir(parents=True, exist_ok=True)
+    interval = max(0.01, float(os.environ.get('BRINEWELL_NOTIFY_INTERVAL', '2')))
+    retry = max(interval, float(os.environ.get('BRINEWELL_NOTIFY_RETRY_INTERVAL', '8')))
+    deadline = time.monotonic() + timeout
+    attempts = 0
+    next_attempt = 0
+    while time.monotonic() < deadline:
+        with open(state / 'steam-shared-library.lock', 'a') as lock:
+            if not lock_with_timeout(lock):
+                return 0
+            ledger = load_ledger(state)
+            share, library = eligible_share(ledger)
+            owned = ledger.get('owned') or {}
+            folder = read_libraryfolder(os.path.join(library, 'libraryfolder.vdf')) if library else None
+            current_boot_id = get_boot_id()
+            if (not share or not library or ledger.get('suppressed') or owned.get('status') != 'pending'
+                    or current_boot_id is None or owned.get('prepared_boot_id') != current_boot_id
+                    or owned.get('share_id') != share['share_id']
+                    or owned.get('mount_path') != share['mount_path']
+                    or owned.get('library_path') != library or not folder
+                    or not valid_contentid(folder['contentid']) or owned.get('contentid') != folder['contentid']):
+                log('no matching current-boot preparation receipt; skipping notification')
+                return 0
+            entries, _ = registry(steam / 'config/libraryfolders.vdf')
+            if entries is None:
+                return 0
+            entry = matching_entry(entries, library)
+            if entry:
+                promote(state, ledger, share, library, entry)
+                return 0
+            if any(e['path'] == library for e in entries.values()):
+                log('ambiguous Steam registry library path')
+                return 0
+            now = time.monotonic()
+            send = attempts < 6 and now >= next_attempt and is_steam_ipc_ready(steam, dot)
+        if send:
+            attempts += 1
+            next_attempt = time.monotonic() + retry * (2 ** (attempts - 1))
+            try:
+                result = subprocess.run([os.environ.get('BRINEWELL_STEAM_BIN', '/usr/bin/steam'),
+                                         '-ifrunning', 'steam://addlibraryfolder/' + quote(library, safe='')],
+                                        timeout=min(15, max(0.01, deadline - time.monotonic())), check=False)
+                if result.returncode:
+                    log('Steam notification exited with status ' + str(result.returncode))
+            except (OSError, subprocess.SubprocessError) as exc:
+                log('Steam library notification failed: ' + str(exc))
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+    return 0
+
+
+class PrepareTimeout(Exception):
+    pass
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ('prepare', 'notify'):
+        log('usage: steam-shared-library {prepare|notify}')
+        return 2
+    try:
+        if sys.argv[1] == 'prepare':
+            def expired(signum, frame):
+                raise PrepareTimeout('prepare deadline exceeded')
+            signal.signal(signal.SIGALRM, expired)
+            signal.setitimer(signal.ITIMER_REAL, max(0.01, float(os.environ.get('BRINEWELL_PREPARE_TIMEOUT', '10'))))
+            try:
+                return cmd_prepare()
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+        return cmd_notify()
+    except PrepareTimeout as exc:
+        log(str(exc))
+        return 0
+    except (OSError, ValueError) as exc:
+        log(str(exc))
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

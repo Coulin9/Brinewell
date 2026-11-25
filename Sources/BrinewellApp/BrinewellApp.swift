@@ -812,7 +812,7 @@ private struct SettingsView: View {
                         get: { model.configuration.sharedFolder?.readOnly ?? true },
                         set: { model.configuration.sharedFolder?.readOnly = $0 }
                     ))
-                    Text("After the next boot, open /run/brinewell/shared in SteamOS.")
+                    Text("Read-only shares are available at /run/brinewell/shared. Turn off Read Only and restart the VM to use a supported shared folder in SteamOS Settings → Storage for downloading games.")
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 HStack {

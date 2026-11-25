@@ -44,7 +44,6 @@
 "4 · Full" = "4 · 完整";
 "Add 1% low FPS, frame-time range, per-core metrics, swap, fans, and total system power." = "增加 1% Low、帧时间范围、逐核状态、交换空间、风扇和整机功耗。";
 "Add a frame-time graph, temperatures, clock speeds, GPU memory, battery, and game resolution." = "增加逐帧曲线、温度、频率、GPU 内存、电池及游戏分辨率。";
-"After the next boot, open /run/brinewell/shared in SteamOS." = "下次启动后，在 SteamOS 中打开 /run/brinewell/shared。";
 "Brinewell runtime components are incomplete. Reinstall the app." = "Brinewell 运行组件不完整，请重新安装应用。";
 "Brinewell runtime components are missing. Reinstall the app." = "找不到 Brinewell 运行组件，请重新安装应用。";
 "Brinewell — SteamOS · Click to Capture Mouse" = "Brinewell — SteamOS · 点击画面捕获鼠标";
@@ -240,6 +239,7 @@
 "Proxy Address" = "代理地址";
 "Quit and reopen Brinewell to apply a language change." = "退出并重新打开 Brinewell 后，语言设置将生效。";
 "Read Only" = "只读";
+"Read-only shares are available at /run/brinewell/shared. Turn off Read Only and restart the VM to use a supported shared folder in SteamOS Settings → Storage for downloading games." = "只读共享可通过 /run/brinewell/shared 访问。关闭“只读”并重新启动虚拟机后，可在 SteamOS 的“设置 → 存储”中选择支持的共享文件夹来下载和安装游戏。";
 "Reading or updating the SteamOS disk…" = "正在读取或更新 SteamOS 磁盘…";
 "Ready to install" = "准备安装";
 "Refresh" = "刷新";

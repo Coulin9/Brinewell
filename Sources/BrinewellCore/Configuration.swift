@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import Metal
@@ -100,6 +101,38 @@ public struct VMSharedFolder: Codable, Equatable, Sendable {
     public init(path: String, readOnly: Bool = true) {
         self.path = path
         self.readOnly = readOnly
+    }
+
+    public static func shareIdentifier(forResolvedPath resolvedPath: String) -> String {
+        let url = URL(fileURLWithPath: resolvedPath)
+        let volumeUUID = (try? url.resourceValues(forKeys: [.volumeUUIDStringKey]))?.volumeUUIDString
+        var info = stat()
+        let key: String
+        if let volumeUUID, !volumeUUID.isEmpty, stat(resolvedPath, &info) == 0 {
+            key = "vol\0\(volumeUUID)\0\(info.st_ino)"
+        } else {
+            key = "path\0\(resolvedPath)"
+        }
+        let digest = SHA256.hash(data: Data("brinewell-share-v1\0\(key)".utf8))
+        return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func displayLabel(forResolvedPath resolvedPath: String) -> String {
+        let component = resolvedPath == "/" ? "" : URL(fileURLWithPath: resolvedPath).lastPathComponent
+        let normalized = component.precomposedStringWithCanonicalMapping
+        let sanitized = String(String.UnicodeScalarView(normalized.unicodeScalars.filter {
+            $0.value >= 0x20 && $0.value != 0x7f
+        })).trimmingCharacters(in: .whitespacesAndNewlines)
+        var label = ""
+        for character in sanitized {
+            guard label.utf8.count + String(character).utf8.count <= 48 else { break }
+            label.append(character)
+        }
+        return label.isEmpty ? "Shared Folder" : label
+    }
+
+    public static func displayLabelHex(forResolvedPath resolvedPath: String) -> String {
+        displayLabel(forResolvedPath: resolvedPath).utf8.map { String(format: "%02x", $0) }.joined()
     }
 
     fileprivate func validatePath() throws {

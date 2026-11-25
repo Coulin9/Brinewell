@@ -20,6 +20,7 @@ account_remembered() {
 }
 
 if [[ ${1:-} == --watch ]]; then
+    /usr/lib/brinewell/steam-shared-library notify </dev/null &
     [[ -f $signin_marker && ${2:-} =~ ^[0-9]+$ ]] || exit 0
     mainpid=$2
     # The launcher replaces itself with Steam; stop watching when that PID exits.
@@ -92,6 +93,8 @@ write_branch() {
 
 if [[ $desktop == 1 ]]; then
     /usr/lib/brinewell/mac-clock-format || true
+    /usr/bin/timeout 12 /usr/lib/brinewell/steam-shared-library prepare || true
+    /usr/lib/brinewell/steam-shared-library notify </dev/null &
     # The stock autostart's arguments; -deckard only for the Frame client.
     if [[ $deck_mode == 1 ]]; then
         [[ -n $branch ]] && write_branch

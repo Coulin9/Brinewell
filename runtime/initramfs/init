@@ -1102,9 +1102,33 @@ fi
 
 # ---------------------------------------------------------------- switch_root
 SHARE_MODE=$(getarg brinewell.share)
+SHARE_ID=$(getarg brinewell.share_id)
+SHARE_LABEL_HEX=$(getarg brinewell.share_label_hex)
+SHARE_ID_VALID=1
+[ "${#SHARE_ID}" -eq 32 ] || SHARE_ID_VALID=0
+case "$SHARE_ID" in *[!0-9a-f]*) SHARE_ID_VALID=0 ;; esac
+if [ "${#SHARE_LABEL_HEX}" -gt 192 ] || [ $((${#SHARE_LABEL_HEX} % 2)) -ne 0 ]; then
+    SHARE_LABEL_HEX=
+fi
+case "$SHARE_LABEL_HEX" in *[!0-9a-f]*) SHARE_LABEL_HEX= ;; esac
 case $SHARE_MODE in
     ro|rw)
-        if mkdir -p /run/brinewell/shared &&
+        if [ "$SHARE_ID_VALID" -eq 1 ]; then
+            SHARE_TARGET="/run/media/brinewell-share-${SHARE_ID}"
+            if mkdir -p /run/media /run/brinewell "$SHARE_TARGET" &&
+                chmod 0755 /run/media /run/brinewell "$SHARE_TARGET" &&
+                mount -t virtiofs -o "$SHARE_MODE,nosuid,nodev,exec" brinewell-share "$SHARE_TARGET"; then
+                rmdir /run/brinewell/shared 2>/dev/null || true
+                ln -sfn "$SHARE_TARGET" /run/brinewell/shared || warn "cannot link host shared folder"
+                printf 'MOUNT=%s\nMODE=%s\nID=%s\nLABEL_HEX=%s\n' \
+                    "$SHARE_TARGET" "$SHARE_MODE" "$SHARE_ID" "$SHARE_LABEL_HEX" > /run/brinewell/share.meta
+                chmod 0644 /run/brinewell/share.meta
+                msg "mounted host shared folder at $SHARE_TARGET ($SHARE_MODE)"
+            else
+                rmdir "$SHARE_TARGET" 2>/dev/null || true
+                warn "cannot mount host shared folder at $SHARE_TARGET"
+            fi
+        elif mkdir -p /run/brinewell/shared &&
             mount -t virtiofs -o "$SHARE_MODE,nosuid,nodev" brinewell-share /run/brinewell/shared; then
             msg "mounted host shared folder at /run/brinewell/shared ($SHARE_MODE)"
         else

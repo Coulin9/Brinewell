@@ -12,6 +12,12 @@ func krunCheck(_ operation: String, _ result: Int32) throws -> Int32 {
     return result
 }
 
+func sharedFolderKernelArguments(_ folder: VMSharedFolder) -> String {
+    let id = VMSharedFolder.shareIdentifier(forResolvedPath: folder.path)
+    let labelHex = VMSharedFolder.displayLabelHex(forResolvedPath: folder.path)
+    return " brinewell.share=\(folder.readOnly ? "ro" : "rw") brinewell.share_id=\(id) brinewell.share_label_hex=\(labelHex)"
+}
+
 public enum RuntimeExitOutcome: Equatable, Sendable {
     case poweroff(status: Int32)
     case reset(status: Int32)
@@ -179,7 +185,7 @@ public final class Runtime {
                 try krunCheck("krun_add_virtiofs4", krun_add_virtiofs4(
                     ctx, "brinewell-share", folder.path, 0, folder.readOnly, UInt32(KRUN_SEMANTICS_LINUX_SIMPLIFIED)
                 ))
-                cmdline += folder.readOnly ? " brinewell.share=ro" : " brinewell.share=rw"
+                cmdline += sharedFolderKernelArguments(folder)
             }
             if let shrinkHomeKiB = options.shrinkHomeKiB {
                 cmdline += " brinewell.shrink_home=\(shrinkHomeKiB)"
