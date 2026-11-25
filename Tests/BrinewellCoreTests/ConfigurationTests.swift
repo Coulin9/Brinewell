@@ -65,7 +65,7 @@ final class ConfigurationTests: XCTestCase {
         let configuration = try JSONDecoder().decode(VMConfiguration.self, from: data)
         XCTAssertEqual(configuration.cpuCount, 2)
         XCTAssertEqual(configuration.memoryGiB, 4)
-        XCTAssertEqual(configuration.graphicsBackend, .neptune)
+        XCTAssertEqual(configuration.graphicsBackend, .automatic)
         XCTAssertNil(configuration.d3dMetalFrameworkPath)
         XCTAssertEqual(configuration.neptuneApertureMiB, 32768)
         XCTAssertFalse(configuration.neptuneMultiRing)
@@ -178,10 +178,10 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(VMConfiguration.self, from: data), configuration)
     }
 
-    func testNewConfigurationsDefaultToD3DMetal() {
-        XCTAssertEqual(VMConfiguration(cpuCount: 2, memoryGiB: 4).graphicsBackend, .neptune)
-        XCTAssertEqual(VMConfiguration.defaults(for: host()).graphicsBackend, .neptune)
-        XCTAssertEqual(Set(GraphicsBackend.allCases), [.venus, .neptune, .mullion])
+    func testNewConfigurationsDefaultToAutomatic() {
+        XCTAssertEqual(VMConfiguration(cpuCount: 2, memoryGiB: 4).graphicsBackend, .automatic)
+        XCTAssertEqual(VMConfiguration.defaults(for: host()).graphicsBackend, .automatic)
+        XCTAssertEqual(GraphicsBackend.allCases, [.automatic, .neptune, .mullion, .venus])
     }
 
     func testGameHUDCanPersistWithoutChangingStoredVMSettings() throws {
@@ -307,13 +307,13 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
-    func testAutomaticConfigurationMigratesToD3DMetalWithoutLosingSettings() throws {
+    func testAutomaticConfigurationPreservesSettings() throws {
         try withTemporaryDirectory { directory in
             let store = ConfigurationStore(url: directory.appendingPathComponent("configuration.json"))
             let data = Data(#"{"cpuCount":2,"memoryGiB":4,"graphicsBackend":"automatic","d3dMetalFrameworkPath":"/tmp/D3DMetal.framework","neptuneApertureMiB":16384,"neptuneMultiRing":true}"#.utf8)
             try data.write(to: store.url)
             let configuration = try store.load(for: host())
-            XCTAssertEqual(configuration.graphicsBackend, .neptune)
+            XCTAssertEqual(configuration.graphicsBackend, .automatic)
             XCTAssertEqual(configuration.cpuCount, 2)
             XCTAssertEqual(configuration.memoryGiB, 4)
             XCTAssertEqual(configuration.d3dMetalFrameworkPath, "/tmp/D3DMetal.framework")
@@ -321,7 +321,7 @@ final class ConfigurationTests: XCTestCase {
             XCTAssertTrue(configuration.neptuneMultiRing)
             try store.save(configuration, for: host())
             let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: store.url)) as? [String: Any])
-            XCTAssertEqual(saved["graphicsBackend"] as? String, "neptune")
+            XCTAssertEqual(saved["graphicsBackend"] as? String, "automatic")
             XCTAssertEqual(try store.load(for: host()), configuration)
         }
     }

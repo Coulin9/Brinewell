@@ -8,13 +8,26 @@ drained to the newline and rejected without corrupting the pending buffer.
 
 import json
 import os
+import selectors
+import socket
+import stat
 import sys
 import tempfile
+import time
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import brinewell_graphics as graphics
 
 DEVICE = "/dev/virtio-ports/fx.graphics"
 STATE = "/run/brinewell/graphics-backend"
 HDR_STATE = "/run/brinewell/hdr/display.json"
-MODES = {"venus", "neptune", "mullion"}
+MODES = set(graphics.LIVE_MODES)
+CLIENT_TIMEOUT = 1.0
+RESOLVE_TIMEOUT = 6.0
+MAX_PENDING = 16
+MAX_CLIENT_CONNS = 32
 MAX_LINE = 4096
 
 
@@ -63,35 +76,42 @@ def _apply_hdr(values, f):
 
 
 def serve(f):
-    """ready/backend/applied exchange over one duplex descriptor."""
-    _write_all(f, b"ready\n")
-    while True:
+    """Multiplex host commands and bounded local resolution requests."""
+    path = os.environ.get("BRINEWELL_GRAPHICS_RESOLVE_SOCK", graphics.DEFAULT_RESOLVE_SOCK)
+    listener = None
+    selector = selectors.DefaultSelector()
+    bound = False
+    clients = {}  # socket -> [request bytes, deadline, request id]
+    pending = {}  # request id -> socket
+    host_buffer = b""
+    draining = False
+
+    def close_client(client, response=None):
+        state = clients.pop(client, None)
+        if state:
+            try:
+                selector.unregister(client)
+            except (KeyError, OSError, ValueError):
+                pass
+            if state[2]:
+                pending.pop(state[2], None)
+        if response:
+            try:
+                client.sendall(response + b"\n")
+            except OSError:
+                pass
+        client.close()
+
+    def host_line(line):
         try:
-            line = f.readline(MAX_LINE + 2)
-        except OSError as error:
-            _log(f"read failed: {error}")
-            return 1
-        if not line:
-            # Host closed the port; restart to re-announce readiness.
-            return 2
-        if len(line) > MAX_LINE:
-            # Drain the overlong line to its newline, then reject it.
-            while not line.endswith(b"\n"):
-                chunk = f.readline(MAX_LINE + 2)
-                if not chunk:
-                    break
-                line = chunk
-            _log("overlong request rejected")
-            continue
-        try:
-            request = line.decode("utf-8").strip()
+            parts = line.decode("utf-8").strip().split(" ")
         except UnicodeDecodeError:
             _log("undecodable request rejected")
-            continue
-        if not request:
-            continue
-        parts = request.split(" ")
-        if len(parts) == 2 and parts[0] == "backend" and parts[1] in MODES:
+            return
+        if len(parts) == 3 and parts[0] == "resolved":
+            if parts[2] in graphics.RESOLUTION_TOKENS and parts[1] in pending:
+                close_client(pending[parts[1]], parts[2].encode())
+        elif len(parts) == 2 and parts[0] == "backend" and parts[1] in MODES:
             try:
                 _apply(parts[1], f)
             except OSError as error:
@@ -104,12 +124,134 @@ def serve(f):
                 values = [int(part) for part in parts[1:]]
                 if any(value > 65535 for value in values[1:]):
                     _log("HDR value out of range")
-                    continue
+                    return
                 _apply_hdr(values, f)
             except (OSError, ValueError) as error:
                 _log(f"HDR apply failed: {error}")
-        else:
+        elif parts != [""]:
             _log(f"unknown request rejected: {parts[0][:32]}")
+
+    try:
+        if path:
+            directory = os.path.dirname(path) or "."
+            if directory == "/run/brinewell":
+                try:
+                    os.mkdir(directory, 0o755)
+                except FileExistsError:
+                    pass
+                else:
+                    os.chmod(directory, 0o755)
+            else:
+                os.makedirs(directory, mode=0o755, exist_ok=True)
+            # Do not unlink arbitrary files at a configured socket path.
+            try:
+                if not stat.S_ISSOCK(os.lstat(path).st_mode):
+                    raise OSError("resolve path exists and is not a socket")
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(path)
+            bound = True
+            os.chmod(path, 0o666)
+            listener.listen(32)
+            listener.setblocking(False)
+        regular_host = stat.S_ISREG(os.fstat(f.fileno()).st_mode)
+        if not regular_host:
+            selector.register(f, selectors.EVENT_READ)
+        if listener:
+            selector.register(listener, selectors.EVENT_READ)
+        _write_all(f, b"ready\n")
+        while True:
+            now = time.monotonic()
+            for client, state in list(clients.items()):
+                if state[1] <= now:
+                    close_client(client, b"venus")
+            timeout = min((state[1] - now for state in clients.values()), default=None)
+            events = selector.select(0 if regular_host else timeout)
+            readable = [key.fileobj for key, _ in events]
+            if regular_host:
+                readable.insert(0, f)
+            for source in readable:
+                if source is f:
+                    try:
+                        chunk = os.read(f.fileno(), 4096)
+                    except OSError as error:
+                        _log(f"read failed: {error}")
+                        return 2
+                    if not chunk:
+                        return 2
+                    for byte in chunk:
+                        if byte == 10:
+                            if not draining:
+                                host_line(host_buffer)
+                            host_buffer = b""
+                            draining = False
+                        elif not draining:
+                            host_buffer += bytes((byte,))
+                            if len(host_buffer) > MAX_LINE:
+                                _log("overlong request rejected")
+                                host_buffer = b""
+                                draining = True
+                elif source is listener:
+                    client = None
+                    try:
+                        client, _ = listener.accept()
+                        client.setblocking(False)
+                        if len(clients) >= MAX_CLIENT_CONNS:
+                            close_client(client, b"venus")
+                            continue
+                        selector.register(client, selectors.EVENT_READ)
+                        clients[client] = [b"", time.monotonic() + CLIENT_TIMEOUT, None]
+                    except OSError:
+                        if client is not None:
+                            close_client(client)
+                elif source in clients:
+                    state = clients[source]
+                    try:
+                        data = source.recv(65)
+                    except OSError:
+                        close_client(source)
+                        continue
+                    if not data:
+                        close_client(source)
+                        continue
+                    if state[2] is not None:
+                        continue
+                    state[0] += data
+                    if len(state[0]) > 64:
+                        close_client(source, b"venus")
+                    elif b"\n" in state[0]:
+                        line = state[0].split(b"\n", 1)[0]
+                        try:
+                            appid = line.decode("ascii")
+                        except UnicodeDecodeError:
+                            appid = ""
+                        if not graphics.valid_app_id(appid) or len(pending) >= MAX_PENDING:
+                            close_client(source, b"venus")
+                            continue
+                        req_id = uuid.uuid4().hex
+                        state[1:] = [time.monotonic() + RESOLVE_TIMEOUT, req_id]
+                        pending[req_id] = source
+                        try:
+                            _write_all(f, f"resolve {req_id} {appid}\n".encode())
+                        except OSError as error:
+                            _log(f"write failed: {error}")
+                            return 1
+    except OSError as error:
+        _log(f"service failed: {error}")
+        return 1
+    finally:
+        for client in list(clients):
+            close_client(client, b"venus")
+        if listener:
+            listener.close()
+        selector.close()
+        if bound:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def main(device=DEVICE):

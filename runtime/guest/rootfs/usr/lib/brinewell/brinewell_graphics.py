@@ -6,9 +6,109 @@ command tail is a real Proton game launch and which architecture/backend
 it selects.
 """
 
+import json
 import os
 from pathlib import Path
+import socket
 import struct
+import subprocess
+import time
+
+LIVE_MODES = ("automatic", "venus", "neptune", "mullion")
+CONCRETE_MODES = ("venus", "neptune", "mullion")
+RESOLUTION_TOKENS = CONCRETE_MODES + ("probe", "probe_nomullion")
+DEFAULT_RESOLVE_SOCK = "/run/brinewell/graphics-resolve.sock"
+
+
+def valid_app_id(app_id):
+    return (isinstance(app_id, str) and 1 <= len(app_id) <= 10
+            and app_id[0] in "123456789"
+            and all("0" <= c <= "9" for c in app_id)
+            and int(app_id) <= 4294967295)
+
+
+def resolve_backend_for_app(app_id, sock_path=None, timeout=6.0):
+    if not valid_app_id(app_id):
+        return "venus"
+    if sock_path is None:
+        sock_path = os.environ.get("BRINEWELL_GRAPHICS_RESOLVE_SOCK", DEFAULT_RESOLVE_SOCK)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            client.connect(sock_path)
+            client.sendall((app_id + "\n").encode("ascii"))
+            data = b""
+            while b"\n" not in data and len(data) < 64:
+                chunk = client.recv(64 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            line, separator, _ = data.partition(b"\n")
+            if separator:
+                mode = line.decode("ascii")
+                if mode in RESOLUTION_TOKENS:
+                    return mode
+    except (OSError, ValueError, UnicodeError):
+        pass
+    return "venus"
+
+
+def probe_local_backend(exe_path=None, install_dir=None, allow_mullion=True,
+                        probe_bin=None, timeout=3.0):
+    probe_bin = probe_bin or os.environ.get(
+        "BRINEWELL_API_PROBE_BIN", "/usr/lib/brinewell/brinewell-api-probe")
+    deadline = time.monotonic() + timeout
+    try:
+        if not install_dir or not os.path.isabs(install_dir):
+            return "venus"
+        install_dir = os.path.normpath(install_dir)
+        if os.path.islink(install_dir) or not os.path.isdir(install_dir):
+            return "venus"
+        install = Path(install_dir).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return "venus"
+
+    executable = None
+    try:
+        if exe_path and os.path.isabs(exe_path):
+            candidate = Path(exe_path).resolve(strict=True)
+            if candidate.is_file() and candidate.is_relative_to(install):
+                executable = candidate
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    def run(operation, path):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            result = subprocess.run([probe_bin, "--json", operation, str(path)],
+                                    capture_output=True, timeout=remaining, check=False)
+            backend = json.loads(result.stdout).get("backend")
+            return backend if backend in CONCRETE_MODES else None
+        except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+            return None
+
+    backend = run("check", executable) if executable else "venus"
+    if backend == "venus" and install:
+        backend = run("scan", install)
+    if backend not in CONCRETE_MODES or (backend == "mullion" and not allow_mullion):
+        return "venus"
+    return backend
+
+
+def effective_mode(live_mode, app_id=None, sock_path=None, timeout=6.0,
+                   exe_path=None, install_dir=None, probe_bin=None, probe_timeout=3.0):
+    if live_mode in CONCRETE_MODES:
+        return live_mode
+    if live_mode == "automatic" and valid_app_id(app_id):
+        mode = resolve_backend_for_app(app_id, sock_path=sock_path, timeout=timeout)
+        if mode in ("probe", "probe_nomullion"):
+            return probe_local_backend(exe_path, install_dir, mode == "probe",
+                                       probe_bin, probe_timeout)
+        if mode in CONCRETE_MODES:
+            return mode
+    return "venus"
 
 PAYLOAD = Path("/usr/lib/brinewell/neptune")
 CONTAINER_PAYLOAD = Path("/run/host/usr/lib/brinewell/neptune")

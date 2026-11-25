@@ -19,6 +19,7 @@ import zipfile
 
 sys.dont_write_bytecode = True
 from game_patches import ensure_compiler, three_dmark_arguments, three_dmark_env
+import brinewell_graphics as graphics
 
 
 METRICS_KEY = r"HKCU\Control Panel\Desktop\WindowMetrics"
@@ -103,21 +104,19 @@ def proton_root(steam):
 
 def live_backend():
     try:
-        return MODE_TAG.get(MODE_FILE.read_text().strip())
+        mode = graphics.effective_mode(MODE_FILE.read_text().strip(), "223850")
+        return MODE_TAG.get(mode)
     except OSError:
         return None
 
 
-def wine_command(root):
+def wine_command(root, backend):
     steam = Path(os.environ.get("BRINEWELL_STEAM_ROOT") or Path.home() / ".local/share/Steam")
     common = steam / "steamapps/common"
     fex = common / "FEX-Emu/fex-compat-tool"
     runtime = common / "SteamLinuxRuntime_4/_v2-entry-point"
     if not fex.is_file() or not runtime.is_file():
         raise ValueError("Install Steam Linux Runtime 4 and FEX-Emu in the default Steam library first.")
-    backend = live_backend()
-    if backend is None:
-        raise ValueError("Select a Neptune graphics backend in Brinewell before starting 3DMark.")
     bridge = NEPTUNE / "bridge/x86_64"
     if not (NEPTUNE / "x86_64-unix/nptunix.so").is_file() or not (bridge / "nptunix.dll").is_file():
         raise ValueError("The Neptune payload is not installed on this system.")
@@ -263,8 +262,6 @@ def main():
     args = parser.parse_args()
     if not os.environ.get("DISPLAY") or os.environ.get("XDG_CURRENT_DESKTOP") != "KDE":
         raise ValueError("Open this launcher in SteamOS Desktop Mode.")
-    if live_backend() is None:
-        raise ValueError("Select a Neptune graphics backend in Brinewell before launching 3DMark.")
     os.umask(0o077)
     root = Path.home() / "3dmark-standalone"
     game = root / "pfx/drive_c/Program Files/UL/3DMark"
@@ -288,8 +285,9 @@ def main():
     root.mkdir(exist_ok=True)
     with (root / "desktop-start.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        wine, env = wine_command(root)
         if installer:
+            # Administrative extraction does not require a live graphics backend.
+            wine, env = wine_command(root, "d3dmetal")
             if not (root / "pfx/drive_c").is_dir():
                 subprocess.run([*wine, "wineboot.exe", "--init"], env=env, check=True)
             install_app(root, game, installer, wine, env)
@@ -298,6 +296,10 @@ def main():
                 return
             subprocess.Popen(["kdialog", "--title", "3DMark Standalone", "--passivepopup",
                               "3DMark is preparing the first launch. This can take several minutes.", "10"])
+        backend = live_backend()
+        if backend is None:
+            raise ValueError("Select a Neptune graphics backend in Brinewell before launching 3DMark.")
+        wine, env = wine_command(root, backend)
         command = open_desktop(root, game, wine, env, browser)
     os.execvp(command[0], command)
 

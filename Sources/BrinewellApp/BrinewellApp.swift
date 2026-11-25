@@ -61,7 +61,7 @@ final class AppModel: ObservableObject {
         self.migrationReport = migrationReport
         host = HostCapabilities.detect()
         configuration = .defaults(for: host)
-        setupReadiness = SetupReadiness(backend: .neptune, disk: .notConfigured, graphics: .d3dMetalMissing)
+        setupReadiness = SetupReadiness(backend: .automatic, disk: .notConfigured, graphics: .d3dMetalMissing)
         reload()
         deployment.onInstalled = { [weak self] url in self?.useDisk(url, startAfterSelection: true) }
         d3dMetalDeployment.configurationStore = store
@@ -157,11 +157,6 @@ final class AppModel: ObservableObject {
         } else if currentSetupStep == .graphics && setupReadiness.graphics.isReady && !setupReadiness.disk.isReady {
             currentSetupStep = .systemDisk
         }
-    }
-    func useVenusForSetup() {
-        setGraphicsBackend(.venus)
-        guard saveError == nil else { return }
-        graphicsSetupChanged()
     }
     func recheckRosetta() {
         d3dMetalDeployment.refreshRosettaStatus()
@@ -670,7 +665,7 @@ private struct MainView: View {
         .sheet(isPresented: $model.isShowingSetupSheet, onDismiss: { model.dismissSetup() }) {
             SetupView(model: model, diskDeployment: deployment, d3dMetalDeployment: model.d3dMetalDeployment,
                       readiness: model.setupReadiness, currentStep: $model.currentSetupStep,
-                      onUseVenus: { model.useVenusForSetup() }, onDismiss: { model.dismissSetup() })
+                      onDismiss: { model.dismissSetup() })
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeScreenNotification)) { _ in model.refreshDisplayCapabilities() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in model.refreshDisplayCapabilities() }
@@ -862,20 +857,26 @@ private struct SettingsView: View {
                     get: { model.configuration.graphicsBackend },
                     set: { model.setGraphicsBackend($0) }
                 )) {
+                    Text("Automatic").tag(GraphicsBackend.automatic)
                     Text("Neptune / D3DMetal").tag(GraphicsBackend.neptune)
                     Text("Neptune / Mullion").tag(GraphicsBackend.mullion)
                     Text("Venus Only").tag(GraphicsBackend.venus)
                 }.disabled(graphicsDeployment.isActive)
+                if model.configuration.graphicsBackend == .automatic {
+                    Text("Automatic routes each game using PCGamingWiki and a local cache, prioritizing D3DMetal (DX12/DX11), then Mullion (DX10), then Venus (Vulkan and others).")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
                 if vm.state == .running {
                     Text("Backend changes apply to the next game launch; the framework, aperture, and multi-ring settings still only apply at boot.")
                         .font(.callout).foregroundStyle(.secondary)
                     if let applied = vm.graphicsApplied {
-                        Text("Active: \(applied.title)").font(.callout).foregroundStyle(.secondary)
+                        Text("Active: \(applied == .automatic ? String(localized: "Automatic") : applied.title)")
+                            .font(.callout).foregroundStyle(.secondary)
                     }
                     if let error = vm.graphicsError { Text(error).foregroundStyle(.red) }
                 }
                 Group {
-                    if model.configuration.graphicsBackend == .neptune {
+                    if model.configuration.graphicsBackend.requiresD3DMetalSetup {
                         if let path = model.configuration.d3dMetalFrameworkPath {
                             if let inspection = try? D3DMetalFramework.inspect(at: URL(fileURLWithPath: path), allowBareBinary: true) {
                                 LabeledContent("Version", value: inspection.version?.displayVersion ?? String(localized: "Unknown"))

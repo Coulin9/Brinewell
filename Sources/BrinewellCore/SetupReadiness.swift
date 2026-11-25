@@ -66,7 +66,7 @@ public struct SetupReadiness: Sendable, Equatable {
         } else { disk = .notConfigured }
 
         let graphics: GraphicsReadiness
-        if configuration.graphicsBackend != .neptune {
+        if !configuration.graphicsBackend.requiresD3DMetalSetup {
             graphics = .notRequiredForBackend(configuration.graphicsBackend)
         } else if let path = configuration.d3dMetalFrameworkPath, !path.isEmpty {
             do {

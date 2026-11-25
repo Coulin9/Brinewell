@@ -1,15 +1,16 @@
-// Brinewell: classify a Windows game as Neptune (D3D11/12) or Venus (other).
+// Brinewell: classify a Windows game as Neptune, Mullion, or Venus.
 //
 // The probe reads PE import and delay-import tables from a bounded set of
 // executables and looks for D3D11/D3D12 DLL dependencies. A short bounded
 // string scan catches games that load those DLLs dynamically. It does not
 // execute anything and does not need Wine.
 //
-// Exit codes: 0 = neptune, 1 = venus, 2 = usage/IO error.
+// Exit codes: 0 = neptune, 1 = venus, 2 = usage error, 3 = mullion.
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -66,14 +67,14 @@ static uint32_t rd32(const unsigned char *p) {
            ((uint32_t)p[3] << 24);
 }
 
-static int read_file(const char *path, struct buffer *out) {
+static int read_file(int fd, struct buffer *out) {
     memset(out, 0, sizeof(*out));
     struct stat st;
-    if (lstat(path, &st) != 0) return -1;
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
     if (!S_ISREG(st.st_mode) || st.st_size <= 0 || (uint64_t)st.st_size > PROBE_MAX_FILE_BYTES)
-        return -1;
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
+        { close(fd); return -1; }
+    FILE *f = fdopen(fd, "rb");
+    if (!f) { close(fd); return -1; }
     size_t size = (size_t)st.st_size;
     unsigned char *data = malloc(size ? size : 1);
     if (!data) {
@@ -155,8 +156,12 @@ static void lower_basename(const char *name, char *out, size_t cap) {
 static int is_d3d_dependency(const char *name) {
     char lower[128];
     lower_basename(name, lower, sizeof(lower));
-    return strcmp(lower, "d3d11.dll") == 0 || strcmp(lower, "d3d12.dll") == 0 ||
-           strcmp(lower, "d3d12core.dll") == 0 || strcmp(lower, "d3d11on12.dll") == 0;
+    if (strcmp(lower, "d3d11.dll") == 0 || strcmp(lower, "d3d12.dll") == 0 ||
+        strcmp(lower, "d3d12core.dll") == 0 || strcmp(lower, "d3d11on12.dll") == 0)
+        return 2;
+    if (strcmp(lower, "d3d10.dll") == 0 || strcmp(lower, "d3d10_1.dll") == 0 ||
+        strcmp(lower, "d3d10core.dll") == 0) return 1;
+    return 0;
 }
 
 static int parse_pe(const char *path, const struct buffer *b, struct pe_info *pe) {
@@ -186,7 +191,8 @@ static int parse_pe(const char *path, const struct buffer *b, struct pe_info *pe
     uint32_t num_dirs = rd32(opt + data_dir_offset - 4);
     if (num_dirs > 16) num_dirs = 16;
     if (num_dirs > 1) pe->import_rva = rd32(opt + data_dir_offset + 8);
-    if (num_dirs > 13) pe->delay_import_rva = rd32(opt + data_dir_offset + 13 * 8);
+    if (num_dirs > 13 && optional_size >= data_dir_offset + 14 * 8)
+        pe->delay_import_rva = rd32(opt + data_dir_offset + 13 * 8);
     pe->size_of_headers = rd32(opt + 60);
     pe->num_sections = num_sections;
     uint64_t sections_offset = optional_offset + optional_size;
@@ -202,6 +208,7 @@ static int check_import_directory(const struct pe_info *pe, uint32_t dir_rva, in
     size_t dir_offset = 0;
     if (rva_to_offset(pe, dir_rva, &dir_offset) != 0) return 0;
     const size_t stride = delay ? 32 : 20;
+    int found = 0;
     for (size_t i = 0; i < 4096; i++) {
         size_t offset = dir_offset + i * stride;
         if (offset + stride > pe->b->size) break;
@@ -225,16 +232,22 @@ static int check_import_directory(const struct pe_info *pe, uint32_t dir_rva, in
         if (name_rva == 0) continue;
         char name[256];
         if (read_cstring_rva(pe, name_rva, name, sizeof(name)) != 0) continue;
-        if (is_d3d_dependency(name)) {
-            add_evidence(evidence, path, delay ? "delay-import" : name);
-            return 1;
+        int tier = is_d3d_dependency(name);
+        if (tier > found) {
+            char basename[128];
+            lower_basename(name, basename, sizeof(basename));
+            add_evidence(evidence, path, basename);
+            found = tier;
+            if (found == 2) break;
         }
     }
-    return 0;
+    return found;
 }
 
 static int scan_strings(const struct buffer *b, const char *path, struct evidence *evidence) {
-    static const char *needles[] = {"d3d11.dll", "d3d12.dll", "d3d12core.dll", "d3d11on12.dll"};
+    static const char *needles[] = {"d3d11.dll", "d3d12.dll", "d3d12core.dll", "d3d11on12.dll",
+                                    "d3d10.dll", "d3d10_1.dll", "d3d10core.dll"};
+    int found = 0;
     for (size_t n = 0; n < sizeof(needles) / sizeof(needles[0]); n++) {
         const char *needle = needles[n];
         size_t needle_len = strlen(needle);
@@ -243,31 +256,41 @@ static int scan_strings(const struct buffer *b, const char *path, struct evidenc
             size_t j = 0;
             while (j < needle_len && tolower(b->data[i + j]) == needle[j]) j++;
             if (j == needle_len) {
-                add_evidence(evidence, path, "string");
-                return 1;
+                int tier = is_d3d_dependency(needle);
+                if (tier > found) {
+                    add_evidence(evidence, path, needle);
+                    found = tier;
+                }
+                if (found == 2) return found;
+                break;
             }
         }
         /* UTF-16LE. */
         if (needle_len * 2 <= b->size) {
-            for (size_t i = 0; i + needle_len * 2 <= b->size; i += 2) {
+            for (size_t i = 0; i + needle_len * 2 <= b->size; i++) {
                 size_t j = 0;
                 while (j < needle_len && b->data[i + j * 2] != 0 &&
                        b->data[i + j * 2 + 1] == 0 &&
                        tolower(b->data[i + j * 2]) == needle[j])
                     j++;
                 if (j == needle_len) {
-                    add_evidence(evidence, path, "string-utf16");
-                    return 1;
+                    int tier = is_d3d_dependency(needle);
+                    if (tier > found) {
+                        add_evidence(evidence, path, needle);
+                        found = tier;
+                    }
+                    if (found == 2) return found;
+                    break;
                 }
             }
         }
     }
-    return 0;
+    return found;
 }
 
-static int classify_file(const char *path, struct evidence *evidence, int *parsed) {
+static int classify_file(int fd, const char *path, struct evidence *evidence, int *parsed) {
     struct buffer b;
-    if (read_file(path, &b) != 0) {
+    if (fd < 0 || read_file(fd, &b) != 0) {
         fprintf(stderr, "brinewell-api-probe: cannot read %s: %s\n", path, strerror(errno));
         return -1;
     }
@@ -276,11 +299,16 @@ static int classify_file(const char *path, struct evidence *evidence, int *parse
     *parsed = ok;
     int found = 0;
     if (ok) {
-        if (check_import_directory(&pe, pe.import_rva, 0, path, evidence)) found = 1;
-        if (!found && check_import_directory(&pe, pe.delay_import_rva, 1, path, evidence))
-            found = 1;
+        found = check_import_directory(&pe, pe.import_rva, 0, path, evidence);
+        if (found < 2) {
+            int tier = check_import_directory(&pe, pe.delay_import_rva, 1, path, evidence);
+            if (tier > found) found = tier;
+        }
     }
-    if (!found) found = scan_strings(&b, path, evidence);
+    if (found < 2) {
+        int tier = scan_strings(&b, path, evidence);
+        if (tier > found) found = tier;
+    }
     free_file(&b);
     return found;
 }
@@ -299,45 +327,80 @@ static int skip_directory(const char *name) {
     return 0;
 }
 
-static int scan_directory(const char *dir, struct evidence *evidence, int depth, int *files) {
-    if (depth > PROBE_MAX_SCAN_DEPTH || *files >= PROBE_MAX_SCAN_FILES) return 0;
-    DIR *d = opendir(dir);
-    if (!d) return 0;
+static int scan_directory(int fd, const char *dir, struct evidence *evidence, int depth, int *files) {
+    struct stat st;
+    if (depth > PROBE_MAX_SCAN_DEPTH || *files >= PROBE_MAX_SCAN_FILES ||
+        fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        close(fd);
+        return 0;
+    }
+    DIR *d = fdopendir(fd);
+    if (!d) { close(fd); return 0; }
     struct dirent *ent;
     int found = 0;
-    while (!found && (ent = readdir(d)) != NULL) {
+    while (found < 2 && *files < PROBE_MAX_SCAN_FILES && (ent = readdir(d)) != NULL) {
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
         char path[PATH_MAX];
         if (snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name) >= (int)sizeof(path)) continue;
-        struct stat st;
-        if (lstat(path, &st) != 0 || S_ISLNK(st.st_mode)) continue;
-        if (S_ISDIR(st.st_mode)) {
-            if (!skip_directory(ent->d_name))
-                found = scan_directory(path, evidence, depth + 1, files);
-        } else if (S_ISREG(st.st_mode) && has_exe_suffix(ent->d_name)) {
+        int child = -1;
+        if (!skip_directory(ent->d_name))
+            child = openat(dirfd(d), ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (child >= 0) {
+            int tier = scan_directory(child, path, evidence, depth + 1, files);
+            if (tier > found) found = tier;
+        } else if (has_exe_suffix(ent->d_name)) {
+            child = openat(dirfd(d), ent->d_name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+            if (child < 0) continue;
             (*files)++;
             int parsed = 0;
-            if (classify_file(path, evidence, &parsed) > 0) found = 1;
+            int tier = classify_file(child, path, evidence, &parsed);
+            if (tier > found) found = tier;
         }
     }
     closedir(d);
     return found;
 }
 
-static void print_json(const struct evidence *evidence, int neptune) {
-    printf("{\"backend\":\"%s\",\"evidence\":[", neptune ? "neptune" : "venus");
+static const char *backend_name(int tier) {
+    return tier == 2 ? "neptune" : tier == 1 ? "mullion" : "venus";
+}
+
+static void print_json(const struct evidence *evidence, int tier) {
+    printf("{\"backend\":\"%s\",\"evidence\":[", backend_name(tier));
     for (size_t i = 0; i < evidence->count; i++) {
         if (i) putchar(',');
         putchar('"');
-        for (const char *p = evidence->items[i]; *p; p++) {
-            unsigned char c = (unsigned char)*p;
+        const unsigned char *p = (const unsigned char *)evidence->items[i];
+        while (*p) {
+            unsigned char c = *p;
             if (c == '"' || c == '\\') {
                 putchar('\\');
                 putchar(c);
+                p++;
             } else if (c < 0x20) {
                 printf("\\u%04x", c);
-            } else {
+                p++;
+            } else if (c < 0x80) {
                 putchar(c);
+                p++;
+            } else {
+                size_t remaining = strlen((const char *)p);
+                size_t n = c >= 0xc2 && c <= 0xdf ? 2 :
+                           c >= 0xe0 && c <= 0xef ? 3 :
+                           c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+                int valid = n && remaining >= n;
+                for (size_t j = 1; valid && j < n; j++)
+                    if ((p[j] & 0xc0) != 0x80) valid = 0;
+                if (valid && ((c == 0xe0 && p[1] < 0xa0) ||
+                              (c == 0xed && p[1] >= 0xa0) ||
+                              (c == 0xf0 && p[1] < 0x90) ||
+                              (c == 0xf4 && p[1] >= 0x90))) valid = 0;
+                if (valid) {
+                    for (size_t j = 0; j < n; j++) putchar(*p++);
+                } else {
+                    fputs("\\uFFFD", stdout);
+                    p++;
+                }
             }
         }
         putchar('"');
@@ -369,9 +432,11 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "check") == 0) {
         for (int i = argi; i < argc; i++) {
             int parsed = 0;
-            int r = classify_file(argv[i], &evidence, &parsed);
+            int fd = open(argv[i], O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+            int r = classify_file(fd, argv[i], &evidence, &parsed);
             if (r < 0) continue;
-            if (r > 0) found = 1;
+            if (r > found) found = r;
+            if (found == 2) break;
         }
     } else if (strcmp(mode, "scan") == 0) {
         if (argi + 1 != argc) {
@@ -379,7 +444,8 @@ int main(int argc, char **argv) {
             return 2;
         }
         int files = 0;
-        found = scan_directory(argv[argi], &evidence, 0, &files);
+        int fd = open(argv[argi], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd >= 0) found = scan_directory(fd, argv[argi], &evidence, 0, &files);
     } else {
         usage();
         return 2;
@@ -388,7 +454,7 @@ int main(int argc, char **argv) {
         print_json(&evidence, found);
     } else {
         for (size_t i = 0; i < evidence.count; i++) printf("evidence %s\n", evidence.items[i]);
-        printf("backend=%s\n", found ? "neptune" : "venus");
+        printf("backend=%s\n", backend_name(found));
     }
-    return found ? 0 : 1;
+    return found == 2 ? 0 : found == 1 ? 3 : 1;
 }

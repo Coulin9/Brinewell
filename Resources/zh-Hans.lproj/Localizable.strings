@@ -13,7 +13,6 @@
 "Other Options" = "其他选项";
 "Import Local DMG or Framework…" = "导入本地 DMG 或 Framework…";
 "Open Apple Downloads in Browser" = "在浏览器中打开 Apple 下载页";
-"Use Built-in Venus (KosmicKrisp) Instead" = "改用内置 Venus (KosmicKrisp) 图形后端";
 "Signing in to Apple Account…" = "正在登录 Apple 账号…";
 "Querying Apple Developer Downloads…" = "正在查询 Apple 官方下载目录…";
 "Mounting disk image…" = "正在挂载磁盘镜像…";
@@ -375,3 +374,6 @@
 "The Apple download redirect could not be verified." = "无法验证 Apple 下载重定向。";
 "The Apple download returned an invalid response." = "Apple 下载返回了无效响应。";
 "The Apple download exceeds the maximum permitted size." = "Apple 下载超过允许的最大大小。";
+
+"Automatic" = "自动";
+"Automatic routes each game using PCGamingWiki and a local cache, prioritizing D3DMetal (DX12/DX11), then Mullion (DX10), then Venus (Vulkan and others)." = "自动模式根据 PCGamingWiki 和本地缓存为每款游戏选择后端，优先使用 D3DMetal（DX12/DX11），其次是 Mullion（DX10），最后是 Venus（Vulkan 及其他）。";

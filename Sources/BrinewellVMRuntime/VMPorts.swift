@@ -7,6 +7,11 @@ import Foundation
 final class VMPorts {
     private let runDirectory: URL
     private let padWriter: (([UInt8]) -> Int)?
+    private let graphicsWriter: (([UInt8]) -> Int)?
+    private let graphicsResolver: any GameGraphicsBackendResolving
+    private let availableBackends: Set<GraphicsBackend>
+    private var graphicsGeneration: UInt64 = 0
+    private var graphicsResolutions: [String: Task<Void, Never>] = [:]
     private var descriptors: [Int32] = []
     private var master: Int32 = -1
     private var slave: Int32 = -1
@@ -31,6 +36,7 @@ final class VMPorts {
     private var graphicsLine = [UInt8]()
     private var graphicsOverflow = false
     private var graphicsPending = [UInt8]()
+    private var graphicsFramePartial = false
     private var graphicsWriteSource: DispatchSourceWrite?
     private var graphicsReady = false
     // The host owns the desired preference: retained for guest reconnects and
@@ -103,9 +109,15 @@ final class VMPorts {
         NSError(domain: "Brinewell.VMPorts", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: message])
     }
 
-    init(runDirectory: URL, padWriter: (([UInt8]) -> Int)? = nil) throws {
+    init(runDirectory: URL, padWriter: (([UInt8]) -> Int)? = nil,
+         graphicsWriter: (([UInt8]) -> Int)? = nil,
+         graphicsResolver: any GameGraphicsBackendResolving = PCGamingWikiResolver(),
+         availableBackends: Set<GraphicsBackend> = [.venus]) throws {
         self.runDirectory = runDirectory
         self.padWriter = padWriter
+        self.graphicsWriter = graphicsWriter
+        self.graphicsResolver = graphicsResolver
+        self.availableBackends = availableBackends
         do {
             var m: Int32 = -1, s: Int32 = -1
             guard openpty(&m, &s, nil, nil, nil) == 0 else { throw Self.error("openpty failed") }
@@ -343,7 +355,23 @@ final class VMPorts {
 
     private func sendGraphicsBackend() {
         guard graphicsReady, let backend = graphicsDesired else { return }
-        graphicsPending.append(contentsOf: "backend \(backend.rawValue)\n".utf8)
+        enqueueGraphicsControl("backend \(backend.rawValue)\n")
+    }
+
+    // Control frames precede queued resolutions, but never interrupt a frame
+    // whose prefix has already been written to the stream.
+    private func enqueueGraphicsControl(_ line: String) {
+        var index = 0
+        if graphicsFramePartial {
+            guard let end = graphicsPending.firstIndex(of: 10) else { return }
+            index = end + 1
+        }
+        while index < graphicsPending.count {
+            if graphicsPending[index...].starts(with: "resolved ".utf8) { break }
+            guard let end = graphicsPending[index...].firstIndex(of: 10) else { break }
+            index = end + 1
+        }
+        graphicsPending.insert(contentsOf: line.utf8, at: index)
         flushGraphics()
     }
 
@@ -353,18 +381,21 @@ final class VMPorts {
         let line = "hdr \(supported ? 1 : 0) \(maxLuminanceNits) \(maxFrameAverageLuminanceNits) \(minLuminance10000ths) \(sdrReferenceNits)\n"
         guard line != desiredDisplayHDR else { return }
         desiredDisplayHDR = line
-        if graphicsReady { graphicsPending.append(contentsOf: line.utf8); flushGraphics() }
+        if graphicsReady { enqueueGraphicsControl(line) }
     }
 
-    private func flushGraphics() {
+    func flushGraphics() {
         while !graphicsPending.isEmpty {
-            let written = graphicsPending.withUnsafeBytes { Darwin.write(graphicsWrite, $0.baseAddress!, $0.count) }
+            let written = graphicsWriter?(graphicsPending) ?? graphicsPending.withUnsafeBytes {
+                Darwin.write(graphicsWrite, $0.baseAddress!, $0.count)
+            }
             if written > 0 {
+                graphicsFramePartial = graphicsPending[written - 1] != 10
                 graphicsPending.removeFirst(written)
             } else if written < 0 && errno == EINTR {
                 continue
-            } else if written < 0 && errno == EAGAIN {
-                if graphicsWriteSource == nil, let duplicate = try? duplicateForSource(graphicsWrite) {
+            } else if written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if graphicsWriter == nil, graphicsWriteSource == nil, let duplicate = try? duplicateForSource(graphicsWrite) {
                     let source = DispatchSource.makeWriteSource(fileDescriptor: duplicate, queue: .main)
                     source.setEventHandler { [weak self] in
                         guard let self, !self.closed else { return }
@@ -376,8 +407,13 @@ final class VMPorts {
                 }
                 return
             } else {
-                graphicsPending.removeAll()
                 report("BRINEWELL graphics error: cannot write backend request")
+                graphicsPending.removeAll()
+                graphicsFramePartial = false
+                graphicsReady = false
+                resetGraphicsResolutions()
+                graphicsWriteSource?.cancel()
+                graphicsWriteSource = nil
                 return
             }
         }
@@ -385,15 +421,88 @@ final class VMPorts {
         graphicsWriteSource = nil
     }
 
-    private func readGraphics(_ bytes: [UInt8]) {
+    private func resetGraphicsResolutions() {
+        graphicsGeneration &+= 1
+        for task in graphicsResolutions.values { task.cancel() }
+        graphicsResolutions.removeAll()
+    }
+
+    private func resolveGraphics(_ line: String) {
+        let words = line.split(separator: " ", omittingEmptySubsequences: false)
+        guard words.count == 3, words[0] == "resolve" else {
+            report("BRINEWELL graphics invalid request: \(line)"); return
+        }
+        let id = String(words[1]), appText = String(words[2])
+        guard id.utf8.count == 32, id.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              !appText.isEmpty, appText.utf8.allSatisfy({ (48...57).contains($0) }),
+              let appID = UInt32(appText), appID > 0, String(appID) == appText else {
+            report("BRINEWELL graphics invalid request: \(line)"); return
+        }
+        guard graphicsReady, !closed else { return }
+        guard graphicsResolutions[id] == nil else { return }
+        if graphicsDesired != .automatic {
+            let desired = graphicsDesired?.rawValue ?? "unset"
+            if enqueueGraphicsResolution(id: id, backend: "venus") {
+                report("BRINEWELL graphics resolved app=\(appID) backend=\(GraphicsBackend.venus.rawValue) mode=\(desired)")
+            }
+            return
+        }
+        guard graphicsResolutions.count < 16 else { return }
+        let generation = graphicsGeneration
+        let resolver = graphicsResolver, available = availableBackends
+        graphicsResolutions[id] = Task { [weak self] in
+            let resolution = await resolver.resolveForGuest(appID: appID, availableBackends: available)
+            guard let self, !self.closed, self.graphicsReady, self.graphicsGeneration == generation,
+                  self.graphicsResolutions.removeValue(forKey: id) != nil else { return }
+            let wire: String
+            switch resolution {
+            case .concrete(let backend):
+                wire = backend.isConcrete && available.contains(backend) ? backend.rawValue : "venus"
+            case .probeLocal(let allowMullion):
+                wire = allowMullion && available.contains(.mullion) ? "probe" : "probe_nomullion"
+            }
+            if self.enqueueGraphicsResolution(id: id, backend: wire) {
+                report("BRINEWELL graphics resolved app=\(appID) backend=\(wire)")
+            }
+        }
+    }
+
+    private func enqueueGraphicsResolution(id: String, backend: String) -> Bool {
+        let frame = Array("resolved \(id) \(backend)\n".utf8)
+        // Count a partial first frame conservatively, since its prefix is gone.
+        var resolutionBytes = 0
+        var start = 0
+        while start < graphicsPending.count, let end = graphicsPending[start...].firstIndex(of: 10) {
+            if (start == 0 && graphicsFramePartial) || graphicsPending[start...].starts(with: "resolved ".utf8) {
+                resolutionBytes += end - start + 1
+            }
+            start = end + 1
+        }
+        guard resolutionBytes + frame.count <= 4096 else { return false }
+        graphicsPending.append(contentsOf: frame)
+        flushGraphics()
+        return true
+    }
+
+    func readGraphics(_ bytes: [UInt8]) {
+        guard !closed else { return }
         for line in Self.lines(bytes, buffer: &graphicsLine, overflow: &graphicsOverflow) {
             if line == "ready" {
+                resetGraphicsResolutions()
+                if graphicsFramePartial, let end = graphicsPending.firstIndex(of: 10) {
+                    graphicsPending.removeSubrange((end + 1)..<graphicsPending.count)
+                } else {
+                    graphicsPending.removeAll()
+                    graphicsFramePartial = false
+                }
                 graphicsReady = true
                 sendGraphicsBackend()
-                if let line = desiredDisplayHDR { graphicsPending.append(contentsOf: line.utf8); flushGraphics() }
+                if graphicsReady, let line = desiredDisplayHDR { enqueueGraphicsControl(line) }
+                if graphicsPending.isEmpty { flushGraphics() }
                 continue
             }
             if line == "applied hdr" { continue }
+            if line == "resolve" || line.hasPrefix("resolve ") { resolveGraphics(line); continue }
             let words = line.split(separator: " ")
             if words.count == 2, words[0] == "applied",
                let mode = GraphicsBackend(rawValue: String(words[1])) {
@@ -659,6 +768,7 @@ final class VMPorts {
         ready = false
         uuReady = false
         graphicsReady = false
+        resetGraphicsResolutions()
         graphicsWriteSource?.cancel()
         graphicsWriteSource = nil
         graphicsPending.removeAll()

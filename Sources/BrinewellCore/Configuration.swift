@@ -74,19 +74,19 @@ public struct HostCapabilities: Codable, Sendable {
 }
 
 public enum GraphicsBackend: String, Codable, Sendable, CaseIterable {
-    case venus
+    case automatic
     case neptune
     case mullion
+    case venus
 
     public var title: String { rawValue }
+    public var isConcrete: Bool { self != .automatic }
+    public var requiresD3DMetalSetup: Bool { self == .automatic || self == .neptune }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         let value = try container.decode(String.self)
-        // Preserve the rest of older configurations while retiring auto-selection.
-        if value == "automatic" {
-            self = .neptune
-        } else if let backend = Self(rawValue: value) {
+        if let backend = Self(rawValue: value) {
             self = backend
         } else {
             throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid graphics backend: \(value)")
@@ -185,7 +185,7 @@ public struct VMConfiguration: Codable, Equatable, Sendable {
     public var pendingDiskShrink: PendingDiskShrink?
 
     public init(diskImagePath: String? = nil, cpuCount: Int, memoryGiB: Int,
-                graphicsBackend: GraphicsBackend = .neptune,
+                graphicsBackend: GraphicsBackend = .automatic,
                 d3dMetalFrameworkPath: String? = nil,
                 neptuneApertureMiB: Int = 32768,
                 neptuneMultiRing: Bool = false,
@@ -222,7 +222,7 @@ public struct VMConfiguration: Codable, Equatable, Sendable {
         cpuCount = try container.decode(Int.self, forKey: .cpuCount)
         memoryGiB = try container.decode(Int.self, forKey: .memoryGiB)
         display = try container.decodeIfPresent(VMDisplayConfiguration.self, forKey: .display) ?? VMDisplayConfiguration()
-        graphicsBackend = try container.decodeIfPresent(GraphicsBackend.self, forKey: .graphicsBackend) ?? .neptune
+        graphicsBackend = try container.decodeIfPresent(GraphicsBackend.self, forKey: .graphicsBackend) ?? .automatic
         d3dMetalFrameworkPath = try container.decodeIfPresent(String.self, forKey: .d3dMetalFrameworkPath)
         neptuneApertureMiB = try container.decodeIfPresent(Int.self, forKey: .neptuneApertureMiB) ?? 32768
         neptuneMultiRing = try container.decodeIfPresent(Bool.self, forKey: .neptuneMultiRing) ?? false

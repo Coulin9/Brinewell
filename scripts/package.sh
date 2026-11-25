@@ -35,6 +35,7 @@ for f in \
     "$OUT/swift/Brinewell" \
     "$OUT/swift/brinewell-vm" \
     "$OUT/swift/brinewell-diagnostics" \
+    "$ROOT/Resources/steam-graphics-index.json" \
     "$ROOT/Resources/Brinewell.icns" \
     "$ROOT/Resources/org.brinewell.render-context.plist"; do
     [[ -f "$f" ]] || die "missing packaging input: ${f#"$ROOT"/}"
@@ -46,6 +47,35 @@ for f in \
         verify_component_artifacts "$component" "$input" "$f"
     fi
 done
+python3 - "$ROOT/Resources/steam-graphics-index.json" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+try:
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 20 * 1024 * 1024:
+        raise ValueError('index must be a nonempty regular file of at most 20 MiB')
+    with open(path, encoding='utf-8') as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict) or type(data.get('schemaVersion')) is not int or data['schemaVersion'] != 1:
+        raise ValueError('expected schemaVersion 1')
+    for key in ('generatedAt', 'source'):
+        if not isinstance(data.get(key), str) or not data[key]:
+            raise ValueError(f'{key} must be a nonempty string')
+    total = 0
+    for key in ('neptune', 'mullion', 'venus'):
+        values = data.get(key)
+        if not isinstance(values, list) or any(type(value) is not int or not 1 <= value <= 0xffffffff for value in values):
+            raise ValueError(f'{key} must be an array of valid AppIDs')
+        total += len(values)
+    if not total:
+        raise ValueError('index has no entries')
+except (OSError, ValueError) as error:
+    sys.exit(f'Invalid graphics index: {error}')
+PY
 log "packaging inputs verified"
 [[ "${1:-}" != --check ]] || exit 0
 
@@ -73,6 +103,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Runtime" \
 
 cp "$OUT/swift/Brinewell" "$OUT/swift/brinewell-vm" "$OUT/swift/brinewell-diagnostics" "$APP/Contents/MacOS/"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/Resources/steam-graphics-index.json" "$APP/Contents/Resources/steam-graphics-index.json"
 for language in "${localizations[@]}"; do
     destination="$APP/Contents/Resources/$language.lproj"
     mkdir -p "$destination"

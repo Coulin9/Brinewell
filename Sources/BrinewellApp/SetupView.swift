@@ -7,19 +7,17 @@ struct SetupView: View {
     @ObservedObject var d3dMetalDeployment: D3DMetalDeployment
     let readiness: SetupReadiness
     @Binding var currentStep: SetupStep
-    let onUseVenus: () -> Void
     let onDismiss: () -> Void
     @State private var showsProgress: Bool
 
     init(model: AppModel, diskDeployment: DiskDeployment, d3dMetalDeployment: D3DMetalDeployment,
          readiness: SetupReadiness, currentStep: Binding<SetupStep>,
-         onUseVenus: @escaping () -> Void, onDismiss: @escaping () -> Void) {
+         onDismiss: @escaping () -> Void) {
         self.model = model
         self.diskDeployment = diskDeployment
         self.d3dMetalDeployment = d3dMetalDeployment
         self.readiness = readiness
         self._currentStep = currentStep
-        self.onUseVenus = onUseVenus
         self.onDismiss = onDismiss
         self._showsProgress = State(initialValue: readiness.neededSteps.count > 1)
     }
@@ -42,7 +40,7 @@ struct SetupView: View {
                 DiskDeploymentView(model: model, deployment: diskDeployment)
             case .graphics:
                 GraphicsSetupView(d3dMetalDeployment: d3dMetalDeployment, readiness: readiness,
-                                  onUseVenus: onUseVenus, onDismiss: onDismiss, onRecheck: { model.recheckRosetta() })
+                                  onDismiss: onDismiss, onRecheck: { model.recheckRosetta() })
             }
         }
         .background(.regularMaterial)

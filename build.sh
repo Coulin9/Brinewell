@@ -6,6 +6,7 @@
 #   ./build.sh --component NAME [--clean]   build one component (incremental unless --clean)
 #   ./build.sh --reuse kernel,layer     reuse only the named artifacts
 #   ./build.sh --reuse all              reuse every native/guest artifact
+#   ./build.sh --refresh-graphics-index  refresh the online index before packaging (full builds only)
 #   ./build.sh --list-components
 set -euo pipefail
 
@@ -40,9 +41,11 @@ COMPONENTS=(
 REUSE=""
 ONLY=""
 CLEAN=0
+REFRESH_GRAPHICS_INDEX=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --clean) CLEAN=1; shift ;;
+        --refresh-graphics-index) REFRESH_GRAPHICS_INDEX=1; shift ;;
         --reuse)
             [[ $# -ge 2 ]] || die "--reuse requires a list or 'all'"
             REUSE="$2"; shift 2 ;;
@@ -51,10 +54,14 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || die "--component requires a name"
             ONLY="$2"; shift 2 ;;
         --list-components) printf '%s\n' "${COMPONENTS[@]}"; exit 0 ;;
-        -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
+
+if [[ $REFRESH_GRAPHICS_INDEX -eq 1 && -n "$ONLY" ]]; then
+    die "--refresh-graphics-index cannot be combined with --component"
+fi
 
 if [[ -n "$REUSE" ]]; then
     [[ $CLEAN -eq 0 ]] || die "--clean cannot be combined with --reuse"
@@ -104,5 +111,8 @@ START=$(date +%s)
 for name in "${COMPONENTS[@]}"; do
     run_component "$name"
 done
+if [[ $REFRESH_GRAPHICS_INDEX -eq 1 ]]; then
+    "$ROOT/scripts/refresh-graphics-index.sh"
+fi
 "$ROOT/scripts/package.sh"
 log "build complete in $(( $(date +%s) - START ))s: ${APP#"$ROOT"}"

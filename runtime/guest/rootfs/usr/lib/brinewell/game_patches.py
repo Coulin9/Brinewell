@@ -141,14 +141,6 @@ def prepare(profile, command, environment, cmdline):
                if environment.get(name)}
     if app_ids != {appid}:
         return command, environment, None
-    # The patches are Neptune-only: require a live Neptune backend and a real
-    # selected Proton launch, never the immutable cmdline or a tool name.
-    try:
-        mode = MODE_FILE.read_text().strip()
-    except OSError:
-        mode = ""
-    if mode not in ("neptune", "mullion"):
-        return command, environment, None
     install_value = environment.get("STEAM_COMPAT_INSTALL_PATH", "")
     prefix_value = environment.get("STEAM_COMPAT_DATA_PATH", "")
     if not os.path.isabs(install_value) or not os.path.isabs(prefix_value):
@@ -172,8 +164,7 @@ def prepare(profile, command, environment, cmdline):
     verb_index += offset
     fex = verb_index >= 2 and Path(command[verb_index - 2]).name == "FEXCompatTool"
     arch = graphics.select_arch(tool, environment, fex)
-    backend = "mullion" if mode == "mullion" else "d3dmetal"
-    if arch is None or (backend == "d3dmetal" and arch != "x86_64"):
+    if arch is None:
         return command, environment, None
     if graphics.graphics_overridden(environment):
         return command, environment, None
@@ -188,11 +179,20 @@ def prepare(profile, command, environment, cmdline):
         return command, environment, None
     index = verb_index + 1
     name = executable.name.lower()
+    if ((appid == "1091500" and name != "redprelauncher.exe")
+            or (appid == "2622380" and name not in ("nightreign.exe", "start_protected_game.exe"))
+            or (appid == "814380" and name != "sekiro.exe")):
+        return command, environment, None
+    try:
+        mode = MODE_FILE.read_text().strip()
+    except OSError:
+        mode = ""
+    mode = graphics.effective_mode(mode, appid, exe_path=value, install_dir=install_value)
+    if mode not in ("neptune", "mullion") or (mode == "neptune" and arch != "x86_64"):
+        return command, environment, None
     identity = {"appid": appid, "prefix": str(Path(prefix_value).resolve() / "pfx"),
                 "executable": str(executable), "affinity": False}
     if appid == "1091500":
-        if name != "redprelauncher.exe":
-            return command, environment, None
         if "--launcher-skip" not in command[index + 1:]:
             command.append("--launcher-skip")
     elif appid == "223850":
@@ -203,14 +203,10 @@ def prepare(profile, command, environment, cmdline):
                             install / "dlc/time-spy-test/bin/x64/d3dcompiler_47.dll",
                             patch_state_dir(appid))
     elif appid == "2622380":
-        if name not in ("nightreign.exe", "start_protected_game.exe"):
-            return command, environment, None
         identity["affinity"] = True
         identity["processes"] = ("nightreign.exe", "start_protected")
         identity["game"] = "nightreign.exe"
     elif appid == "814380":
-        if name != "sekiro.exe":
-            return command, environment, None
         identity["affinity"] = True
         identity["processes"] = ("sekiro.exe",)
         identity["game"] = "sekiro.exe"

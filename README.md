@@ -133,7 +133,7 @@ start.
   through the proxy over TCP. Failed connections never fall back to a direct connection,
   and ICMP is not tunnelled. Restart the VM after switching Wi-Fi or Ethernet.
 - **Shared folder.** Choose a Mac folder, read-only by default, accessible at
-  `/run/brinewell/shared` (a symlink to `/run/media/brinewell-share-<id>`). Turn off
+  `/run/brinewell/shared` (a symlink to `/run/media/bw-<id8>`). Turn off
   Read Only and restart the VM to make supported folders available as a Steam library
   in Gaming Mode **Settings → Storage** for game downloads. The `/run/media/` mount
   lets Steam and Proton containers access it. A folder that is empty (ignoring macOS
@@ -471,6 +471,10 @@ digests are in `.build/` and `build/manifest.json`.
 
 ### Packaging
 
+- Before building a release, refresh the bundled offline Steam graphics index with
+  `./scripts/refresh-graphics-index.sh`, or use `./build.sh --refresh-graphics-index`
+  to refresh it before packaging. The refresh uses the network; ordinary builds do not
+  refresh the index. The helper accepts updater options such as `--proxy` and `--dry-run`.
 - `./scripts/package.sh` rebuilds `build/Brinewell.app` from existing artifacts. It first
   checks every artifact against the recorded SHA-256, and re-checks Swift sources and
   dependencies. It refuses to touch the existing bundle if anything is missing, stale or

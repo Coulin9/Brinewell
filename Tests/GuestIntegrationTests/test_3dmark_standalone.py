@@ -46,6 +46,55 @@ class Standalone3DMarkTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
 
+    def test_automatic_live_backend(self):
+        mode = self.root / "mode"
+        mode.write_text("automatic\n")
+        with patch.object(standalone, "MODE_FILE", mode):
+            for resolved, expected in (("neptune", "d3dmetal"), ("mullion", "mullion"), ("venus", None)):
+                with self.subTest(resolved=resolved), patch.object(
+                        standalone.graphics, "effective_mode", return_value=resolved) as lookup:
+                    self.assertEqual(standalone.live_backend(), expected)
+                    lookup.assert_called_once_with("automatic", "223850")
+            with patch.object(standalone.graphics, "DEFAULT_RESOLVE_SOCK", str(self.root / "missing")):
+                self.assertIsNone(standalone.live_backend())
+
+    def test_install_does_not_resolve_automatic_backend(self):
+        installer = self.root / "data_x64.msi"
+        installer.touch()
+        mode = self.root / "mode"
+        mode.write_text("automatic\n")
+        with patch.object(sys, "argv", ["3dmark-standalone", "--install", str(installer)]), \
+             patch.dict(standalone.os.environ, {"DISPLAY": ":0", "XDG_CURRENT_DESKTOP": "KDE"}), \
+             patch.object(standalone.os, "umask"), \
+             patch.object(Path, "home", return_value=self.root), \
+             patch.object(standalone, "MODE_FILE", mode), \
+             patch.object(standalone.graphics, "resolve_backend_for_app") as resolve, \
+             patch.object(standalone, "wine_command", return_value=(["wine"], {})), \
+             patch.object(standalone.subprocess, "run"), \
+             patch.object(standalone, "install_app"):
+            standalone.main()
+        resolve.assert_not_called()
+
+    def test_launch_resolves_automatic_backend_once(self):
+        game = self.root / "3dmark-standalone/pfx/drive_c/Program Files/UL/3DMark"
+        game.mkdir(parents=True)
+        (game / "3DMark.exe").touch()
+        mode = self.root / "mode"
+        mode.write_text("automatic\n")
+        with patch.object(sys, "argv", ["3dmark-standalone"]), \
+             patch.dict(standalone.os.environ, {"DISPLAY": ":0", "XDG_CURRENT_DESKTOP": "KDE"}), \
+             patch.object(standalone.os, "umask"), \
+             patch.object(Path, "home", return_value=self.root), \
+             patch.object(standalone, "MODE_FILE", mode), \
+             patch.object(standalone.graphics, "resolve_backend_for_app", return_value="mullion") as resolve, \
+             patch.object(standalone, "wine_command", return_value=(["wine"], {})) as wine, \
+             patch.object(standalone, "browser_command", return_value=["browser"]), \
+             patch.object(standalone, "open_desktop", return_value=["browser"]), \
+             patch.object(standalone.os, "execvp"):
+            standalone.main()
+        resolve.assert_called_once_with("223850", sock_path=None, timeout=6.0)
+        wine.assert_called_once_with(self.root / "3dmark-standalone", "mullion")
+
     def run_metrics_repair(self, metrics):
         registry = self.root / "registry.json"
         registry.write_text(json.dumps(metrics))

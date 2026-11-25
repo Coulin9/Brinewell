@@ -62,6 +62,47 @@ class GamePatchTests(unittest.TestCase):
                 str(self.tool / "proton"),
                 "waitforexitandrun", str(executable), *arguments]
 
+    def test_automatic_only_applies_resolved_neptune_patches(self):
+        self.mode.write_text("automatic\n")
+        command = self.command("REDprelauncher.exe")
+        for backend, expected in (("neptune", True), ("mullion", True), ("venus", False)):
+            with self.subTest(backend=backend), patch.object(
+                    game_patches.graphics, "resolve_backend_for_app", return_value=backend):
+                changed, _, identity = game_patches.prepare(
+                    "cyberpunk2077", command, self.environment, "")
+                self.assertEqual(identity is not None, expected)
+                self.assertEqual("--launcher-skip" in changed, expected)
+
+    def test_automatic_probe_after_qualification(self):
+        self.mode.write_text("automatic\n")
+        command = self.command("REDprelauncher.exe")
+        with patch.object(game_patches.graphics, "resolve_backend_for_app", return_value="probe"), \
+             patch.object(game_patches.graphics, "probe_local_backend", return_value="neptune") as probe:
+            changed, _, identity = game_patches.prepare("cyberpunk2077", command, self.environment, "")
+        self.assertIsNotNone(identity)
+        self.assertIn("--launcher-skip", changed)
+        self.assertEqual(probe.call_args.args[:2], (command[-1], str(self.install)))
+
+    def test_automatic_runinprefix_never_resolves(self):
+        self.mode.write_text("automatic\n")
+        command = self.command("REDprelauncher.exe")
+        command[-2] = "runinprefix"
+        with patch.object(game_patches.graphics, "resolve_backend_for_app") as resolve:
+            changed, environment, identity = game_patches.prepare(
+                "cyberpunk2077", command, self.environment, "")
+        resolve.assert_not_called()
+        self.assertEqual((changed, environment, identity), (command, self.environment, None))
+
+    def test_automatic_sekiro_launcher_never_connects_to_resolve_socket(self):
+        self.mode.write_text("automatic\n")
+        command = self.command("launcher.exe")
+        environment = dict(self.environment, SteamAppId="814380")
+        with patch.object(game_patches.graphics.socket, "socket") as socket:
+            changed, actual_environment, identity = game_patches.prepare(
+                "sekiro", command, environment, "")
+        socket.assert_not_called()
+        self.assertEqual((changed, actual_environment, identity), (command, environment, None))
+
     def test_cyberpunk_only_changes_game_arguments(self):
         command = self.command("REDprelauncher.exe", "--intro-skip")
         changed, environment, identity = game_patches.prepare(

@@ -115,7 +115,7 @@ Brinewell 四轮显卡分数为 10548、10481、10463、10478，极差 0.8%；�
   （服务端须支持 UDP ASSOCIATE）；HTTP(S) 通过 CONNECT 只转发 TCP。客体 DNS 通过 TCP 经代理
   查询。连接失败不会自动改为直连，也不提供 ICMP 隧道。切换 Wi-Fi 或网线后需重启虚拟机。
 - **共享文件夹**：选择一个 Mac 目录，默认只读，可通过 `/run/brinewell/shared` 访问
-  （它是指向 `/run/media/brinewell-share-<id>` 的符号链接）。关闭“只读”并重启虚拟机后，
+  （它是指向 `/run/media/bw-<id8>` 的符号链接）。关闭“只读”并重启虚拟机后，
   支持的文件夹会出现在游戏模式的 **设置 → 存储** 中，可作为 Steam 库下载游戏；
   `/run/media/` 挂载位置使 Steam 和 Proton 容器可以访问它。空文件夹（忽略 `.DS_Store` 等
   macOS 系统文件）或根目录已有 Steam 库（`steamapps/` 或 `libraryfolder.vdf`）的文件夹直接
@@ -382,6 +382,9 @@ cd Brinewell
 
 ### 打包
 
+- 构建发布版本前，运行 `./scripts/refresh-graphics-index.sh` 更新内置的离线 Steam 图形索引，
+  或使用 `./build.sh --refresh-graphics-index` 在打包前更新。更新需要网络；普通构建不会刷新索引。
+  脚本支持 `--proxy`、`--dry-run` 等更新工具选项。
 - `./scripts/package.sh` 用已有制品更新 `build/Brinewell.app`。它会先核对所有制品与构建记录中的
   SHA-256，并重新校验 Swift 源码和依赖；有缺失、过期或被替换的制品时，在修改现有应用包前拒绝
   打包。`./scripts/package.sh --check` 只运行校验。

@@ -131,6 +131,13 @@ final class D3DMetalFrameworkTests: XCTestCase {
         XCTAssertEqual(evaluate().neededSteps, [.systemDisk])
         config.d3dMetalFrameworkPath = nil
         XCTAssertEqual(evaluate().nextStep(after: .systemDisk), .graphics)
+        for backend in [GraphicsBackend.automatic, .neptune] {
+            config.graphicsBackend = backend
+            XCTAssertEqual(evaluate().graphics, .d3dMetalMissing)
+            config.d3dMetalFrameworkPath = framework.path
+            XCTAssertEqual(evaluate(rosetta: false).graphics, .rosettaMissing)
+            config.d3dMetalFrameworkPath = nil
+        }
         for backend in [GraphicsBackend.venus, .mullion] {
             config.graphicsBackend = backend
             XCTAssertEqual(evaluate().neededSteps, [.systemDisk])

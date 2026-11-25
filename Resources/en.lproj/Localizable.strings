@@ -15,7 +15,6 @@
 "Other Options" = "Other Options";
 "Import Local DMG or Framework…" = "Import Local DMG or Framework…";
 "Open Apple Downloads in Browser" = "Open Apple Downloads in Browser";
-"Use Built-in Venus (KosmicKrisp) Instead" = "Use Built-in Venus (KosmicKrisp) Instead";
 "Signing in to Apple Account…" = "Signing in to Apple Account…";
 "Querying Apple Developer Downloads…" = "Querying Apple Developer Downloads…";
 "Mounting disk image…" = "Mounting disk image…";
@@ -83,3 +82,6 @@
 "The Apple download redirect could not be verified." = "The Apple download redirect could not be verified.";
 "The Apple download returned an invalid response." = "The Apple download returned an invalid response.";
 "The Apple download exceeds the maximum permitted size." = "The Apple download exceeds the maximum permitted size.";
+
+"Automatic" = "Automatic";
+"Automatic routes each game using PCGamingWiki and a local cache, prioritizing D3DMetal (DX12/DX11), then Mullion (DX10), then Venus (Vulkan and others)." = "Automatic routes each game using PCGamingWiki and a local cache, prioritizing D3DMetal (DX12/DX11), then Mullion (DX10), then Venus (Vulkan and others).";

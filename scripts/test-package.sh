@@ -35,6 +35,8 @@ with tempfile.TemporaryDirectory(prefix='brinewell-package-test-') as temp:
     (root / 'Package.swift').write_text('// fixture package\n')
     (root / 'Resources/Brinewell.icon').mkdir(parents=True)
     (root / 'Resources/Brinewell.icns').touch()
+    index = root / 'Resources/steam-graphics-index.json'
+    index.write_text(json.dumps(dict(schemaVersion=1, generatedAt='fixture', source='PCGamingWiki', neptune=[730], mullion=[], venus=[])))
     shutil.copy(source / 'Resources/org.brinewell.render-context.plist',
                 root / 'Resources/org.brinewell.render-context.plist')
     localizations = ('en', 'zh-Hans')
@@ -146,6 +148,15 @@ stamp_write "$name" "$input" "$@"
     unchanged('valid --check')
     print('PASS: valid --check leaves installed bundle and manifest unchanged')
 
+    valid_index = index.read_text()
+    invalid_index = json.loads(valid_index)
+    invalid_index['neptune'] = ['730']
+    index.write_text(json.dumps(invalid_index))
+    rejected('invalid graphics index', 'Invalid graphics index')
+    rejected('invalid graphics index --check', 'Invalid graphics index',
+             ['bash', str(package), '--check'])
+    index.write_text(valid_index)
+
     stamp = root / '.build/stamps/swift.json'
     saved_stamp = stamp.read_bytes()
     stamp.unlink()
@@ -191,6 +202,7 @@ stamp_write "$name" "$input" "$@"
 
     subprocess.run(['bash', str(package)], env=env, check=True)
     assert (app / 'Contents/registered-marker').is_file(), 'bundle was not published'
+    assert (app / 'Contents/Resources/steam-graphics-index.json').read_bytes() == index.read_bytes()
     assert app.stat().st_mtime > old_mtime, 'outer bundle mtime stayed stale'
     assert not sentinel.exists(), 'old executable remained in published bundle'
     for path in app.rglob('*'):

@@ -95,7 +95,11 @@ public final class Runtime {
         display.displayRefreshRate = Double(options.display.refreshRate)
         display.setGameHUD(level: options.gameHUDLevel, position: options.gameHUDPosition)
         network = try RuntimeNetwork(directory: options.runDirectory)
-        ports = try VMPorts(runDirectory: options.runDirectory)
+        let indexURL = options.resources.deletingLastPathComponent().appendingPathComponent("steam-graphics-index.json")
+        let index = SteamGraphicsIndex.loadIfPresent(from: indexURL)
+            ?? SteamGraphicsIndex.loadIfPresent(from: Bundle.main.url(forResource: "steam-graphics-index", withExtension: "json"))
+        ports = try VMPorts(runDirectory: options.runDirectory, graphicsResolver: PCGamingWikiResolver(bundledIndex: index),
+                            availableBackends: options.availableBackends)
         display.hardwareSample = { [weak ports] in ports?.hardwareSample() }
         do {
             input = try VMInput()
@@ -181,9 +185,9 @@ public final class Runtime {
                 if neptune.multiRing { cmdline += " brinewell.neptune.multi_ring=1" }
             }
             if let folder = options.sharedFolder {
-                // Use the guest caller's UID/GID so deck can access directories owned by the Mac user.
-                try krunCheck("krun_add_virtiofs4", krun_add_virtiofs4(
-                    ctx, "brinewell-share", folder.path, 0, folder.readOnly, UInt32(KRUN_SEMANTICS_LINUX_SIMPLIFIED)
+                // Present the share as owned by steamos, with a five-second attribute cache.
+                try krunCheck("krun_add_virtiofs5", krun_add_virtiofs5(
+                    ctx, "brinewell-share", folder.path, 0, folder.readOnly, 1000, 1000, 5
                 ))
                 cmdline += sharedFolderKernelArguments(folder)
             }

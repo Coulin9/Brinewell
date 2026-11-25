@@ -166,7 +166,7 @@ public struct RuntimeOptions {
             }
             backend = parsed
         } else {
-            backend = .neptune
+            backend = .automatic
         }
 
         let aperture: Int
@@ -280,11 +280,11 @@ public struct RuntimeOptions {
         neptuneD3DMetal = d3dmetal.support
         neptuneMullion = mullion.support
         var reasons: [GraphicsBackend: String] = [:]
-        if let reason = d3dmetal.reason { reasons[.neptune] = reason }
+        if let reason = d3dmetal.reason { reasons[.neptune] = reason; reasons[.automatic] = reason }
         if let reason = mullion.reason { reasons[.mullion] = reason }
         neptuneReasons = reasons
         switch backend {
-        case .neptune:
+        case .automatic, .neptune:
             neptune = d3dmetal.support
         case .mullion:
             neptune = mullion.support
@@ -309,7 +309,7 @@ public struct RuntimeOptions {
 
     func neptuneSupport(for backend: GraphicsBackend) -> NeptuneSupport? {
         switch backend {
-        case .neptune: return neptuneD3DMetal
+        case .automatic, .neptune: return neptuneD3DMetal
         case .mullion: return neptuneMullion
         case .venus: return nil
         }
@@ -317,7 +317,7 @@ public struct RuntimeOptions {
 
     var availableBackends: Set<GraphicsBackend> {
         var set: Set<GraphicsBackend> = [.venus]
-        if neptuneD3DMetal != nil { set.insert(.neptune) }
+        if neptuneD3DMetal != nil { set.formUnion([.automatic, .neptune]) }
         if neptuneMullion != nil { set.insert(.mullion) }
         return set
     }

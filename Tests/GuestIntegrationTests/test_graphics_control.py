@@ -27,6 +27,10 @@ class GraphicsControlTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.state = self.root / "graphics-backend"
+        self.sock_path = str(self.root / "resolve.sock")
+        env_patcher = patch.dict(os.environ, {"BRINEWELL_GRAPHICS_RESOLVE_SOCK": self.sock_path})
+        self.addCleanup(env_patcher.stop)
+        env_patcher.start()
         self.host, self.guest = socket.socketpair()
         self.addCleanup(self.host.close)
         self.addCleanup(self.guest.close)
@@ -45,6 +49,75 @@ class GraphicsControlTests(unittest.TestCase):
         self.thread.start()
         # First line is always readiness.
         self.assertEqual(self.host_file.readline().strip(), b"ready")
+
+    def connect_resolver(self, appid):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.settimeout(3)
+        client.connect(self.sock_path)
+        client.sendall(appid + b"\n")
+        return client
+
+    def test_override_parent_permissions_are_preserved(self):
+        self.assertEqual(self.root.stat().st_mode & 0o7777, 0o700)
+
+    def test_idle_client_burst_is_bounded_and_host_remains_responsive(self):
+        with patch.object(control, "CLIENT_TIMEOUT", 10):
+            clients = []
+            for _ in range(control.MAX_CLIENT_CONNS + 1):
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.addCleanup(client.close)
+                client.settimeout(3)
+                client.connect(self.sock_path)
+                clients.append(client)
+            self.assertEqual(clients[-1].recv(64), b"venus\n")
+            self.host_file.write(b"backend venus\nhdr 1 576 576 50 480\n")
+            self.assertEqual(self.host_file.readline(), b"applied venus\n")
+            self.assertEqual(self.host_file.readline(), b"applied hdr\n")
+
+    def test_automatic_resolution_multiplexes_and_ignores_stale(self):
+        self.host_file.write(b"backend automatic\n")
+        self.assertEqual(self.host_file.readline(), b"applied automatic\n")
+        self.assertEqual(self.state.read_text(), "automatic\n")
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(os.stat(self.sock_path).st_mode & 0o777, 0o666)
+        clients = [self.connect_resolver(str(i).encode()) for i in (1, 2, 3)]
+        requests = [self.host_file.readline().decode().split() for _ in clients]
+        self.assertEqual([r[2] for r in requests], ["1", "2", "3"])
+        for request in requests:
+            self.assertRegex(request[1], r"^[0-9a-f]{32}$")
+        self.host_file.write(b"resolved 00000000000000000000000000000000 neptune\n"
+                             b"backend venus\nhdr 1 576 576 50 480\n")
+        self.assertEqual(self.host_file.readline(), b"applied venus\n")
+        self.assertEqual(self.host_file.readline(), b"applied hdr\n")
+        for index, mode in ((2, "venus"), (0, "neptune"), (1, "mullion")):
+            self.host_file.write(f"resolved {requests[index][1]} {mode}\n".encode())
+            self.assertEqual(clients[index].recv(64), (mode + "\n").encode())
+        self.assertEqual(self.state.read_text(), "venus\n")
+
+    def test_probe_directives_are_forwarded(self):
+        for token in ("probe", "probe_nomullion"):
+            client = self.connect_resolver(b"42")
+            request = self.host_file.readline().split()
+            self.host_file.write(b"resolved " + request[1] + b" " + token.encode() + b"\n")
+            self.assertEqual(client.recv(64), token.encode() + b"\n")
+
+    def test_invalid_timeout_and_disconnect(self):
+        for appid in (b"0", b"01", b"4294967296", b"-1", b"x"):
+            self.assertEqual(self.connect_resolver(appid).recv(64), b"venus\n")
+        with patch.object(control, "RESOLVE_TIMEOUT", 0.1):
+            client = self.connect_resolver(b"1")
+            request = self.host_file.readline().split()
+            self.assertEqual(client.recv(64), b"venus\n")
+            self.host_file.write(b"resolved " + request[1] + b" neptune\n")
+        client = self.connect_resolver(b"2")
+        self.assertEqual(self.host_file.readline().split()[2], b"2")
+        self.host_file.close()
+        self.host.close()
+        self.assertEqual(client.recv(64), b"venus\n")
+        self.thread.join(3)
+        self.assertEqual(self.result, [2])
+        self.assertFalse(os.path.exists(self.sock_path))
 
     def test_backend_apply_ack_and_eof_restart(self):
         self.host_file.write(b"backend mullion\n")
@@ -113,6 +186,7 @@ class GraphicsControlTests(unittest.TestCase):
         # The virtio port is a character device; drive main() through a pty.
         self.host_file.close()
         self.host.close()
+        self.thread.join(timeout=5)
         master, slave = os.openpty()
         tty.setraw(master)
         tty.setraw(slave)

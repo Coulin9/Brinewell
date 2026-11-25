@@ -6,7 +6,6 @@ import UniformTypeIdentifiers
 struct GraphicsSetupView: View {
     @ObservedObject var d3dMetalDeployment: D3DMetalDeployment
     let readiness: SetupReadiness
-    let onUseVenus: () -> Void
     let onDismiss: () -> Void
     let onRecheck: () -> Void
 
@@ -69,7 +68,6 @@ struct GraphicsSetupView: View {
                             Button("Open Apple Downloads in Browser") {
                                 NSWorkspace.shared.open(AppleDeveloperCatalog.downloadsPageURL)
                             }
-                            Button("Use Built-in Venus (KosmicKrisp) Instead") { onUseVenus() }
                         }.padding(.top, 8)
                     }.disabled(d3dMetalDeployment.isActive)
                 }

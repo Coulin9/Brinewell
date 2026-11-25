@@ -126,6 +126,111 @@ class GraphicsWrapTests(unittest.TestCase):
     def game(self, verb="waitforexitandrun", mode="venus", **kw):
         return self.run_wrap([verb, "/game/game.exe", "--opt"], mode=mode, **kw)
 
+    def test_automatic_uses_concrete_injection_and_cleanup(self):
+        compat = self._make_prefix()
+        self._ngx_payload()
+        with patch.object(graphics, "resolve_backend_for_app", return_value="neptune") as resolve:
+            argv = self.game(mode="automatic", env=self._ngx_env(compat))
+            self.assertCandidate(argv)
+            self.assertEqual(self._setenvs(argv)["BRINEWELL_NEPTUNE_BACKEND"], "d3dmetal")
+            resolve.assert_called_once()
+        with patch.object(graphics, "resolve_backend_for_app", return_value="mullion"):
+            argv = self.game(mode="automatic", env=self._ngx_env(compat))
+            self.assertEqual(self._setenvs(argv)["BRINEWELL_NEPTUNE_BACKEND"], "mullion")
+            self.assertFalse(self._nvngx(compat).exists())
+        with patch.object(graphics, "resolve_backend_for_app", return_value="venus"):
+            argv = self.game(mode="automatic", env=self._ngx_env(compat))
+            self.assertEqual(self._setenvs(argv)["ENABLE_GAMESCOPE_WSI"], "1")
+            self.assertNotIn("BRINEWELL_NEPTUNE_BACKEND", argv)
+        argv = self.game(mode="automatic", env={"BRINEWELL_GRAPHICS_RESOLVE_SOCK": str(self.root / "missing")})
+        self.assertEqual(self._setenvs(argv)["ENABLE_GAMESCOPE_WSI"], "1")
+
+    def test_automatic_local_probe_routes_and_scans_launcher(self):
+        install = self.root / "game"
+        install.mkdir()
+        exe = install / "launcher.exe"
+        exe.touch()
+        env = {"STEAM_COMPAT_INSTALL_PATH": str(install)}
+        for directive, checked, scanned, expected in (
+                ("probe", "neptune", None, "d3dmetal"),
+                ("probe", "mullion", None, "mullion"),
+                ("probe", "venus", "neptune", "d3dmetal"),
+                ("probe", "venus", "venus", None),
+                ("probe_nomullion", "mullion", None, None)):
+            with self.subTest(directive=directive, checked=checked, scanned=scanned):
+                replies = [checked] + ([scanned] if scanned else [])
+                def run(args, **kwargs):
+                    backend = replies.pop(0)
+                    return type("Result", (), {"stdout": json.dumps({"backend": backend}).encode()})()
+                with patch.object(graphics, "resolve_backend_for_app", return_value=directive), \
+                     patch.object(graphics.subprocess, "run", side_effect=run) as probe:
+                    argv = self.run_wrap(["run", str(exe)], env=env, mode="automatic")
+                self.assertEqual(probe.call_args_list[0].args[0][1:], ["--json", "check", str(exe)])
+                if scanned:
+                    self.assertEqual(probe.call_args_list[1].args[0][1:], ["--json", "scan", str(install)])
+                self.assertEqual(self._setenvs(argv).get("BRINEWELL_NEPTUNE_BACKEND"), expected)
+
+    def test_local_probe_fails_safe_and_validates_paths(self):
+        install = self.root / "install"
+        install.mkdir()
+        exe = install / "game.exe"
+        exe.touch()
+        outside = self.root / "outside.exe"
+        outside.touch()
+        invalid = type("Result", (), {"stdout": b"not json"})()
+        with patch.object(graphics.subprocess, "run", return_value=invalid) as run:
+            self.assertEqual(graphics.probe_local_backend(exe, install), "venus")
+            self.assertEqual(run.call_count, 1)
+        result = type("Result", (), {"stdout": b'{"backend":"mullion"}'})()
+        with patch.object(graphics.subprocess, "run", return_value=result) as run:
+            self.assertEqual(graphics.probe_local_backend(outside, install, False), "venus")
+            self.assertEqual(run.call_args.args[0][2:], ["scan", str(install)])
+        with patch.object(graphics.subprocess, "run", side_effect=OSError("missing")):
+            self.assertEqual(graphics.probe_local_backend(exe, install), "venus")
+        with patch.object(graphics, "probe_local_backend", side_effect=AssertionError("probe")):
+            self.assertEqual(graphics.effective_mode("automatic", "42", sock_path=str(self.root / "missing")), "venus")
+            self.assertEqual(graphics.effective_mode("neptune", "42"), "neptune")
+
+    def test_automatic_probe_requires_verified_install(self):
+        install = self.root / "install"
+        install.mkdir()
+        exe = install / "game.exe"
+        exe.touch()
+        link = self.root / "link"
+        link.symlink_to(install)
+        for value in (None, "relative", str(link), str(link) + "/", str(self.root / "missing"), str(exe)):
+            with self.subTest(install=value):
+                env = {} if value is None else {"STEAM_COMPAT_INSTALL_PATH": value}
+                with patch.object(graphics, "resolve_backend_for_app", return_value="probe"), \
+                     patch.object(graphics.subprocess, "run") as probe:
+                    argv = self.run_wrap(["run", str(exe)], env=env, mode="automatic")
+                probe.assert_not_called()
+                self.assertEqual(self._setenvs(argv)["ENABLE_GAMESCOPE_WSI"], "1")
+
+    def test_automatic_probe_outside_executable_only_scans_install(self):
+        install = self.root / "install"
+        install.mkdir()
+        outside = self.root / "outside.exe"
+        outside.touch()
+        escape = install / "escape.exe"
+        escape.symlink_to(outside)
+        result = type("Result", (), {"stdout": b'{"backend":"venus"}'})()
+        for exe in (outside, escape, "relative.exe"):
+            with self.subTest(exe=exe), \
+                 patch.object(graphics, "resolve_backend_for_app", return_value="probe"), \
+                 patch.object(graphics.subprocess, "run", return_value=result) as probe:
+                argv = self.run_wrap(["run", str(exe)],
+                                     env={"STEAM_COMPAT_INSTALL_PATH": str(install)}, mode="automatic")
+                probe.assert_called_once()
+                self.assertEqual(probe.call_args.args[0][2:], ["scan", str(install)])
+                self.assertEqual(self._setenvs(argv)["ENABLE_GAMESCOPE_WSI"], "1")
+
+    def test_automatic_non_game_never_resolves(self):
+        with patch.object(graphics, "resolve_backend_for_app", side_effect=AssertionError("lookup")):
+            argv = self.run_wrap(["runinprefix", "x"], mode="automatic")
+        self.assertEqual(argv, ["--args", "9", str(self.pv), "--opt=x", "--",
+                                "FEXCompatTool", str(self.tool / "proton"), "runinprefix", "x"])
+
     # --- delegate resolution ---
 
     def test_delegate_from_pressure_vessel_parent(self):

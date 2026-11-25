@@ -150,6 +150,7 @@ final class VMProcess: ObservableObject {
         guard state == .running, let runtime else { return false }
         do {
             try runtime.setGraphicsBackend(backend)
+            updateRebootGraphicsBackend(backend)
             graphicsError = nil
             graphicsRequested = backend
             graphicsTimeout?.cancel()
@@ -164,6 +165,12 @@ final class VMProcess: ObservableObject {
         } catch {
             graphicsError = error.localizedDescription
             return false
+        }
+    }
+
+    private func updateRebootGraphicsBackend(_ backend: GraphicsBackend) {
+        if let index = launchArguments.firstIndex(of: "--graphics-backend") {
+            launchArguments[index + 1] = backend.rawValue
         }
     }
 
@@ -193,6 +200,7 @@ final class VMProcess: ObservableObject {
         rt.onGraphicsApplied = { [weak self] mode in
             guard let self, self.session.accepts(token) else { return }
             self.graphicsApplied = mode
+            self.updateRebootGraphicsBackend(mode)
             self.graphicsError = nil
             if mode == self.graphicsRequested {
                 self.graphicsTimeout?.cancel()

@@ -78,14 +78,17 @@ final class RuntimeNeptuneOptionsTests: XCTestCase {
         }
     }
 
-    func testUnspecifiedBackendDefaultsToD3DMetal() throws {
+    func testUnspecifiedBackendDefaultsToAutomatic() throws {
         let framework = packageRoot.deletingLastPathComponent()
             .appendingPathComponent("Frameworks/D3DMetal.framework", isDirectory: true)
         guard FileManager.default.fileExists(atPath: framework.path) else {
             throw XCTSkip("D3DMetal framework is unavailable")
         }
         try withPackagedRuntime(["--d3dmetal-framework", framework.path]) { options in
-            XCTAssertEqual(options.graphicsBackend, .neptune)
+            XCTAssertEqual(options.graphicsBackend, .automatic)
+            XCTAssertTrue(options.availableBackends.contains(.automatic))
+            XCTAssertTrue(options.availableBackends.contains(.neptune))
+            XCTAssertEqual(options.availableBackends.contains(.mullion), options.neptuneMullion != nil)
             let support = try XCTUnwrap(options.neptune)
             guard case .d3dmetal = support.backend else {
                 return XCTFail("expected the D3DMetal backend")
@@ -110,17 +113,28 @@ final class RuntimeNeptuneOptionsTests: XCTestCase {
             XCTAssertEqual(options.neptune != nil,
                            options.neptuneD3DMetal != nil || options.neptuneMullion != nil)
             XCTAssertTrue(options.availableBackends.contains(.venus))
+            XCTAssertEqual(options.availableBackends.contains(.automatic), options.availableBackends.contains(.neptune))
+            XCTAssertEqual(options.neptuneReasons[.automatic], options.neptuneReasons[.neptune])
         }
     }
 
-    func testAutomaticIsNoLongerARuntimeBackend() throws {
-        do {
-            try withPackagedRuntime(["--graphics-backend", "automatic"]) { _ in
-                XCTFail("automatic backend is no longer supported")
+    func testInvalidBackendIsRejectedStrictly() throws {
+        for value in ["Automatic", "auto", "neptune "] {
+            do {
+                try withPackagedRuntime(["--graphics-backend", value]) { _ in XCTFail("invalid backend accepted") }
+                XCTFail("invalid backend accepted")
+            } catch let error as RuntimeError {
+                XCTAssertEqual(error.description, "invalid graphics backend: \(value)")
             }
-            XCTFail("automatic backend was accepted")
+        }
+    }
+
+    func testAutomaticRequiresD3DMetal() throws {
+        do {
+            try withPackagedRuntime(["--graphics-backend", "automatic"]) { _ in XCTFail("missing framework accepted") }
+            XCTFail("missing framework accepted")
         } catch let error as RuntimeError {
-            XCTAssertEqual(error.description, "invalid graphics backend: automatic")
+            XCTAssertEqual(error.description, "Neptune is not available: D3DMetal framework path is not configured")
         }
     }
 }

@@ -51,7 +51,7 @@ def _log(message):
 def _mode():
     try:
         mode = Path("/run/brinewell/graphics-backend").read_text().strip()
-        if mode in ("venus", "neptune", "mullion"):
+        if mode in graphics.LIVE_MODES:
             return mode
     except OSError:
         pass
@@ -849,8 +849,17 @@ def main(argv):
                    if Path(argv[i]).name == 'pv-adverb'), None)
         if pv is not None and '--' in argv[pv + 1:]:
             command = argv[argv.index('--', pv + 1) + 1:]
-            if graphics.proton_invocation(command, os.environ):
+            info = graphics.proton_invocation(command, os.environ)
+            if info:
                 mode = _mode()
+                if mode == "automatic":
+                    app_id = (os.environ.get("STEAM_COMPAT_APP_ID") or os.environ.get("SteamGameId")
+                              or os.environ.get("SteamAppId"))
+                    verb_index = info[1]
+                    executable = command[verb_index + 1] if verb_index + 1 < len(command) else None
+                    mode = graphics.effective_mode(
+                        mode, app_id, exe_path=executable,
+                        install_dir=os.environ.get("STEAM_COMPAT_INSTALL_PATH"))
                 bwrap_env, complete = _bwrap_setenvs(argv[:pv]) if mode == 'venus' else ((), True)
                 extra = _injection(mode, command, os.environ, bwrap_env, complete)
     args = argv[:2] + extra + argv[2:] if extra else argv
