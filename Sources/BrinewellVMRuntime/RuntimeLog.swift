@@ -11,13 +11,13 @@ public final class RuntimeLog {
     public init(url: URL) throws {
         let log = open(url.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o600)
         guard log >= 0 else { throw Self.failure("cannot open host log") }
-        defer { close(log) }
+        defer { Darwin.close(log) }
         let output = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3)
         guard output >= 0 else { throw Self.failure("cannot save stdout") }
         let error = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3)
         guard error >= 0 else {
             let failure = Self.failure("cannot save stderr")
-            close(output)
+            Darwin.close(output)
             throw failure
         }
         fflush(nil)
@@ -25,8 +25,8 @@ public final class RuntimeLog {
             let failure = Self.failure("cannot redirect host log")
             _ = dup2(output, STDOUT_FILENO)
             _ = dup2(error, STDERR_FILENO)
-            close(output)
-            close(error)
+            Darwin.close(output)
+            Darwin.close(error)
             throw failure
         }
         savedOutput = output
@@ -38,10 +38,12 @@ public final class RuntimeLog {
         fflush(nil)
         _ = dup2(savedOutput, STDOUT_FILENO)
         _ = dup2(savedError, STDERR_FILENO)
-        close(savedOutput)
-        close(savedError)
+        Darwin.close(savedOutput)
+        Darwin.close(savedError)
         restored = true
     }
+
+    public func close() { restore() }
 
     deinit { restore() }
 

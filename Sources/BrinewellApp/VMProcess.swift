@@ -7,7 +7,7 @@ import Foundation
 @MainActor
 final class VMProcess: ObservableObject {
     enum State {
-        case idle, starting, running, stopping, failed
+        case idle, starting, running, stopping, restarting, failed
 
         var title: String {
             switch self {
@@ -15,6 +15,7 @@ final class VMProcess: ObservableObject {
             case .starting: String(localized: "Starting")
             case .running: String(localized: "Running")
             case .stopping: String(localized: "Stopping")
+            case .restarting: String(localized: "Restarting…")
             case .failed: String(localized: "Failed")
             }
         }
@@ -27,22 +28,26 @@ final class VMProcess: ObservableObject {
     @Published private(set) var graphicsError: String?
     @Published private(set) var runDirectory: URL?
     @Published private(set) var hostDisplayID: UInt32?
-    var busy: Bool { state == .starting || state == .running || state == .stopping }
+    var busy: Bool { state == .starting || state == .running || state == .stopping || state == .restarting }
     var logPath: String? { runDirectory?.appendingPathComponent("host.log").path }
     private var runtime: Runtime?
     private var graphicsRequested: GraphicsBackend?
     private var graphicsTimeout: Task<Void, Never>?
     private var runtimeLog: RuntimeLog?
-    private var session = UUID()
-    private var requestedStop = false
-    private var fatalErrorReceived = false
-    private var wasReady = false
+    private var session = VMSessionPolicy()
+    private var sessionDiskFD: Int32 = -1
+    private var launchArguments: [String] = []
+    private var preservedWindow: VMWindow?
     var onExit: (() -> Void)?
     var onSettled: (() -> Void)?
+    var onTerminationWillSettle: (() -> Void)?
+    var onTerminateWhenSettled: (() -> Void)?
+    var onShrinkReset: (() -> Void)?
 
     func start(configuration: VMConfiguration, host: HostCapabilities, display: HostDisplayCapabilities?,
                shrinkHomeKiB: UInt64? = nil, willLaunch: (() -> Void)? = nil) {
         guard !busy, runtime == nil else { return }
+        session.begin(shrinkPreparation: shrinkHomeKiB != nil)
         workContextWarning = nil
         uu = UUPluginStatus()
         resetGraphics()
@@ -108,46 +113,13 @@ final class VMProcess: ObservableObject {
                 arguments += ["--shared-folder", folder.path, "--shared-folder-read-only", folder.readOnly ? "1" : "0"]
             }
             let options = try RuntimeOptions(arguments: arguments)
-            let token = UUID()
-            session = token
-            let rt: Runtime
-            do { rt = try Runtime(options: options) }
+            do { sessionDiskFD = try options.dupDiskFD() }
             catch { close(options.diskFD); throw error }
-            // Single-process mode: route state lines and VM exit back to this
-            // object on the main actor while retaining the host log output.
-            reportHandler = { [weak self] line in
-                Task { @MainActor in self?.receive(line, session: token) }
+            launchArguments = arguments
+            if let index = launchArguments.firstIndex(of: "--shrink-home-kib") {
+                launchArguments.removeSubrange(index...index + 1)
             }
-            rt.onExit = { [weak self] result in
-                Task { @MainActor in self?.vmExited(result, session: token) }
-            }
-            rt.onGraphicsApplied = { [weak self] mode in
-                guard let self, self.session == token else { return }
-                self.graphicsApplied = mode
-                self.graphicsError = nil
-                if mode == self.graphicsRequested {
-                    self.graphicsTimeout?.cancel()
-                    self.graphicsTimeout = nil
-                }
-            }
-            runtime = rt
-            requestedStop = false
-            fatalErrorReceived = false
-            wasReady = false
-            error = nil
-            willLaunch?()
-            state = .starting
-            Task { @MainActor [self] in
-                do { try await rt.start() }
-                catch {
-                    guard session == token else { return }
-                    if requestedStop || error is CancellationError {
-                        vmExited(0, session: token)
-                    } else {
-                        startFailed(error)
-                    }
-                }
-            }
+            try launch(options: options, existingWindow: nil, willLaunch: willLaunch)
         } catch {
             startFailed(error)
         }
@@ -158,7 +130,7 @@ final class VMProcess: ObservableObject {
     }
 
     func installUU() {
-        guard uu.canInstall, let runtime, !requestedStop else { return }
+        guard uu.canInstall, let runtime, !session.requestedStop else { return }
         do {
             try runtime.installUU()
             uu.beginInstallation()
@@ -166,7 +138,7 @@ final class VMProcess: ObservableObject {
     }
 
     func refreshUUStatus() {
-        guard uu.canRefresh, let runtime, !requestedStop else { return }
+        guard uu.canRefresh, let runtime, !session.requestedStop else { return }
         do { try runtime.refreshUUStatus() }
         catch { uu.fail((error as? LocalizedError)?.errorDescription ?? String(describing: error)) }
     }
@@ -195,18 +167,80 @@ final class VMProcess: ObservableObject {
         }
     }
 
+    private func launch(options: RuntimeOptions, existingWindow: VMWindow?, willLaunch: (() -> Void)? = nil) throws {
+        let rt: Runtime
+        do { rt = try Runtime(options: options, existingWindow: existingWindow) }
+        catch { close(options.diskFD); throw error }
+        let token = session.beginBoot()
+        error = nil
+        reportHandler = { [weak self] line in
+            Task { @MainActor in self?.receive(line, generation: token) }
+        }
+        rt.shouldPreserveWindowOnReset = { [weak self] in
+            guard let self, self.session.accepts(token) else { return false }
+            return self.session.shouldPreserveWindow
+        }
+        rt.onShutdownRequested = { [weak self] in
+            guard let self, self.session.active, self.session.generation == token ||
+                    (self.state == .restarting && self.session.generation == token + 1) ||
+                    (self.state == .starting && self.session.generation == token + 2) else { return }
+            self.stop()
+        }
+        rt.onOutcome = { [weak self, weak rt] outcome in
+            guard let self, let rt, self.session.accepts(token) else { return }
+            self.vmExited(outcome, runtime: rt, generation: token)
+        }
+        rt.onGraphicsApplied = { [weak self] mode in
+            guard let self, self.session.accepts(token) else { return }
+            self.graphicsApplied = mode
+            self.graphicsError = nil
+            if mode == self.graphicsRequested {
+                self.graphicsTimeout?.cancel()
+                self.graphicsTimeout = nil
+            }
+        }
+        runtime = rt
+        preservedWindow = nil
+        willLaunch?()
+        state = .starting
+        Task { @MainActor [self] in
+            do { try await rt.start() }
+            catch {
+                guard session.generation == token, session.active else { return }
+                if session.requestedStop || error is CancellationError { finish(clean: false, failure: nil) }
+                else { startFailed(error) }
+            }
+        }
+    }
+
     private func startFailed(_ failure: Error) {
         let message = (failure as? LocalizedError)?.errorDescription ?? String(describing: failure)
         report("BRINEWELL error \(message)")
-        error = message
-        state = .failed
+        finish(clean: false, failure: message)
+    }
+
+    private func finish(clean: Bool, failure: String?, abortShrink: Bool = false) {
+        guard session.active else { return }
+        session.active = false
+        session.generation += 1
+        preservedWindow?.closeForSessionEnd()
+        preservedWindow = nil
         runtime = nil
         workContextWarning = nil
         uu = UUPluginStatus()
         resetGraphics()
         reportHandler = nil
+        runtimeLog?.close()
         runtimeLog = nil
+        if sessionDiskFD >= 0 { close(sessionDiskFD); sessionDiskFD = -1 }
+        error = failure
+        state = failure == nil ? .idle : .failed
+        if abortShrink { onShrinkReset?() }
+        let terminateWhenSettled = clean || session.requestedStop
+        if terminateWhenSettled { onTerminationWillSettle?() }
         onSettled?()
+        onExit?()
+        if terminateWhenSettled { onTerminateWhenSettled?() }
     }
 
     private func resetGraphics() {
@@ -217,13 +251,12 @@ final class VMProcess: ObservableObject {
         graphicsError = nil
     }
 
-    private func receive(_ line: String, session token: UUID) {
-        guard token == session, runtime != nil else { return }
+    private func receive(_ line: String, generation token: UInt64) {
+        guard token == session.generation, session.active, runtime != nil else { return }
         switch line {
         case "BRINEWELL state booting": break
         case "BRINEWELL state running":
-            if !requestedStop && !fatalErrorReceived {
-                wasReady = true
+            if session.markReady() {
                 state = .running
             }
         case "BRINEWELL state stopping":
@@ -249,39 +282,79 @@ final class VMProcess: ObservableObject {
             }
             if line.hasPrefix("BRINEWELL error ") {
                 error = String(line.dropFirst("BRINEWELL error ".count))
-                fatalErrorReceived = true
+                session.fatalError = true
                 state = .stopping
             }
         }
     }
 
-    private func vmExited(_ result: Int32, session token: UUID) {
-        guard token == session else { return }
-        let normal = result == 0
-        runtime = nil
-        workContextWarning = nil
-        uu = UUPluginStatus()
-        resetGraphics()
-        reportHandler = nil
-        runtimeLog = nil
-        if fatalErrorReceived || !normal || (!wasReady && !requestedStop) {
-            state = .failed
-            if error == nil { error = String(localized: "The virtual machine process exited (status \(result)).") }
-        } else { state = .idle }
-        onSettled?()
-        onExit?()
+    private func vmExited(_ outcome: RuntimeExitOutcome, runtime rt: Runtime, generation token: UInt64) {
+        guard token == session.generation, session.active else { return }
+        switch outcome {
+        case .reset:
+            switch session.decideReset() {
+            case .stop:
+                rt.detachWindowForRestart()?.closeForSessionEnd()
+                finish(clean: false, failure: nil, abortShrink: session.shrinkPreparation)
+                return
+            case .abortShrink:
+                finish(clean: false, failure: String(localized: "The shrink preparation boot restarted; disk shrink was cancelled."), abortShrink: true)
+                return
+            case .tooManyResets:
+                finish(clean: false, failure: String(localized: "The virtual machine restarted repeatedly before becoming ready."))
+                return
+            case .restart: break
+            }
+            preservedWindow = rt.detachWindowForRestart()
+            runtime = nil
+            reportHandler = nil
+            runtimeLog?.close()
+            runtimeLog = nil
+            state = .restarting
+            let previousDirectory = runDirectory
+            session.generation += 1
+            let restartToken = session.generation
+            Task { @MainActor [self] in
+                await Task.yield()
+                guard session.generation == restartToken, session.active else { return }
+                if session.requestedStop { finish(clean: false, failure: nil); return }
+                do {
+                    let directory = URL(fileURLWithPath: "/tmp/brinewell-\(UUID().uuidString)", isDirectory: true)
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                    guard let previousDirectory else { throw Failure("Previous run directory unavailable") }
+                    let network = directory.appendingPathComponent("network.json")
+                    try FileManager.default.copyItem(at: previousDirectory.appendingPathComponent("network.json"), to: network)
+                    runDirectory = directory
+                    runtimeLog = try RuntimeLog(url: directory.appendingPathComponent("host.log"))
+                    report("BRINEWELL reboot \(previousDirectory.lastPathComponent) -> \(directory.lastPathComponent)")
+                    var arguments = launchArguments
+                    if let index = arguments.firstIndex(of: "--run-directory") { arguments[index + 1] = directory.path }
+                    if let index = arguments.firstIndex(of: "--network-config") { arguments[index + 1] = network.path }
+                    let options = try RuntimeOptions(arguments: arguments, retainingDiskFD: sessionDiskFD)
+                    try launch(options: options, existingWindow: preservedWindow)
+                } catch { startFailed(error) }
+            }
+        case .poweroff(let status):
+            let clean = status == 0 && !session.fatalError && (session.ready || session.requestedStop)
+            let failure = clean ? nil : (error ?? String(localized: "The virtual machine process exited (status \(status))."))
+            finish(clean: clean, failure: failure)
+        case .failed(let code):
+            finish(clean: false, failure: error ?? String(localized: "The virtual machine process exited (status \(code))."))
+        }
     }
 
     func stop() {
-        guard let runtime, !requestedStop else { return }
-        requestedStop = true
+        guard session.active, !session.requestedStop else { return }
+        session.requestedStop = true
+        if state == .restarting { return }
         state = .stopping
-        runtime.shutdown()
+        runtime?.shutdown()
     }
 
     func forceStop() {
-        guard runtime != nil else { return }
-        requestedStop = true
+        guard session.active else { return }
+        if state == .restarting { stop(); return }
+        session.requestedStop = true
         state = .stopping
         // In-process: no separate process to SIGKILL. Tear down the runtime;
         // the guest shutdown key is best-effort, then we drop the reference so

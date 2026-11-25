@@ -126,6 +126,7 @@ final class VMDisplay: @unchecked Sendable {
     private var colorState: DisplayColorState = .sdr
     private var latest: DisplayFrame?
     private var deliveryScheduled = false
+    private var retired = false
     @MainActor private let renderer: IOSurfaceRenderer
     @MainActor private var window: VMWindow?
     @MainActor private var inputView: VMInputView?
@@ -141,13 +142,15 @@ final class VMDisplay: @unchecked Sendable {
     @MainActor var displayRefreshRate: Double?
     @MainActor private var reportedGameSource: GameFrameSample.Source?
     @MainActor private var windowPixelSize: NSSize = .zero
+    @MainActor private var preserveWindowFrame = false
     @MainActor private var fittingWindow = false
     @MainActor private var refitWindow = false
     private var screenObserver: NSObjectProtocol?
     @MainActor private var hdrTimer: Timer?
     @MainActor private var sampledCapabilities: HostDisplayCapabilities?
 
-    @MainActor init() throws {
+    @MainActor init(existingWindow: VMWindow? = nil) throws {
+        window = existingWindow
         renderer = try IOSurfaceRenderer()
     }
 
@@ -346,7 +349,7 @@ final class VMDisplay: @unchecked Sendable {
     }
 
     private func scheduleDeliveryLocked() {
-        guard !deliveryScheduled else { return }
+        guard !retired, !deliveryScheduled else { return }
         deliveryScheduled = true
         DispatchQueue.main.async { [weak self] in self?.deliver() }
     }
@@ -355,6 +358,7 @@ final class VMDisplay: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         deliveryScheduled = false
+        guard !retired else { return }
         if let latest {
             let size = latest.pixelSize
             do {
@@ -378,9 +382,10 @@ final class VMDisplay: @unchecked Sendable {
     @MainActor func show(input: VMInput, mode: VMDisplayConfiguration, screenID: UInt32,
                          onScreenChange: @escaping @MainActor @Sendable (HostDisplayCapabilities) -> Void,
                          onActivity: @escaping (Bool) -> Void, onClose: @escaping () -> Void) {
-        if let window { window.makeKeyAndOrderFront(nil); return }
+        let reused = window != nil
+        preserveWindowFrame = reused
         let screen = NSScreen.screens.first { HostDisplayCapabilities.screenID($0) == screenID }
-        let window = VMWindow(contentRect: NSRect(x: 0, y: 0, width: 1024, height: 640), screen: screen)
+        let window = window ?? VMWindow(contentRect: NSRect(x: 0, y: 0, width: 1024, height: 640), screen: screen)
         let view = VMInputView(renderer: renderer, input: input, onActivity: onActivity)
         inputView = view
         window.contentView = view
@@ -400,7 +405,7 @@ final class VMDisplay: @unchecked Sendable {
             if capabilities.hdrSupported {
                 let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
                     Task { @MainActor in
-                        guard let self, let window = self.window, window.isVisible,
+                        guard let self, !self.retired, let window = self.window, window.isVisible,
                               let screen = window.screen, let id = HostDisplayCapabilities.screenID(screen),
                               let next = HostDisplayCapabilities.detect(displayID: id), next != self.sampledCapabilities else { return }
                         self.sampledCapabilities = next
@@ -419,9 +424,11 @@ final class VMDisplay: @unchecked Sendable {
         self.window = window
         setWorkContextWarning(workContextWarning)
         updateGameHUDVisibility()
-        fitWindowToContent()
-        window.center()
-        window.makeKeyAndOrderFront(nil)
+        if !reused {
+            fitWindowToContent()
+            window.center()
+            window.makeKeyAndOrderFront(nil)
+        }
         window.makeFirstResponder(view)
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
@@ -437,7 +444,7 @@ final class VMDisplay: @unchecked Sendable {
     }
 
     @MainActor private func fitWindowToContent() {
-        guard let window, !window.isFullScreen else { return }
+        guard !preserveWindowFrame, let window, !window.isFullScreen else { return }
         // Moving the window can synchronously change its screen, which calls back
         // here; refit once afterwards for the new screen instead of recursing.
         guard !fittingWindow else { refitWindow = true; return }
@@ -476,7 +483,7 @@ final class VMDisplay: @unchecked Sendable {
     }
 
     @MainActor private func updateGameHUDVisibility() {
-        guard gameHUDState.enabled, let content = window?.contentView else {
+        guard gameHUDState.enabled, inputView != nil, let content = window?.contentView else {
             gameHUDTimer?.invalidate()
             gameHUDTimer = nil
             gameHUD?.removeFromSuperview()
@@ -558,7 +565,33 @@ final class VMDisplay: @unchecked Sendable {
 
     /// Called after the VMM has stopped (or startup failed), while AppKit and
     /// the launcher remain alive. Closing the window also ends its full screen.
-    @MainActor func close() {
+    @MainActor func detachForRestart(onShutdownRequested: @escaping () -> Void) -> VMWindow? {
+        let preserved = window
+        teardown(closeWindow: false)
+        guard let preserved else { return nil }
+        let status = NSView(frame: preserved.contentView?.bounds ?? .zero)
+        status.wantsLayer = true
+        status.layer?.backgroundColor = NSColor.black.cgColor
+        let label = NSTextField(labelWithString: "Restarting SteamOS…")
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 20)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        status.addSubview(label)
+        NSLayoutConstraint.activate([label.centerXAnchor.constraint(equalTo: status.centerXAnchor), label.centerYAnchor.constraint(equalTo: status.centerYAnchor)])
+        preserved.contentView = status
+        preserved.onClose = onShutdownRequested
+        return preserved
+    }
+
+    @MainActor func close() { teardown(closeWindow: true) }
+
+    @MainActor private func teardown(closeWindow: Bool) {
+        lock.lock()
+        retired = true
+        latest = nil
+        slots.removeAll()
+        allocated.removeAll()
+        lock.unlock()
         stopInput()
         if let screenObserver {
             NotificationCenter.default.removeObserver(screenObserver)
@@ -569,7 +602,7 @@ final class VMDisplay: @unchecked Sendable {
         window?.onExitFullScreen = nil
         setWorkContextWarning(nil)
         setGameHUD(level: .off, position: gameHUDPosition)
-        window?.close()
+        if closeWindow { window?.close() }
         window = nil
         inputView = nil
         lock.lock()

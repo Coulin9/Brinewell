@@ -47,6 +47,7 @@ final class AppModel: ObservableObject {
     private var commandLineStartPending = CommandLine.arguments.dropFirst().contains("--start-vm")
     private var starting = false
     private var isTerminating = false
+    private var needsTerminationWhenSettled = false
     func setTerminating(_ terminating: Bool) { isTerminating = terminating }
     let migrationReport: LegacyInstallationMigration.Report?
     private var migrationBlocked: Bool { migrationReport?.needsAttention == true }
@@ -69,6 +70,17 @@ final class AppModel: ObservableObject {
             guard let self, self.isShowingSetupSheet else { return }
             self.refreshDiskAvailability()
             self.reconcileActiveSetupSheet()
+        }
+        vm.onShrinkReset = { [weak self] in self?.configuration.pendingDiskShrink = nil }
+        vm.onTerminationWillSettle = { [weak self] in
+            guard let self else { return }
+            self.needsTerminationWhenSettled = !self.isTerminating
+            self.setTerminating(true)
+        }
+        vm.onTerminateWhenSettled = { [weak self] in
+            guard let self, self.needsTerminationWhenSettled else { return }
+            self.needsTerminationWhenSettled = false
+            NSApp.terminate(nil)
         }
         vm.onSettled = { [weak self] in
             self?.refreshDiskAvailability()
@@ -485,8 +497,7 @@ final class AppModel: ObservableObject {
     ]
 
     /// Host-side second phase of a scheduled shrink. Runs at app launch, before
-    /// the next VM start, and on VM exit paths that return (the in-process VM
-    /// terminates the app on a normal guest shutdown).
+    /// the next VM start, and after VM teardown before app termination.
     private func finishPendingDiskShrink() {
         guard !vm.busy, !deployment.busy, !diskResizing, !migrationBlocked,
               let pending = pendingDiskShrink, pending.bootStarted,
@@ -533,52 +544,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.setActivationPolicy(.regular)
     }
     private func finishTermination(_ sender: NSApplication) {
+        if let vm, vm.busy {
+            vm.onExit = { [weak self, weak sender] in
+                guard let self, let sender else { return }
+                self.finishTermination(sender)
+            }
+            vm.stop()
+            return
+        }
         Task { @MainActor in
             if let model {
                 await model.waitForDiskResize()
                 await model.deployment.cancel()
                 await model.d3dMetalDeployment.cancelAndWait()
             }
-            if let vm, vm.busy {
-                vm.onExit = { [weak self, weak sender] in
-                    guard let self, let sender else { return }
-                    self.finishTermination(sender)
-                }
-                vm.stop()
-                return
-            }
+            guard quitting else { return }
             quitting = false
             sender.reply(toApplicationShouldTerminate: true)
         }
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if quitting { return .terminateLater }
         model?.setTerminating(true)
-        if let model, model.diskResizing || model.deployment.busy || model.d3dMetalDeployment.isActive {
-            if !quitting {
-                quitting = true
-                finishTermination(sender)
+        if let vm, vm.busy {
+            let alert = NSAlert()
+            alert.messageText = String(localized: "The virtual machine is still running")
+            alert.informativeText = String(localized: "Shut down the virtual machine before quitting Brinewell?")
+            alert.addButton(withTitle: String(localized: "Shut Down and Quit"))
+            alert.addButton(withTitle: String(localized: "Cancel"))
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                model?.setTerminating(false)
+                return .terminateCancel
             }
+        }
+        if vm?.busy == true || model?.diskResizing == true || model?.deployment.busy == true || model?.d3dMetalDeployment.isActive == true {
+            quitting = true
+            finishTermination(sender)
             return .terminateLater
         }
-        guard let vm, vm.busy else { return .terminateNow }
-        if quitting { return .terminateLater }
-        let alert = NSAlert()
-        alert.messageText = String(localized: "The virtual machine is still running")
-        alert.informativeText = String(localized: "Shut down the virtual machine before quitting Brinewell?")
-        alert.addButton(withTitle: String(localized: "Shut Down and Quit"))
-        alert.addButton(withTitle: String(localized: "Cancel"))
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            model?.setTerminating(false)
-            return .terminateCancel
-        }
-        guard vm.busy else { return .terminateNow }
-        quitting = true
-        vm.onExit = { [weak self, weak sender] in
-            guard let self, let sender else { return }
-            self.finishTermination(sender)
-        }
-        vm.stop()
-        return .terminateLater
+        return .terminateNow
     }
 }
 
@@ -591,6 +595,7 @@ struct BrinewellApp: App {
     // Runs before AppModel is created, so the configuration load, disk-shrink
     // finalize and language preference all see the migrated locations.
     init() {
+        signal(SIGPIPE, SIG_IGN)
         let report = LegacyInstallationMigration.migrateIfNeeded()
         _model = StateObject(wrappedValue: AppModel(migrationReport: report))
     }

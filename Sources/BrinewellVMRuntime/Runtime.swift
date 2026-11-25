@@ -12,8 +12,35 @@ func krunCheck(_ operation: String, _ result: Int32) throws -> Int32 {
     return result
 }
 
+public enum RuntimeExitOutcome: Equatable, Sendable {
+    case poweroff(status: Int32)
+    case reset(status: Int32)
+    case failed(code: Int32)
+}
+
+private final class ShutdownEvent: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fd: Int32 = -1
+
+    func install(_ fd: Int32) { lock.lock(); defer { lock.unlock() }; self.fd = fd }
+    func close() {
+        lock.lock(); defer { lock.unlock() }
+        if fd >= 0 { Darwin.close(fd); fd = -1 }
+    }
+    func signal() {
+        lock.lock(); defer { lock.unlock() }
+        guard fd >= 0 else { return }
+        var one: UInt64 = 1
+        if Darwin.write(fd, &one, MemoryLayout<UInt64>.size) != MemoryLayout<UInt64>.size {
+            report("BRINEWELL control error cannot send guest shutdown key: \(String(cString: strerror(errno)))")
+        }
+    }
+    deinit { close() }
+}
+
 @MainActor
 public final class Runtime {
+    private static var logInitialized = false
     private let options: RuntimeOptions
     private let display: VMDisplay
     private let ports: VMPorts
@@ -21,7 +48,7 @@ public final class Runtime {
     private let network: RuntimeNetwork
     private let workContext = WorkContextService()
     private var context: UInt32?
-    private var shutdownFD: Int32 = -1
+    private let shutdownEvent = ShutdownEvent()
     private var diskFD: Int32 = -1
     private var stopping = false
     private var started = false
@@ -33,9 +60,15 @@ public final class Runtime {
     private var edidCapabilities: HostDisplayCapabilities?
     private var hostCapabilities: HostDisplayCapabilities
 
-    /// If krun_start_enter returns, called after the main actor has closed the
-    /// guest window and runtime services. libkrun may terminate the process on
-    /// a normal guest shutdown instead of returning to its caller.
+    /// Called on the main actor after boot-scoped services have stopped.
+    public var onOutcome: ((RuntimeExitOutcome) -> Void)?
+    public var onShutdownRequested: (() -> Void)?
+    public var shouldPreserveWindowOnReset: (() -> Bool)?
+    private var restartWindow: VMWindow?
+    public func detachWindowForRestart() -> VMWindow? {
+        defer { restartWindow = nil }
+        return restartWindow
+    }
     public var onExit: (@Sendable (Int32) -> Void)?
     public var onGraphicsApplied: ((GraphicsBackend) -> Void)? {
         get { ports.onGraphicsApplied }
@@ -43,7 +76,7 @@ public final class Runtime {
     }
 
     /// Takes ownership of options.diskFD only after initialization succeeds.
-    public init(options: RuntimeOptions) throws {
+    public init(options: RuntimeOptions, existingWindow: VMWindow? = nil) throws {
         self.options = options
         guard let capabilities = HostDisplayCapabilities.detect(displayID: options.hostDisplayID) else {
             throw RuntimeError(String(localized: "Could not read the available display modes for the host display."))
@@ -52,13 +85,18 @@ public final class Runtime {
         currentDisplayMode = options.display
         initialScreenID = capabilities.id
         hostCapabilities = capabilities
-        display = try VMDisplay()
+        display = try VMDisplay(existingWindow: existingWindow)
         display.displayRefreshRate = Double(options.display.refreshRate)
         display.setGameHUD(level: options.gameHUDLevel, position: options.gameHUDPosition)
         network = try RuntimeNetwork(directory: options.runDirectory)
         ports = try VMPorts(runDirectory: options.runDirectory)
         display.hardwareSample = { [weak ports] in ports?.hardwareSample() }
-        input = try VMInput()
+        do {
+            input = try VMInput()
+        } catch {
+            ports.close()
+            throw error
+        }
         ports.onGraphicsRequest = { [weak self] mode in try self?.setGraphicsBackend(mode) }
         diskFD = options.diskFD
         workContext.onReport = { [weak display] line in
@@ -114,7 +152,10 @@ public final class Runtime {
             try network.start(binary: options.resources.appendingPathComponent("gvproxy").path,
                               sshPort: options.sshPort, configuration: options.network)
             raiseFileLimit()
-            try krunCheck("krun_init_log", krun_init_log(KRUN_LOG_TARGET_DEFAULT, UInt32(KRUN_LOG_LEVEL_WARN), UInt32(KRUN_LOG_STYLE_AUTO), UInt32(KRUN_LOG_OPTION_NO_ENV)))
+            if !Self.logInitialized {
+                try krunCheck("krun_init_log", krun_init_log(KRUN_LOG_TARGET_DEFAULT, UInt32(KRUN_LOG_LEVEL_WARN), UInt32(KRUN_LOG_STYLE_AUTO), UInt32(KRUN_LOG_OPTION_NO_ENV)))
+                Self.logInitialized = true
+            }
             let ctx = UInt32(try krunCheck("krun_create_ctx", krun_create_ctx()))
             context = ctx
             try krunCheck("krun_set_vm_config", krun_set_vm_config(ctx, options.cpus, options.memoryMiB))
@@ -144,7 +185,8 @@ public final class Runtime {
                 cmdline += " brinewell.shrink_home=\(shrinkHomeKiB)"
             }
             try krunCheck("krun_set_kernel", krun_set_kernel(ctx, kernel, 0, initrd, cmdline))
-            try krunCheck("krun_add_disk2(vda)", krun_add_disk2(ctx, "vda", options.disk, 0, false))
+            guard diskFDMatchesPath(diskFD, path: options.disk) else { throw RuntimeError("disk was replaced before attachment") }
+            try krunCheck("krun_add_disk_raw_fd(vda)", krun_add_disk_raw_fd(ctx, "vda", diskFD, false))
             try krunCheck("krun_add_disk2(vdb)", krun_add_disk2(ctx, "vdb", options.resources.appendingPathComponent("brinewell-layer.img").path, 0, true))
             if krun_has_feature(UInt64(KRUN_FEATURE_SND)) == 1 {
                 try krunCheck("krun_set_snd_device", krun_set_snd_device(ctx, true))
@@ -169,12 +211,14 @@ public final class Runtime {
             var backend = display.makeBackend()
             try krunCheck("krun_set_display_backend", krun_set_display_backend(ctx, &backend, MemoryLayout<krun_display_backend>.size))
             try network.attach(context: ctx)
-            shutdownFD = try krunCheck("krun_get_shutdown_eventfd", krun_get_shutdown_eventfd(ctx))
+            let shutdownEventFD = try krunCheck("krun_get_shutdown_eventfd", krun_get_shutdown_eventfd(ctx))
+            _ = fcntl(shutdownEventFD, F_SETNOSIGPIPE, 1)
+            shutdownEvent.install(shutdownEventFD)
             try ports.start(onReady: { [weak self] in
                 guard let self, !self.stopping, !self.ready else { return }
                 self.ready = true
                 report("BRINEWELL state running")
-            }, onShutdown: { [weak self] in self?.shutdown() }, onFrameDump: { [weak self] path in
+            }, onShutdown: { [weak self] in self?.requestShutdown() }, onFrameDump: { [weak self] path in
                 guard let self else { throw RuntimeError("runtime unavailable") }
                 try self.display.dump(to: path)
                 self.reportScanoutStats()
@@ -194,24 +238,46 @@ public final class Runtime {
                          onActivity: { [weak self] active in
                 self?.ports.setInputActive(active)
                 self?.workContext.setActive(active)
-            }, onClose: { [weak self] in self?.shutdown() })
+            }, onClose: { [weak self] in self?.requestShutdown() })
             report("BRINEWELL state booting")
             started = true
             let thread = Thread { [self] in
-                let result = krun_start_enter(ctx)
+                var result = krun_run_result()
+                let code = krun_run(ctx, &result)
+                if code < 0 { _ = krun_free_ctx(ctx) }
+                self.shutdownEvent.close()
+                let outcome: RuntimeExitOutcome
+                if code != 0 { outcome = .failed(code: code) }
+                else if result.reason == UInt32(KRUN_EXIT_REASON_GUEST_POWEROFF) { outcome = .poweroff(status: result.guest_status) }
+                else if result.reason == UInt32(KRUN_EXIT_REASON_GUEST_RESET) { outcome = .reset(status: result.guest_status) }
+                else { outcome = .failed(code: -1) }
                 Task { @MainActor in
-                    if result != 0 { report("BRINEWELL error krun_start_enter returned \(result)") }
+                    self.stopping = true
                     self.hdrWork?.cancel(); self.hdrWork = nil
                     self.started = false
                     self.workContext.stop()
-                    self.context = nil // krun_start_enter consumed the context.
-                    self.shutdownFD = -1
-                    self.display.close()
-                    self.input.setActive(false)
+                    self.context = nil // krun_run consumes the context.
+                    self.shutdownEvent.close()
                     self.ports.close()
+                    if case .reset = outcome, self.shouldPreserveWindowOnReset?() == true {
+                        let request = self.onShutdownRequested ?? { [weak self] in self?.shutdown() }
+                        self.restartWindow = self.display.detachForRestart(onShutdownRequested: request)
+                    } else { self.display.close() }
+                    self.input.setActive(false)
                     self.network.stop()
                     self.closeDisk()
-                    if let onExit = self.onExit { onExit(result) } else { Darwin.exit(result == 0 ? 0 : 1) }
+                    if let onOutcome = self.onOutcome { onOutcome(outcome) }
+                    else if let onExit = self.onExit {
+                        switch outcome {
+                        case .poweroff(let status), .reset(let status): onExit(status)
+                        case .failed(let code): onExit(code)
+                        }
+                    } else {
+                        switch outcome {
+                        case .poweroff(let status), .reset(let status): Darwin.exit(status)
+                        case .failed: Darwin.exit(1)
+                        }
+                    }
                 }
             }
             thread.name = "brinewell-vmm"
@@ -219,7 +285,9 @@ public final class Runtime {
             thread.qualityOfService = .userInteractive
             thread.start()
         } catch {
+            stopping = true
             hdrWork?.cancel(); hdrWork = nil
+            shutdownEvent.close()
             workContext.stop()
             display.close()
             input.setActive(false)
@@ -230,6 +298,10 @@ public final class Runtime {
             closeDisk()
             throw error
         }
+    }
+
+    private func requestShutdown() {
+        if let onShutdownRequested { onShutdownRequested() } else { shutdown() }
     }
 
     private func closeDisk() {
@@ -350,10 +422,7 @@ public final class Runtime {
         input.setActive(false)
         ports.setInputActive(false)
         report("BRINEWELL state stopping")
-        var one: UInt64 = 1
-        if Darwin.write(shutdownFD, &one, MemoryLayout<UInt64>.size) != MemoryLayout<UInt64>.size {
-            report("BRINEWELL control error cannot send guest shutdown key: \(String(cString: strerror(errno)))")
-        }
+        shutdownEvent.signal()
     }
 
 

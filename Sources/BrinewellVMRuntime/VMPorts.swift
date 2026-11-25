@@ -61,6 +61,7 @@ final class VMPorts {
     private var telemetryOverflow = false
     private var telemetryReplyInterrupted = false
     private var telemetry: HostHardwareTelemetry?
+    private var ownsFIFO = false
     private var fifoRead: Int32 = -1
     private var consoleLog: Int32 = -1
     private var progressLog: Int32 = -1
@@ -88,6 +89,7 @@ final class VMPorts {
     private lazy var physicalGamepad = PhysicalGamepad(input: input)
     private var release: DispatchWorkItem?
     private var closed = false
+    private var closing = false
     private var onReady: (() -> Void)?
     private var onPointerFocus: ((String) -> Void)?
     private var onGameFrame: ((GameFrameSample) -> Void)?
@@ -133,8 +135,13 @@ final class VMPorts {
             try nonblocking(clipboardWrite)
         } catch {
             for fd in descriptors { Darwin.close(fd) }
+            descriptors.removeAll()
             throw error
         }
+    }
+
+    deinit {
+        for fd in descriptors { Darwin.close(fd) }
     }
 
     private func makePort() throws -> (Int32, Int32, Int32, Int32) {
@@ -215,6 +222,7 @@ final class VMPorts {
         self.onGameFrame = onGameFrame
         let fifo = runDirectory.appendingPathComponent("control.fifo").path
         guard mkfifo(fifo, 0o600) == 0 else { throw Self.error("cannot create control.fifo") }
+        ownsFIFO = true
         fifoRead = open(fifo, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
         guard fifoRead >= 0 else { throw Self.error("cannot open control.fifo") }
         descriptors.append(fifoRead)
@@ -630,7 +638,20 @@ final class VMPorts {
 
 
     func close() {
-        guard !closed else { return }
+        guard !closed, !closing else { return }
+        closing = true
+        // The main-queue read source may not have run before the VM exits.
+        // Consume complete commands before removing the FIFO, without waiting
+        // for a writer or allowing a shutdown callback to re-enter close().
+        if fifoRead >= 0 {
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while true {
+                let count = Darwin.read(fifoRead, &buffer, buffer.count)
+                if count > 0 { readFIFO(Array(buffer[..<count])) }
+                else if count < 0 && errno == EINTR { continue }
+                else { break }
+            }
+        }
         stopTelemetry()
         physicalGamepad.stop()
         flush()
@@ -652,5 +673,9 @@ final class VMPorts {
         physicalResetPending = false
         for fd in descriptors { Darwin.close(fd) }
         descriptors.removeAll()
+        if ownsFIFO {
+            unlink(runDirectory.appendingPathComponent("control.fifo").path)
+            ownsFIFO = false
+        }
     }
 }

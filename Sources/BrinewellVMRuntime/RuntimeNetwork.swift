@@ -91,12 +91,12 @@ final class RuntimeNetwork {
     }
 
     func stop() {
-        try? lifeline?.fileHandleForWriting.close()
-        lifeline = nil
-        if let process, process.isRunning {
-            kill(process.processIdentifier, SIGTERM)
+        if let process {
+            if process.isRunning { kill(process.processIdentifier, SIGTERM) }
             process.waitUntilExit()
         }
+        try? lifeline?.fileHandleForWriting.close()
+        lifeline = nil
         process = nil
     }
 }

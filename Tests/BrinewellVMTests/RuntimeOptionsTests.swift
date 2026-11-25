@@ -33,6 +33,39 @@ final class RuntimeOptionsTests: XCTestCase {
                   "--run-directory", run.path, "--graphics-backend", "venus"], root)
     }
 
+    func testRetainedDiskLockSurvivesAcrossBootOptions() throws {
+        try withRuntimeArguments { arguments, root in
+            let first = try RuntimeOptions(arguments: arguments)
+            let retained = try first.dupDiskFD()
+            let descriptorFlags = fcntl(retained, F_GETFD)
+            XCTAssertGreaterThanOrEqual(descriptorFlags, 0)
+            XCTAssertNotEqual(descriptorFlags & FD_CLOEXEC, 0)
+            close(first.diskFD)
+            let contender = open(root.appendingPathComponent("disk.img").path, O_RDWR)
+            XCTAssertGreaterThanOrEqual(contender, 0)
+            defer { close(contender) }
+            XCTAssertNotEqual(flock(contender, LOCK_EX | LOCK_NB), 0)
+            let second = try RuntimeOptions(arguments: arguments, retainingDiskFD: retained)
+            close(second.diskFD)
+            XCTAssertNotEqual(flock(contender, LOCK_EX | LOCK_NB), 0)
+            close(retained)
+            XCTAssertEqual(flock(contender, LOCK_EX | LOCK_NB), 0)
+        }
+    }
+
+    func testRetainedDiskRejectsReplacedPath() throws {
+        try withRuntimeArguments { arguments, root in
+            let first = try RuntimeOptions(arguments: arguments)
+            let retained = try first.dupDiskFD()
+            close(first.diskFD)
+            defer { close(retained) }
+            let disk = root.appendingPathComponent("disk.img")
+            try FileManager.default.moveItem(at: disk, to: root.appendingPathComponent("old.img"))
+            try Data().write(to: disk)
+            XCTAssertThrowsError(try RuntimeOptions(arguments: arguments, retainingDiskFD: retained))
+        }
+    }
+
     func testOmittedDisplayOptionsKeepLegacyDefaults() throws {
         try withRuntimeArguments { arguments, _ in
             let options = try RuntimeOptions(arguments: arguments)

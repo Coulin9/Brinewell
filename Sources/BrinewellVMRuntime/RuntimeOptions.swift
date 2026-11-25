@@ -82,7 +82,8 @@ public struct RuntimeOptions {
     var renderer: URL { contents.appendingPathComponent("Helpers/virgl_render_server") }
     var vulkanDriver: URL { contents.appendingPathComponent("Frameworks/libvulkan_kosmickrisp.dylib") }
 
-    public init(arguments: [String]) throws {
+    /// Pass only a descriptor obtained from dupDiskFD(); it must remain open across boots.
+    public init(arguments: [String], retainingDiskFD: Int32? = nil) throws {
         let accepted: Set<String> = [
             "--resources", "--disk", "--cpus", "--memory-gib", "--run-directory", "--ssh-port",
             "--graphics-backend", "--d3dmetal-framework", "--neptune-aperture-mib", "--neptune-multi-ring",
@@ -231,14 +232,14 @@ public struct RuntimeOptions {
               runStat.st_uid == getuid(), (runStat.st_mode & 0o777) == 0o700 else {
             throw RuntimeError("run directory must be an existing owner-only directory")
         }
-        let fd = open(diskPath, O_RDWR | O_CLOEXEC)
+        let fd = retainingDiskFD.map { fcntl($0, F_DUPFD_CLOEXEC, 3) } ?? open(diskPath, O_RDWR | O_CLOEXEC)
         guard fd >= 0 else { throw RuntimeError("cannot open disk: \(String(cString: strerror(errno)))") }
         var diskStat = stat()
         guard fstat(fd, &diskStat) == 0, (diskStat.st_mode & S_IFMT) == S_IFREG else {
             close(fd)
             throw RuntimeError("disk is not a regular file")
         }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        guard retainingDiskFD != nil || flock(fd, LOCK_EX | LOCK_NB) == 0 else {
             let error = errno
             close(fd)
             if error == EWOULDBLOCK || error == EAGAIN {
@@ -297,6 +298,13 @@ public struct RuntimeOptions {
             close(fd)
             throw RuntimeError("Neptune is not available: \(reasons[backend] ?? "unknown reason")")
         }
+    }
+
+    /// Duplicate the locked open-file description; the caller owns the returned descriptor.
+    public func dupDiskFD() throws -> Int32 {
+        let fd = fcntl(diskFD, F_DUPFD_CLOEXEC, 3)
+        guard fd >= 0 else { throw RuntimeError("cannot duplicate disk descriptor") }
+        return fd
     }
 
     func neptuneSupport(for backend: GraphicsBackend) -> NeptuneSupport? {

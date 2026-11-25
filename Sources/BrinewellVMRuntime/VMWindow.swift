@@ -2,7 +2,7 @@ import AppKit
 
 /// AppKit owns the full-screen Space, animations and window restoration.
 @MainActor
-final class VMWindow: NSWindow, NSWindowDelegate {
+public final class VMWindow: NSWindow, NSWindowDelegate {
     private enum FullScreenPhase { case windowed, entering, fullScreen, exiting }
     private var phase = FullScreenPhase.windowed
     private var requestedFullScreen: Bool?
@@ -48,16 +48,18 @@ final class VMWindow: NSWindow, NSWindowDelegate {
         }
     }
 
-    override func close() {
+    public func closeForSessionEnd() { onClose = nil; close() }
+
+    public override func close() {
         requestedFullScreen = nil
         super.close()
     }
 
-    func windowWillEnterFullScreen(_ notification: Notification) {
+    public func windowWillEnterFullScreen(_ notification: Notification) {
         phase = .entering
     }
 
-    func windowDidEnterFullScreen(_ notification: Notification) {
+    public func windowDidEnterFullScreen(_ notification: Notification) {
         finishEnteringFullScreen()
     }
 
@@ -68,12 +70,12 @@ final class VMWindow: NSWindow, NSWindowDelegate {
         finishFullScreenRequest()
     }
 
-    func windowWillExitFullScreen(_ notification: Notification) {
+    public func windowWillExitFullScreen(_ notification: Notification) {
         phase = .exiting
         restoreMenuBar()
     }
 
-    func windowDidExitFullScreen(_ notification: Notification) {
+    public func windowDidExitFullScreen(_ notification: Notification) {
         finishExitingFullScreen()
     }
 
@@ -84,12 +86,12 @@ final class VMWindow: NSWindow, NSWindowDelegate {
         finishFullScreenRequest()
     }
 
-    func windowDidFailToEnterFullScreen(_ window: NSWindow) {
+    public func windowDidFailToEnterFullScreen(_ window: NSWindow) {
         finishExitingFullScreen()
         (contentView as? VMInputView)?.updateActivity()
     }
 
-    func windowDidFailToExitFullScreen(_ window: NSWindow) {
+    public func windowDidFailToExitFullScreen(_ window: NSWindow) {
         finishEnteringFullScreen()
         (contentView as? VMInputView)?.updateActivity()
     }
@@ -102,12 +104,12 @@ final class VMWindow: NSWindow, NSWindowDelegate {
         }
     }
 
-    func windowDidChangeScreen(_ notification: Notification) { onScreenChange?() }
-    func windowDidChangeBackingProperties(_ notification: Notification) { onScreenChange?() }
-    func windowDidResize(_ notification: Notification) { updateMenuBar() }
-    func windowDidBecomeKey(_ notification: Notification) { updateMenuBar() }
-    func windowWillClose(_ notification: Notification) { restoreMenuBar() }
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
+    public func windowDidChangeScreen(_ notification: Notification) { onScreenChange?() }
+    public func windowDidChangeBackingProperties(_ notification: Notification) { onScreenChange?() }
+    public func windowDidResize(_ notification: Notification) { updateMenuBar() }
+    public func windowDidBecomeKey(_ notification: Notification) { updateMenuBar() }
+    public func windowWillClose(_ notification: Notification) { restoreMenuBar() }
+    public func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard let onClose else { return true }
         onClose()
         return false
@@ -115,7 +117,7 @@ final class VMWindow: NSWindow, NSWindowDelegate {
 
     /// Reordering an already extended full-screen window otherwise reapplies the
     /// camera inset. Allow AppKit to resize tiles and to restore windowed mode.
-    override func setFrame(_ frameRect: NSRect, display flag: Bool) {
+    public override func setFrame(_ frameRect: NSRect, display flag: Bool) {
         if extendsCameraArea, (phase == .entering || phase == .fullScreen),
            styleMask.contains(.fullScreen), let screen, screen.safeAreaInsets.top > 0,
            frame == screen.frame, NativeFullScreenSupport.occupiesWholeScreen(self) {
@@ -147,7 +149,7 @@ final class VMWindow: NSWindow, NSWindowDelegate {
         }
     }
 
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    public override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if event.modifierFlags.intersection([.control, .command, .option, .shift]) == [.control, .command],
            event.charactersIgnoringModifiers?.lowercased() == "f" {
             if !isFullScreenTransitioning && !event.isARepeat { super.toggleFullScreen(nil) }
