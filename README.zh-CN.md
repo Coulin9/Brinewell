@@ -195,7 +195,9 @@ Brinewell 随附带有 Easy Anti-Cheat 补丁的 FEX（[StonkGuy/FEX](https://gi
 
 ### 游戏优化配置
 
-赛博朋克 2077、3DMark、黑夜君临和只狼的优化配置默认启用。离线同步会把游戏启动选项设为
+赛博朋克 2077、荒野大镖客：救赎 2、3DMark、黑夜君临和只狼的优化配置默认启用。
+荒野大镖客：救赎 2 在 Neptune / Mullion 下没有图形设置时默认使用 DX12，不会覆盖已有设置。
+离线同步会把游戏启动选项设为
 `brinewell-game-launch`，并保留已有及用户后续修改的选项。复杂的 shell 启动选项需要手动组合。
 也可以直接在 Steam 中设置：
 

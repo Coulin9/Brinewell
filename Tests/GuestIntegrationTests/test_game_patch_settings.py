@@ -36,6 +36,9 @@ class GamePatchSettingsTests(unittest.TestCase):
 
     def test_all_supported_patches_are_defaults(self):
         settings.synchronize(self.steam, self.state)
+        self.assertEqual(settings.PATCHES["1174180"], "rdr2")
+        self.assertEqual(self.options("1174180"),
+                         "/usr/lib/brinewell/brinewell-game-launch --profile rdr2 -- %command%")
         for appid in settings.PATCHES:
             self.assertEqual(self.options(appid), settings.launch_options(appid, None))
         before = self.config.read_bytes()

@@ -245,9 +245,10 @@ are not covered.
 
 ### Game profiles
 
-Optimisation profiles for Cyberpunk 2077, 3DMark, Elden Ring Nightreign and Sekiro are enabled by
-default. The offline sync sets the game's launch options to `brinewell-game-launch`,
-keeping existing and later user options. Complex shell launch options must be combined
+Optimisation profiles for Cyberpunk 2077, Red Dead Redemption 2, 3DMark, Elden Ring Nightreign
+and Sekiro are enabled by default. Red Dead Redemption 2 defaults to DX12 on Neptune / Mullion
+when no graphics settings exist, without overwriting existing settings. The offline sync sets
+the game's launch options to `brinewell-game-launch`, keeping existing and later user options. Complex shell launch options must be combined
 by hand. You can also set it manually in Steam:
 
 ```text

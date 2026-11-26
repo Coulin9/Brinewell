@@ -10,7 +10,7 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
-from game_patches import PATCHES, prepare
+from game_patches import PATCHES, prepare, try_seed_rdr2
 
 
 WINE_SERVICES = {
@@ -154,6 +154,31 @@ def run_with_affinity(command, environment, identity):
         time.sleep(2 if targets or game_seen else 0.2)
 
 
+def run_with_deferred_seed(command, environment, seed):
+    child = subprocess.Popen(command, env=environment)
+
+    def forward_signal(number, _frame):
+        try:
+            child.send_signal(number)
+        except ProcessLookupError:
+            pass
+
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(number, forward_signal)
+    while child.poll() is None:
+        try:
+            if try_seed_rdr2(seed["prefix"], seed["state"], nonblocking=True):
+                break
+        except BlockingIOError:
+            pass
+        try:
+            child.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+    status = child.wait()
+    return status if status >= 0 else 128 - status
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", required=True,
@@ -169,6 +194,8 @@ def main():
         print("brinewell-game-launch: profile did not match this launch; using the original command", file=sys.stderr)
     elif identity["affinity"]:
         return run_with_affinity(command, environment, identity)
+    elif identity.get("deferred_seed"):
+        return run_with_deferred_seed(command, environment, identity["deferred_seed"])
     os.execvpe(command[0], command, environment)
 
 

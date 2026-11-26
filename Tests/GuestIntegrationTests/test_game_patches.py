@@ -1,3 +1,11 @@
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import subprocess
+import contextlib
+import io
 import importlib.machinery
 import struct
 import importlib.util
@@ -194,6 +202,208 @@ class GamePatchTests(unittest.TestCase):
         target.write_bytes(b"existing")
         game_patches.ensure_compiler(source, target, self.root / "records")
         self.assertEqual(target.read_bytes(), b"existing")
+
+    def test_rdr2_seed_qualification_and_cleanup(self):
+        self.assertEqual(game_patches.PATCHES["1174180"], "rdr2")
+        environment = dict(self.environment, SteamAppId="1174180")
+        prefix = Path(environment["STEAM_COMPAT_DATA_PATH"]) / "pfx"
+        target = prefix / game_patches.RDR2_SETTINGS
+        state = self.root / "records"
+        (prefix / "drive_c/users/steamuser/Documents").mkdir(parents=True)
+        with patch.object(game_patches, "patch_state_dir", return_value=state):
+            for mode in ("neptune", "mullion"):
+                for name in ("PlayRDR2.exe", "RDR2.exe"):
+                    with self.subTest(mode=mode, name=name):
+                        self.mode.write_text(mode)
+                        command = self.command(name)
+                        self.assertIsNotNone(game_patches.prepare("rdr2", command, environment, "")[2])
+                        self.assertEqual(target.read_bytes(), game_patches.RDR2_SEED)
+                        record = json.loads(next(state.glob("*.json")).read_text())
+                        self.assertEqual(record["sha256"], hashlib.sha256(target.read_bytes()).hexdigest())
+                        self.mode.write_text("venus")
+                        self.assertIsNone(game_patches.prepare("rdr2", command, environment, "")[2])
+                        self.assertFalse(target.exists())
+            self.mode.write_text("neptune")
+            target.write_text("<API>kSettingAPI_Vulkan</API>")
+            command = self.command("RDR2.exe")
+            game_patches.prepare("rdr2", command, environment, "")
+            self.assertEqual(target.read_text(), "<API>kSettingAPI_Vulkan</API>")
+            target.unlink()
+            game_patches.prepare("rdr2", command, environment, "")
+            target.write_text("game-saved settings")
+            game_patches.prepare("rdr2", command, environment, "")
+            self.mode.write_text("venus")
+            game_patches.prepare("rdr2", command, environment, "")
+            self.assertEqual(target.read_text(), "game-saved settings")
+            target.unlink()
+            self.mode.write_text("neptune")
+            for flag in ("-sgadriver=vulkan", "-vulkan"):
+                game_patches.prepare("rdr2", command, environment, "")
+                self.assertTrue(target.exists())
+                game_patches.prepare("rdr2", command + [flag], environment, "")
+                self.assertFalse(target.exists())
+                game_patches.prepare("rdr2", command + [flag.upper()], environment, "")
+                self.assertFalse(target.exists())
+            self.assertIsNone(game_patches.prepare("rdr2", self.command("other.exe"), environment, "")[2])
+
+    def test_rdr2_rejects_escaping_symlink(self):
+        environment = dict(self.environment, SteamAppId="1174180")
+        prefix = Path(environment["STEAM_COMPAT_DATA_PATH"]) / "pfx"
+        user = prefix / "drive_c/users/steamuser"
+        user.mkdir(parents=True)
+        outside = self.root / "outside"
+        outside.mkdir()
+        (user / "Documents").symlink_to(outside, target_is_directory=True)
+        with patch.object(game_patches, "patch_state_dir", return_value=self.root / "records"):
+            game_patches.prepare("rdr2", self.command("PlayRDR2.exe"), environment, "")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_rdr2_fresh_prefix_deferred_launch(self):
+        environment = dict(self.environment, SteamAppId="1174180")
+        prefix = Path(environment["STEAM_COMPAT_DATA_PATH"]) / "pfx"
+        state = self.root / "records"
+        command = self.command("RDR2.exe")
+        with patch.object(game_patches, "patch_state_dir", return_value=state):
+            _, _, identity = game_patches.prepare("rdr2", command, environment, "")
+        self.assertFalse(prefix.exists())
+        self.assertEqual(identity["deferred_seed"]["prefix"], str(prefix.resolve()))
+        proton = self.tool / "proton"
+        proton.write_text("#!/usr/bin/env python3\nimport os, pathlib, time\n"
+                          "p = pathlib.Path(os.environ['STEAM_COMPAT_DATA_PATH']) / 'pfx/drive_c/users/steamuser/Documents'\n"
+                          "p.mkdir(parents=True)\n"
+                          "time.sleep(1.5)\n"
+                          "assert (p / 'Rockstar Games/Red Dead Redemption 2/Settings/system.xml').is_file()\n")
+        env = dict(os.environ, **environment)
+        result = subprocess.run([sys.executable, "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); import game_patches; "
+            "game_patches.MODE_FILE=__import__('pathlib').Path(sys.argv[2]); "
+            "game_patches.patch_state_dir=lambda _: __import__('pathlib').Path(sys.argv[3]); "
+            "import importlib.machinery; m=importlib.machinery.SourceFileLoader('launch', sys.argv[1]+'/brinewell-game-launch').load_module(); "
+            "m.Path=lambda _: type('Cmdline', (), {'read_text': lambda self: ''})(); "
+            "sys.argv=['brinewell-game-launch','--profile','rdr2','--']+sys.argv[4:]; sys.exit(m.main())",
+            str(SCRIPTS), str(self.mode), str(state), str(proton), "run", command[-1]],
+            env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((prefix / game_patches.RDR2_SETTINGS).read_bytes(), game_patches.RDR2_SEED)
+
+    def test_rdr2_cleanup_triggers_and_same_bytes_replacement(self):
+        environment = dict(self.environment, SteamAppId="1174180")
+        prefix = Path(environment["STEAM_COMPAT_DATA_PATH"]) / "pfx"
+        (prefix / "drive_c/users/steamuser/Documents").mkdir(parents=True)
+        target = prefix / game_patches.RDR2_SETTINGS
+        command = self.command("RDR2.exe")
+        state = self.root / "records"
+        with patch.object(game_patches, "patch_state_dir", return_value=state):
+            for mode, env, flags in [("venus", {}, []), ("neptune", {"WINEDLLOVERRIDES": "d3d12=n"}, []),
+                                     ("neptune", {}, ["-Vulkan"]), ("neptune", {}, ["-SgaDriver=Vulkan"]),
+                                     ("neptune", {}, ["-SgaDriver", "Vulkan"])]:
+                with self.subTest(mode=mode, env=env, flags=flags):
+                    self.mode.write_text("neptune")
+                    game_patches.prepare("rdr2", command, environment, "")
+                    self.assertTrue(target.exists())
+                    self.mode.write_text(mode)
+                    game_patches.prepare("rdr2", command + flags, dict(environment, **env), "")
+                    self.assertFalse(target.exists())
+            self.mode.write_text("neptune")
+            game_patches.prepare("rdr2", command, environment, "")
+            replacement = target.with_name("replacement")
+            replacement.write_bytes(target.read_bytes())
+            replacement.replace(target)
+            self.mode.write_text("venus")
+            game_patches.prepare("rdr2", command, environment, "")
+            self.assertEqual(target.read_bytes(), game_patches.RDR2_SEED)
+            self.assertFalse(list(state.glob("*.json")))
+
+    def test_rdr2_cleanup_retries_after_transient_error(self):
+        prefix = self.root / "pfx"
+        (prefix / "drive_c/users/steamuser/Documents").mkdir(parents=True)
+        state = self.root / "records"
+        game_patches.seed_rdr2_settings(prefix, state)
+        target = prefix / game_patches.RDR2_SETTINGS
+        record = next(state.glob("*.json"))
+        original_unlink = os.unlink
+
+        def fail_target(path, *args, **kwargs):
+            if path == "system.xml":
+                raise OSError(errno.EIO, "temporary failure")
+            return original_unlink(path, *args, **kwargs)
+
+        with patch.object(game_patches.os, "unlink", side_effect=fail_target):
+            with self.assertRaises(OSError):
+                game_patches.cleanup_rdr2_settings(prefix, state)
+        self.assertTrue(record.exists())
+        self.assertEqual(target.read_bytes(), game_patches.RDR2_SEED)
+        game_patches.cleanup_rdr2_settings(prefix, state)
+        self.assertFalse(target.exists())
+        self.assertFalse(record.exists())
+
+    def test_rdr2_cleanup_preserves_fifo_without_blocking(self):
+        prefix = self.root / "pfx"
+        (prefix / "drive_c/users/steamuser/Documents").mkdir(parents=True)
+        state = self.root / "records"
+        game_patches.seed_rdr2_settings(prefix, state)
+        target = prefix / game_patches.RDR2_SETTINGS
+        target.unlink()
+        os.mkfifo(target)
+        game_patches.cleanup_rdr2_settings(prefix, state)
+        self.assertTrue(target.exists())
+        self.assertFalse(list(state.glob("*.json")))
+
+    def test_deferred_seed_locked_state_does_not_delay_child_exit(self):
+        prefix = self.root / "pfx"
+        (prefix / "drive_c/users/steamuser/Documents").mkdir(parents=True)
+        state = self.root / "records"
+        state.mkdir()
+        with (state / "files.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = subprocess.run([sys.executable, "-c",
+                "import sys, importlib.machinery; sys.path.insert(0, sys.argv[1]); "
+                "m=importlib.machinery.SourceFileLoader('launch', sys.argv[1]+'/brinewell-game-launch').load_module(); "
+                "sys.exit(m.run_with_deferred_seed([sys.executable, '-c', 'import time; time.sleep(0.2); exit(7)'], "
+                "__import__('os').environ, {'prefix':sys.argv[2], 'state':sys.argv[3]}))",
+                str(SCRIPTS), str(prefix), str(state)], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertFalse((prefix / game_patches.RDR2_SETTINGS).exists())
+
+    def test_rdr2_seed_fallback_preserves_file_if_record_fails(self):
+        prefix = self.root / "pfx"
+        (prefix / "drive_c/users/steamuser/Documents").mkdir(parents=True)
+        state = self.root / "records"
+        real_write_record = game_patches.write_record
+        calls = []
+
+        def write_record(path, record):
+            calls.append(record)
+            if len(calls) == 2:
+                raise OSError(errno.EIO, "record failure")
+            real_write_record(path, record)
+
+        with patch.object(game_patches.os, "link", side_effect=OSError(errno.EPERM, "no links")), \
+             patch.object(game_patches, "write_record", side_effect=write_record):
+            with self.assertRaises(OSError):
+                game_patches.seed_rdr2_settings(prefix, state)
+        self.assertEqual((prefix / game_patches.RDR2_SETTINGS).read_bytes(), game_patches.RDR2_SEED)
+
+    def test_rdr2_internal_symlink_and_io_errors_do_not_block(self):
+        environment = dict(self.environment, SteamAppId="1174180")
+        prefix = Path(environment["STEAM_COMPAT_DATA_PATH"]) / "pfx"
+        documents = prefix / "drive_c/users/steamuser/Documents"
+        settings = documents / "Rockstar Games/Red Dead Redemption 2/Settings"
+        settings.parent.mkdir(parents=True)
+        destination = prefix / "elsewhere"
+        destination.mkdir()
+        settings.symlink_to(destination, target_is_directory=True)
+        command = self.command("RDR2.exe")
+        with patch.object(game_patches, "patch_state_dir", return_value=self.root / "records"):
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertIsNotNone(game_patches.prepare("rdr2", command, environment, "")[2])
+            self.assertIn("RDR2 seed failed", stderr.getvalue())
+            self.assertEqual(list(destination.iterdir()), [])
+            settings.unlink()
+            settings.write_text("not a directory")
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertIsNotNone(game_patches.prepare("rdr2", command, environment, "")[2])
+            self.assertIn("RDR2 seed failed", stderr.getvalue())
 
     def test_nightreign_returns_launch_specific_identity(self):
         command = self.command("start_protected_game.exe")
