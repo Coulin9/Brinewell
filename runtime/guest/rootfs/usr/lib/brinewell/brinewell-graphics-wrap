@@ -800,7 +800,8 @@ def _neptune_injection(mode, cmd, env, tool):
     if not (bridge.joinpath("nptunix.dll").is_file()
             and bridge.joinpath("nptunix.so").is_file()):
         return inject
-    providers = {"d3d11": "dxvk", "dxgi": "dxvk", "d3d12": "vkd3d-proton"}
+    providers = {"d3d11": "dxvk", "dxgi": "dxvk", "d3d12": "vkd3d-proton",
+                 "d3d10core": "dxvk"}
     binds = []
     unsafe = False
     for name in GRAPHICS_DLLS:
@@ -808,6 +809,7 @@ def _neptune_injection(mode, cmd, env, tool):
         dll_dir = tool / "files/lib/wine" / providers[name] / f"{arch}-windows"
         target = dll_dir / f"{name}.dll"
         if not (source.is_file() and dll_dir.is_dir() and target.is_file()):
+            _log(f"missing payload or provider slot for {name}.dll ({source}, {target}): passing through")
             return inject
         if Path(os.path.realpath(dll_dir)) != Path(os.path.abspath(dll_dir)):
             unsafe = True

@@ -112,7 +112,7 @@ def effective_mode(live_mode, app_id=None, sock_path=None, timeout=6.0,
 
 PAYLOAD = Path("/usr/lib/brinewell/neptune")
 CONTAINER_PAYLOAD = Path("/run/host/usr/lib/brinewell/neptune")
-GRAPHICS_DLLS = ("d3d11", "dxgi", "d3d12")
+GRAPHICS_DLLS = ("d3d11", "dxgi", "d3d12", "d3d10core")
 VERBS = ("run", "waitforexitandrun")
 ELF_MACHINE = {"x86_64": 62, "aarch64": 183}
 # PE machine types: x64 also covers ARM64EC modules (Proton installs ARM64EC

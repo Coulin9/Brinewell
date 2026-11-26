@@ -50,6 +50,29 @@ for d in "$HOME"/dx12-lab/*/; do
     for name in d3d11 dxgi d3d12; do
         [[ -f "$d$name.dll" ]] && { cp -f "$win/$name.dll" "$d$name.dll"; n=$((n + 1)); }
     done
+    # Only explicitly opted-in harnesses participate in the fourth DLL sync.
+    if [[ -f "${d}.brinewell-sync-d3d10core" ]]; then
+        core="${d}d3d10core.dll"
+        stamp="${d}.brinewell-managed-d3d10core.sha256"
+        if [[ -f "$win/d3d10core.dll" ]]; then
+            rm -f "$stamp"
+            cp -f "$win/d3d10core.dll" "$core"
+            sha256sum "$core" | cut -d ' ' -f 1 > "$stamp"
+            n=$((n + 1))
+        else
+            echo "warning: $payload lacks d3d10core.dll; checking managed harness copy in $d" >&2
+            if [[ -f "$stamp" && ! -L "$stamp" && -f "$core" && ! -L "$core" ]] \
+                    && recorded=$(<"$stamp") \
+                    && actual=$(sha256sum "$core") \
+                    && [[ "$recorded" == "${actual%% *}" ]]; then
+                if rm -f "$core"; then
+                    rm -f "$stamp" || echo "warning: cannot remove $stamp" >&2
+                else
+                    echo "warning: cannot remove managed $core" >&2
+                fi
+            fi
+        fi
+    fi
     sys32="${d}pfx/drive_c/windows/system32/nptunix.dll"
     [[ -f "$sys32" ]] && { cp -f "$win/nptunix.dll" "$sys32"; n=$((n + 1)); }
     if [[ -f "${d}run-vm.sh" ]]; then

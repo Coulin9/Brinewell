@@ -57,7 +57,7 @@ class GraphicsWrapTests(unittest.TestCase):
         for arch in ("x86_64", "aarch64"):
             for sub in (f"{arch}-windows", f"{arch}-unix", f"bridge/{arch}"):
                 (self.payload / sub).mkdir(parents=True)
-            for name in ("d3d11", "dxgi", "d3d12", "nptunix"):
+            for name in ("d3d11", "dxgi", "d3d12", "d3d10core", "nptunix"):
                 (self.payload / f"{arch}-windows/{name}.dll").write_bytes(("p" + name).encode())
             (self.payload / f"{arch}-unix/nptunix.so").write_bytes(b"so")
             for suffix in ("dll", "so"):
@@ -87,6 +87,7 @@ class GraphicsWrapTests(unittest.TestCase):
         dxvk.mkdir(parents=True, exist_ok=True)
         (dxvk / "d3d11.dll").write_bytes(_pe(0x8664))
         (dxvk / "dxgi.dll").write_bytes(_pe(0x8664))
+        (dxvk / "d3d10core.dll").write_bytes(_pe(0x8664))
         vkd3d = wine / "vkd3d-proton" / f"{arch}-windows"
         vkd3d.mkdir(parents=True, exist_ok=True)
         (vkd3d / "d3d12.dll").write_bytes(_pe(0x8664))
@@ -409,7 +410,7 @@ class GraphicsWrapTests(unittest.TestCase):
                 self.assertEqual(self.execed[-1][1], [str(self.bwrap), *argv_template])
 
     def test_grouped_and_wildcard_overrides_no_extra(self):
-        for value in ("d3d12,dxgi=n", "D3D11.DLL=b", "d3d*=n"):
+        for value in ("d3d12,dxgi=n", "D3D11.DLL=b", "d3d*=n", "d3d10core=b", "other,D3D10CORE.DLL=n", "d3d10?ore=n"):
             argv = self.run_wrap(["waitforexitandrun", "/game/x.exe"],
                                  env={"WINEDLLOVERRIDES": value}, mode="neptune")
             self.assertNotIn("--ro-bind", argv)
@@ -435,6 +436,35 @@ class GraphicsWrapTests(unittest.TestCase):
         self.assertEqual(tail, [str(self.pv), "--opt=x", "--", "FEXCompatTool",
                                 str(self.tool / "proton"), "waitforexitandrun",
                                 "/game/game.exe", "--opt"])
+
+    def test_four_provider_binds_are_atomic_for_each_backend_and_arch(self):
+        self._make_tool(self.tool, "aarch64")
+        for mode, arch, env in (("neptune", "x86_64", {}),
+                                ("mullion", "x86_64", {}),
+                                ("mullion", "aarch64", {"PROTON_USE_ARM64": "1"})):
+            with self.subTest(mode=mode, arch=arch):
+                argv = self.game(mode=mode, env=env)
+                expected = [(str(self.payload / f"{arch}-windows/{name}.dll"),
+                             str(self.tool / f"files/lib/wine/{provider}/{arch}-windows/{name}.dll"))
+                            for name, provider in (("d3d11", "dxvk"), ("dxgi", "dxvk"),
+                                                   ("d3d12", "vkd3d-proton"), ("d3d10core", "dxvk"))]
+                self.assertEqual(self._binds(argv), expected)
+                overrides = self._setenvs(argv)["WINEDLLOVERRIDES"].split(";")
+                for name in ("d3d11", "dxgi", "d3d12", "d3d10core"):
+                    self.assertIn(f"{name}=n", overrides)
+                self.assertFalse(any("syswow64" in part.lower() or "i386-windows" in part for pair in expected for part in pair))
+        self.assertEqual(self._binds(self.game(mode="venus")), [])
+
+    def test_missing_or_unsafe_d3d10core_aborts_all_binds(self):
+        source = self.payload / "x86_64-windows/d3d10core.dll"
+        target = self.tool / "files/lib/wine/dxvk/x86_64-windows/d3d10core.dll"
+        source.unlink()
+        self.assertEqual(self._binds(self.game(mode="neptune")), [])
+        source.write_bytes(b"source")
+        target.unlink()
+        self.assertEqual(self._binds(self.game(mode="neptune")), [])
+        target.symlink_to("/etc/passwd")
+        self.assertEqual(self._binds(self.game(mode="neptune")), [])
 
     def test_mullion_tag(self):
         argv = self.run_wrap(["waitforexitandrun", "/game/x.exe"], mode="mullion")
@@ -518,7 +548,7 @@ class GraphicsWrapTests(unittest.TestCase):
         for arch in ("x86_64", "aarch64"):
             for sub in (f"{arch}-windows", f"{arch}-unix", f"bridge/{arch}"):
                 (self.dev / sub).mkdir(parents=True)
-            for name in ("d3d11", "dxgi", "d3d12", "nptunix"):
+            for name in ("d3d11", "dxgi", "d3d12", "d3d10core", "nptunix"):
                 (self.dev / f"{arch}-windows/{name}.dll").write_bytes(("d" + name).encode())
             (self.dev / f"{arch}-unix/nptunix.so").write_bytes(b"devso")
             for suffix in ("dll", "so"):
@@ -544,7 +574,7 @@ class GraphicsWrapTests(unittest.TestCase):
         index = argv.index(str(self.dev))
         self.assertEqual(argv[index - 1:index + 2],
                          ["--ro-bind", str(self.dev), str(self.dev)])
-        for name in ("d3d11", "dxgi", "d3d12"):
+        for name in ("d3d11", "dxgi", "d3d12", "d3d10core"):
             self.assertIn(str(self.dev / f"x86_64-windows/{name}.dll"), argv)
         self.assertEqual(argv[argv.index("WINEDLLPATH") + 1].split(":")[0],
                          str(self.dev / "bridge/x86_64"))

@@ -129,7 +129,8 @@ CROSS
     -Dzstd=disabled -Dzlib=disabled -Ddisplay-info=disabled
     local -a ninja_targets=(
         src/virtio/neptune/d3d11.dll src/virtio/neptune/d3d12.dll
-        src/virtio/neptune/dxgi.dll src/virtio/neptune/nptunix/nptunix.dll)
+        src/virtio/neptune/dxgi.dll src/virtio/neptune/d3d10core.dll
+        src/virtio/neptune/nptunix/nptunix.dll)
     # The opt-in NGX shims are x86-64 PE only; arm64ec targets do not exist.
     if [[ $pe_target == x86_64 ]]; then
         ninja_targets+=(src/virtio/neptune/nvngx.dll
@@ -137,8 +138,36 @@ CROSS
     fi
     ninja -C "$build" -j3 "${ninja_targets[@]}"
     mkdir -p "$payload/$arch-windows" "$payload/$arch-unix"
-    cp "$build/src/virtio/neptune/"{d3d11,d3d12,dxgi}.dll \
+    cp "$build/src/virtio/neptune/"{d3d11,d3d12,dxgi,d3d10core}.dll \
         "$build/src/virtio/neptune/nptunix/nptunix.dll" "$payload/$arch-windows/"
+    local dll expected
+    for dll in d3d10core d3d11; do
+        llvm-readobj --coff-exports "$payload/$arch-windows/$dll.dll" | awk '
+            $1 == "Ordinal:" { ordinal = $2 }
+            $1 == "Name:" { print ordinal, $2 }
+        ' | LC_ALL=C sort > "/tmp/$dll-exports.txt"
+        if [[ $dll == d3d10core ]]; then
+            expected=$'1 D3D10CoreCreateDevice\n2 D3D10CoreGetVersion\n3 D3D10CoreRegisterLayers'
+        else
+            expected=$'1 D3D11CreateDevice\n2 D3D11CreateDeviceAndSwapChain\n3 D3D11On12CreateDevice'
+        fi
+        if ! cmp -s "/tmp/$dll-exports.txt" <(printf '%s\n' "$expected" | LC_ALL=C sort); then
+            echo "Neptune $pe_target $dll.dll has incorrect exports or ordinals" >&2
+            return 1
+        fi
+    done
+    if ! llvm-readobj --coff-imports "$payload/$arch-windows/d3d10core.dll" | awk '
+        $1 == "Name:" && tolower($2) ~ /\.dll$/ {
+            dll = tolower($2)
+            if (dll ~ /^(libstdc\+\+|libgcc|libc\+\+|libunwind|libwinpthread)/) bad = 1
+        }
+        $1 == "Symbol:" && dll == "d3d11.dll" && $2 == "D3D11CreateDevice" { found = 1 }
+        $1 == "Symbol:" && $2 == "D3D11CoreCreateDevice" { bad = 1 }
+        END { exit !(found && !bad) }
+    '; then
+        echo "Neptune $pe_target d3d10core.dll has incorrect imports" >&2
+        return 1
+    fi
     if ! llvm-readobj --coff-exports "$payload/$arch-windows/d3d12.dll" | awk '
         $1 == "Ordinal:" { ordinal = $2 }
         $1 == "Name:" && $2 == "D3D12CreateDevice" { create = (ordinal == 101) }
@@ -259,7 +288,7 @@ from pathlib import Path
 root = Path(sys.argv[1])
 files = {}
 for arch, elf_machine in [('x86_64', 62), ('aarch64', 183)]:
-    names = ['d3d11', 'd3d12', 'dxgi', 'nptunix']
+    names = ['d3d11', 'd3d12', 'dxgi', 'd3d10core', 'nptunix']
     if arch == 'x86_64':
         names += ['nvngx', 'nvapi64']
     for name in names:
