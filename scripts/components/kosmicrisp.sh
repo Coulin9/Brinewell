@@ -55,7 +55,7 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 meson setup "$OUTDIR/build" "$OUTDIR/src" \
     --prefix="$OUTDIR/prefix" --libdir=lib --buildtype=release -Db_ndebug=true \
     -Dplatforms=macos -Dvulkan-drivers=kosmickrisp \
-    -Dgallium-drivers= -Dopengl=false -Dzstd=disabled
+    -Dgallium-drivers= -Dopengl=false -Dzstd=disabled -Dxmlconfig=disabled
 ninja -C "$OUTDIR/build"
 ninja -C "$OUTDIR/build" install
 
