@@ -28,6 +28,17 @@ final class VMProcess: ObservableObject {
     @Published private(set) var graphicsError: String?
     @Published private(set) var runDirectory: URL?
     @Published private(set) var hostDisplayID: UInt32?
+    @Published private(set) var adminSnapshot: VMAdminSnapshot?
+    @Published private(set) var adminConnected = false
+    @Published private(set) var adminLastSyncedAt: Date?
+    @Published private(set) var sshForwardState: VMSSHForwardState = .unpublished
+    @Published private(set) var sshPort = VMSSHEndpoint.defaultPort
+    @Published private(set) var isUpdatingSSH = false
+    @Published private(set) var isUpdatingPassword = false
+    @Published private(set) var adminActionError: String?
+    private var adminSnapshotDiskID: String?
+    private var runningDiskID: String?
+    private var configuredDiskPath: String?
     var busy: Bool { state == .starting || state == .running || state == .stopping || state == .restarting }
     var logPath: String? { runDirectory?.appendingPathComponent("host.log").path }
     private var runtime: Runtime?
@@ -47,6 +58,7 @@ final class VMProcess: ObservableObject {
     func start(configuration: VMConfiguration, host: HostCapabilities, display: HostDisplayCapabilities?,
                shrinkHomeKiB: UInt64? = nil, willLaunch: (() -> Void)? = nil) {
         guard !busy, runtime == nil else { return }
+        syncAdminDiskContext(diskPath: configuration.diskImagePath)
         session.begin(shrinkPreparation: shrinkHomeKiB != nil)
         workContextWarning = nil
         uu = UUPluginStatus()
@@ -60,6 +72,7 @@ final class VMProcess: ObservableObject {
             guard let disk = configuration.diskImagePath, FileManager.default.isWritableFile(atPath: disk) else {
                 throw Failure(String(localized: "Choose an existing writable disk image."))
             }
+            runningDiskID = diskIdentity(forPath: disk)
             let contents = Bundle.main.bundleURL.appendingPathComponent("Contents")
             let resources = contents.appendingPathComponent("Resources/Runtime")
             for name in ["Image", "initramfs.cpio.gz", "brinewell-layer.img", "gvproxy"] {
@@ -125,6 +138,81 @@ final class VMProcess: ObservableObject {
         }
     }
 
+    private func diskIdentity(forPath path: String) -> String? {
+        guard !path.isEmpty else { return nil }
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+           let dev = attributes[.systemNumber], let ino = attributes[.systemFileNumber] {
+            return "\(dev):\(ino)"
+        }
+        return URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    public func syncAdminDiskContext(diskPath: String?) {
+        configuredDiskPath = diskPath
+        guard !session.active else { return }
+        let identity = diskPath.flatMap { diskIdentity(forPath: $0) }
+        if identity != adminSnapshotDiskID {
+            adminSnapshot = nil
+            adminLastSyncedAt = nil
+            adminActionError = nil
+            adminSnapshotDiskID = nil
+        }
+    }
+
+    private func recordAdminSnapshot(_ snapshot: VMAdminSnapshot, diskID: String?) {
+        adminSnapshot = snapshot
+        adminLastSyncedAt = Date()
+        adminSnapshotDiskID = diskID
+    }
+
+    private func resetAdminConnection() {
+        adminConnected = false
+        sshForwardState = .unpublished
+        isUpdatingSSH = false
+        isUpdatingPassword = false
+    }
+
+    func requestAdminRefresh() { runtime?.requestAdminRefresh() }
+    func clearAdminActionError() { adminActionError = nil }
+
+    func setGuestSSH(enabled: Bool) {
+        guard state == .running, adminConnected, !isUpdatingSSH, let runtime else { return }
+        isUpdatingSSH = true
+        adminActionError = nil
+        let token = session.generation
+        let diskID = runningDiskID
+        runtime.setGuestSSH(enabled: enabled) { [weak self] result in
+            Task { @MainActor in
+                guard let self, self.session.accepts(token), !self.session.requestedStop else { return }
+                self.isUpdatingSSH = false
+                switch result {
+                case .success(let snapshot): self.recordAdminSnapshot(snapshot, diskID: diskID)
+                case .failure(let code): self.adminActionError = adminErrorMessage(code)
+                }
+            }
+        }
+    }
+
+    func setGuestSudoPassword(_ password: String, confirmUnlock: Bool) async -> Result<Void, VMAdminErrorCode> {
+        guard state == .running, adminConnected, let runtime else { return .failure(.notConnected) }
+        guard !isUpdatingPassword else { return .failure(.busy) }
+        isUpdatingPassword = true
+        let token = session.generation
+        let diskID = runningDiskID
+        let result: Result<VMAdminSnapshot, VMAdminErrorCode> = await withCheckedContinuation { continuation in
+            runtime.setGuestSudoPassword(password, confirmUnlock: confirmUnlock) { continuation.resume(returning: $0) }
+        }
+        guard session.accepts(token), !session.requestedStop else { return .failure(.disconnected) }
+        isUpdatingPassword = false
+        switch result {
+        case .success(let snapshot):
+            recordAdminSnapshot(snapshot, diskID: diskID)
+            runtime.requestAdminRefresh()
+            return .success(())
+        case .failure(let code): return .failure(code)
+        }
+    }
+
     func setGameHUD(level: GameHUDLevel, position: GameHUDPosition) {
         runtime?.setGameHUD(level: level, position: position)
     }
@@ -180,6 +268,18 @@ final class VMProcess: ObservableObject {
         catch { close(options.diskFD); throw error }
         let token = session.beginBoot()
         error = nil
+        let diskID = runningDiskID
+        rt.onAdminUpdate = { [weak self] update in
+            Task { @MainActor in
+                guard let self, self.session.accepts(token), !self.session.requestedStop else { return }
+                self.adminConnected = update.connected
+                self.sshForwardState = update.forwardState
+                self.sshPort = update.sshPort
+                if let snapshot = update.snapshot, update.connected {
+                    self.recordAdminSnapshot(snapshot, diskID: diskID)
+                }
+            }
+        }
         reportHandler = { [weak self] line in
             Task { @MainActor in self?.receive(line, generation: token) }
         }
@@ -237,6 +337,9 @@ final class VMProcess: ObservableObject {
         workContextWarning = nil
         uu = UUPluginStatus()
         resetGraphics()
+        resetAdminConnection()
+        runningDiskID = nil
+        syncAdminDiskContext(diskPath: configuredDiskPath)
         reportHandler = nil
         runtimeLog?.close()
         runtimeLog = nil
@@ -314,6 +417,7 @@ final class VMProcess: ObservableObject {
             case .restart: break
             }
             preservedWindow = rt.detachWindowForRestart()
+            resetAdminConnection()
             runtime = nil
             reportHandler = nil
             runtimeLog?.close()
@@ -354,6 +458,7 @@ final class VMProcess: ObservableObject {
     func stop() {
         guard session.active, !session.requestedStop else { return }
         session.requestedStop = true
+        resetAdminConnection()
         if state == .restarting { return }
         state = .stopping
         runtime?.shutdown()
@@ -363,6 +468,7 @@ final class VMProcess: ObservableObject {
         guard session.active else { return }
         if state == .restarting { stop(); return }
         session.requestedStop = true
+        resetAdminConnection()
         state = .stopping
         // In-process: no separate process to SIGKILL. Tear down the runtime;
         // the guest shutdown key is best-effort, then we drop the reference so

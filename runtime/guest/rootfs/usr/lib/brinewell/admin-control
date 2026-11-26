@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""Root-only NDJSON administration channel for the host."""
+import collections
+import ctypes
+import errno
+import json
+import os
+import pwd
+import secrets
+import signal
+import select
+import struct
+import subprocess
+import sys
+import time
+
+MAX_LINE = 8192
+HEARTBEAT_INTERVAL = 5.0
+MASKED = {"masked", "masked-runtime"}
+WATCH_MASK = 0x80 | 0x100 | 0x8 | 0x4 | 0x200
+
+
+def run(args, input_data=None):
+    try:
+        return subprocess.run(args, input=input_data, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=3.0, check=False,
+                              env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def unit(name):
+    result = run(["systemctl", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,UnitFileState", name])
+    values = {}
+    if result:
+        for line in result.stdout.decode("utf-8", "replace").splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                values[key] = value
+    return [values.get(key, "") for key in ("LoadState", "ActiveState", "SubState", "UnitFileState")]
+
+
+def socket_owner(inode):
+    try:
+        processes = os.listdir("/proc")
+    except OSError:
+        return False
+    for pid in processes:
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/" + pid + "/comm", encoding="utf-8") as handle:
+                if handle.read().strip() not in {"sshd", "systemd"}:
+                    continue
+            directory = "/proc/" + pid + "/fd"
+            for descriptor in os.listdir(directory):
+                try:
+                    if os.readlink(directory + "/" + descriptor) == "socket:[" + inode + "]":
+                        return True
+                except (PermissionError, FileNotFoundError):
+                    continue
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            continue
+    return False
+
+
+def is_listening_on_port_22(tcp_path="/proc/net/tcp", tcp6_path="/proc/net/tcp6",
+                            bindv6only_path="/proc/sys/net/ipv6/bindv6only",
+                            socket_owner_checker=socket_owner):
+    try:
+        with open(bindv6only_path, encoding="ascii") as handle:
+            dual_stack = handle.read().strip() == "0"
+    except FileNotFoundError:
+        dual_stack = True
+    except OSError:
+        dual_stack = False
+    addresses = [(tcp_path, {"00000000", "027FA8C0"}),
+                 (tcp6_path, {"0000000000000000FFFF0000027FA8C0"} |
+                  ({"00000000000000000000000000000000"} if dual_stack else set()))]
+    for path, allowed in addresses:
+        try:
+            with open(path, encoding="ascii") as handle:
+                for line in handle:
+                    fields = line.split()
+                    if len(fields) < 10 or fields[3] != "0A":
+                        continue
+                    address, sep, port = fields[1].partition(":")
+                    inode = fields[9]
+                    if (sep and port.upper() == "0016" and address.upper() in allowed
+                            and inode.isdigit() and inode != "0" and socket_owner_checker(inode)):
+                        return True
+        except OSError:
+            continue
+    return False
+
+
+def listening():
+    return is_listening_on_port_22()
+
+
+def password_state():
+    result = run(["/usr/bin/passwd", "-S", "steamos"])
+    if not result or result.returncode:
+        return "unknown"
+    parts = result.stdout.decode("utf-8", "replace").split()
+    if len(parts) < 2 or parts[0] != "steamos":
+        return "unknown"
+    return {"P": "set", "NP": "unset", "L": "locked"}.get(parts[1], "unknown")
+
+
+def shadow_stat():
+    try:
+        s = os.stat("/etc/shadow")
+        return (s.st_dev, s.st_ino, s.st_mtime_ns, s.st_ctime_ns)
+    except OSError:
+        return None
+
+
+class Admin:
+    def __init__(self):
+        self.instance = secrets.token_hex(16)
+        self.seq = 1
+        self.rev = 1
+        self.shadow = shadow_stat()
+        self.pwstate = password_state()
+        self.completed = collections.OrderedDict()
+        self.last = None
+
+    def snapshot(self, event=False, force_password=False):
+        current = shadow_stat()
+        if event or current != self.shadow:
+            self.rev += 1
+            force_password = True
+        self.shadow = current
+        if force_password:
+            self.pwstate = password_state()
+        service = unit("sshd.service")
+        sock = unit("sshd.socket")
+        keys = ("Load", "Active", "Sub", "UnitFile")
+        ssh = {"service" + k: v for k, v in zip(keys, service)}
+        ssh.update({"socket" + k: v for k, v in zip(keys, sock)})
+        ssh["listeningOn22"] = listening()
+        return {"ssh": ssh, "password": {"state": self.pwstate, "rev": self.rev}}
+
+    def reply(self, reqid, ok, code, snapshot=None):
+        return {"type": "reply", "instance": self.instance, "id": reqid,
+                "ok": ok, "code": code, "snapshot": snapshot or self.snapshot(force_password=True)}
+
+    def request(self, req):
+        if not isinstance(req, dict) or not isinstance(req.get("id"), str) or not req["id"]:
+            return None
+        reqid = req["id"]
+        command = req.get("type")
+        if command == "getSnapshot":
+            return self.reply(reqid, True, "ok")
+        if command in ("setSSH", "setPassword") and "targetInstance" in req:
+            if not isinstance(req["targetInstance"], str) or req["targetInstance"] != self.instance:
+                return self.reply(reqid, False, "invalidRequest")
+        if command == "setSSH":
+            if type(req.get("enabled")) is not bool:
+                return self.reply(reqid, False, "invalidRequest")
+            snap = self.snapshot(force_password=True)
+            ssh = snap["ssh"]
+            if ssh["serviceLoad"] == "not-found" and ssh["socketLoad"] == "not-found":
+                return self.reply(reqid, False, "unitNotFound", snap)
+            if req["enabled"]:
+                target = "socket" if (ssh["socketLoad"] == "loaded" and
+                    (ssh["socketActive"] == "active" or ssh["socketUnitFile"] == "enabled") and
+                    ssh["serviceUnitFile"] != "enabled") else "service"
+                if ssh[target + "UnitFile"] in MASKED or (ssh["serviceUnitFile"] in MASKED and ssh["socketUnitFile"] in MASKED):
+                    return self.reply(reqid, False, "unitMasked", snap)
+                if ssh[target + "Load"] == "not-found":
+                    return self.reply(reqid, False, "unitNotFound", snap)
+                result = run(["systemctl", "enable", "--now", "sshd." + target])
+                snap = self.snapshot(force_password=True)
+                ssh = snap["ssh"]
+                if (not ssh["serviceLoad"] and not ssh["socketLoad"]) or ssh[target + "Active"] != "active":
+                    return self.reply(reqid, False, "sshApplyFailed", snap)
+                if ssh[target + "UnitFile"] != "enabled" or not result or result.returncode:
+                    return self.reply(reqid, False, "sshPartiallyManaged", snap)
+                return self.reply(reqid, True, "ok", snap)
+            for target in ("socket", "service"):
+                load = ssh[target + "Load"]
+                file_state = ssh[target + "UnitFile"]
+                if load == "loaded" or (load == "masked" or file_state in MASKED) and ssh[target + "Active"] in ("active", "activating", "reloading"):
+                    run(["systemctl", "stop", "sshd." + target])
+                if load == "loaded" and file_state not in MASKED | {"static", ""}:
+                    run(["systemctl", "disable", "sshd." + target])
+            snap = self.snapshot(force_password=True)
+            ssh = snap["ssh"]
+            if (not ssh["serviceLoad"] and not ssh["socketLoad"]) or ssh["serviceActive"] == "active" or ssh["socketActive"] == "active":
+                return self.reply(reqid, False, "sshApplyFailed", snap)
+            if ssh["serviceUnitFile"] == "enabled" or ssh["socketUnitFile"] == "enabled":
+                return self.reply(reqid, False, "sshPartiallyManaged", snap)
+            return self.reply(reqid, True, "ok", snap)
+        if command == "setPassword":
+            password = req.pop("password", None)
+            if "confirmUnlock" in req and type(req["confirmUnlock"]) is not bool:
+                return self.reply(reqid, False, "invalidRequest")
+            if reqid in self.completed:
+                ok, code = self.completed[reqid]
+                return self.reply(reqid, ok, code)
+            ok, code = self.set_password(password, req.get("confirmUnlock") is True)
+            password = None
+            self.completed[reqid] = (ok, code)
+            if len(self.completed) > 32:
+                self.completed.popitem(last=False)
+            return self.reply(reqid, ok, code)
+        return self.reply(reqid, False, "unknownCommand")
+
+    def set_password(self, password, unlock):
+        try:
+            pwd.getpwnam("steamos")
+        except KeyError:
+            return False, "accountMissing"
+        if not isinstance(password, str) or any(c in password for c in "\0\r\n:"):
+            return False, "invalidPassword"
+        try:
+            encoded = password.encode("utf-8")
+        except UnicodeEncodeError:
+            return False, "invalidPassword"
+        if not 1 <= len(encoded) <= 256:
+            return False, "invalidPassword"
+        state = password_state()
+        if state not in ("set", "unset", "locked"):
+            return False, "passwordApplyFailed"
+        if state == "locked" and unlock is not True:
+            return False, "accountLocked"
+        result = run(["/usr/sbin/chpasswd"], b"steamos:" + encoded + b"\n")
+        password = encoded = None
+        if not result or result.returncode:
+            return False, "passwordApplyFailed"
+        unlock_ok = True
+        if state == "locked" and password_state() == "locked":
+            result = run(["/usr/bin/passwd", "-u", "steamos"])
+            unlock_ok = bool(result and not result.returncode)
+        self.rev += 1
+        self.shadow = shadow_stat()
+        self.pwstate = password_state()
+        return (True, "ok") if unlock_ok and self.pwstate == "set" else (False, "passwordApplyFailed")
+
+
+class ShadowWatch:
+    def __init__(self):
+        self.fd = -1
+        self.open()
+
+    def open(self):
+        if self.fd >= 0:
+            os.close(self.fd)
+        self.fd = -1
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+            if fd < 0:
+                return
+            if libc.inotify_add_watch(fd, b"/etc", WATCH_MASK) < 0:
+                os.close(fd)
+                return
+            self.fd = fd
+        except (AttributeError, OSError):
+            pass
+
+    def events(self):
+        try:
+            data = os.read(self.fd, 65536)
+        except OSError:
+            return False
+        changed = False
+        offset = 0
+        rebuild = False
+        while offset + 16 <= len(data):
+            _, mask, _, length = struct.unpack_from("iIII", data, offset)
+            name = data[offset + 16:offset + 16 + length].split(b"\0", 1)[0]
+            offset += 16 + length
+            changed |= name == b"shadow" or bool(mask & 0x4000)
+            rebuild |= bool(mask & (0x4000 | 0x8000))
+        if rebuild:
+            self.open()
+        return changed
+
+
+def encode_message(message):
+    return (json.dumps(message, separators=(",", ":")) + "\n").encode()
+
+
+def serve(fd, heartbeat_interval=HEARTBEAT_INTERVAL):
+    admin = Admin()
+    try:
+        serve_loop(fd, admin, heartbeat_interval)
+    finally:
+        try:
+            os.write(fd, encode_message({"type": "bye", "instance": admin.instance}))
+        except OSError:
+            pass
+
+
+def serve_loop(fd, admin, heartbeat_interval):
+    last_sent = time.monotonic()
+    reply_queue = collections.deque(maxlen=32)
+    pending_state = None
+    pending_heartbeat = None
+    current_out = b""
+    current_offset = 0
+
+    def send(message):
+        nonlocal pending_state, pending_heartbeat
+        data = encode_message(message)
+        if message["type"] == "state":
+            pending_state = data
+        elif message["type"] == "heartbeat":
+            pending_heartbeat = data
+        else:
+            reply_queue.append(data)
+
+    def flush():
+        nonlocal current_out, current_offset, pending_state, pending_heartbeat, last_sent
+        if not current_out:
+            if reply_queue:
+                current_out = reply_queue.popleft()
+            elif pending_state:
+                current_out, pending_state = pending_state, None
+            elif pending_heartbeat:
+                current_out, pending_heartbeat = pending_heartbeat, None
+            else:
+                return
+            current_offset = 0
+        try:
+            n = os.write(fd, current_out[current_offset:])
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return
+            raise
+        if n <= 0:
+            raise OSError("port closed")
+        current_offset += n
+        if current_offset == len(current_out):
+            current_out = b""
+            last_sent = time.monotonic()
+
+    watch = ShadowWatch()
+    with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
+        boot = f.read().strip()
+    admin.last = admin.snapshot()
+    send({"type": "hello", "version": 1, "instance": admin.instance,
+          "bootId": boot, "seq": admin.seq, "snapshot": admin.last})
+    flush()
+    pending = b""
+    draining = False
+    deadline = time.monotonic() + 2
+    while True:
+        readers = [fd] + ([watch.fd] if watch.fd >= 0 else [])
+        writers = [fd] if current_out or reply_queue or pending_state or pending_heartbeat else []
+        timeout = min(deadline, last_sent + heartbeat_interval) - time.monotonic()
+        # A queued heartbeat must not cause a busy loop while the port is blocked.
+        if pending_heartbeat or current_out and time.monotonic() >= last_sent + heartbeat_interval:
+            timeout = deadline - time.monotonic()
+        ready, writable, _ = select.select(readers, writers, [], max(0, timeout))
+        if fd in writable:
+            flush()
+        event = watch.fd in ready and watch.events()
+        if fd in ready:
+            try:
+                chunk = os.read(fd, 4096)
+            except BlockingIOError:
+                chunk = None
+            if chunk == b"":
+                return
+            for byte in chunk or b"":
+                if byte == 10:
+                    if not draining:
+                        try:
+                            req = json.loads(pending.decode("utf-8"))
+                            reply = admin.request(req)
+                            if reply:
+                                send(reply)
+                        except (ValueError, UnicodeError, TypeError, RecursionError):
+                            pass
+                    pending = b""
+                    draining = False
+                elif not draining:
+                    pending += bytes((byte,))
+                    if len(pending) > MAX_LINE:
+                        pending = b""
+                        draining = True
+        if event or time.monotonic() >= deadline:
+            if watch.fd < 0:
+                watch.open()
+            snap = admin.snapshot(event=event, force_password=True)
+            if snap != admin.last:
+                admin.seq += 1
+                send({"type": "state", "instance": admin.instance,
+                      "seq": admin.seq, "snapshot": snap})
+                admin.last = snap
+            deadline = time.monotonic() + 2
+        if time.monotonic() - last_sent >= heartbeat_interval:
+            send({"type": "heartbeat", "instance": admin.instance, "seq": admin.seq})
+        if current_out or reply_queue or pending_state or pending_heartbeat:
+            flush()
+
+
+def stop(signum, frame):
+    raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    device = sys.argv[1] if len(sys.argv) > 1 else "/dev/virtio-ports/fx.admin"
+    fd = os.open(device, os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        serve(fd)
+    finally:
+        os.close(fd)

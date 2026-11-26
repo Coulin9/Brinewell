@@ -75,21 +75,16 @@ bind_ro() { cp "$1" "$2"; }
                     f"{action} --now steamos-devkit-service.service",
                 ])
 
-    def test_missing_persistent_link_is_enabled_for_this_boot(self):
-        self.boot("1")
-        self.assertEqual(os.readlink(self.run / WANTS_LINK), SSHD_UNIT)
-        self.assertFalse((self.root / "etc" / WANTS_LINK).is_symlink())
-
-    def test_disabled_policy_still_masks_ssh_and_leaves_devkit_alone(self):
-        self.boot("0")
-        self.assertEqual(os.readlink(self.run / "systemd/system/sshd.service"), "/dev/null")
-        self.assertEqual(os.readlink(self.run / "systemd/system/sshd-unix-local.socket"), "/dev/null")
-        self.assertEqual(self.devkit.read_text(), DEVKIT_HELPER)
-
-    def test_unset_policy_leaves_guest_enablement_alone(self):
-        self.boot("")
-        self.assertFalse((self.run / WANTS_LINK).is_symlink())
-        self.assertEqual(self.devkit.read_text(), DEVKIT_HELPER)
+    def test_disabled_persistent_state_is_never_overridden(self):
+        for policy in ("0", "1", ""):
+            with self.subTest(policy=policy):
+                self.devkit.write_text(DEVKIT_HELPER)
+                self.boot(policy)
+                wants = self.run / WANTS_LINK
+                self.assertFalse(wants.is_symlink() or os.path.lexists(wants))
+                self.assertFalse((self.run / "systemd/system/sshd.service").is_symlink())
+                self.assertNotIn("    sshd\n", self.devkit.read_text())
+                self.assertFalse((self.root / "etc" / WANTS_LINK).is_symlink())
 
     def test_unknown_devkit_layout_keeps_stock_helper_and_warns(self):
         unknown_layout = DEVKIT_HELPER.replace("SYSTEMD_SERVICES=(", "OTHER_SERVICES=(")

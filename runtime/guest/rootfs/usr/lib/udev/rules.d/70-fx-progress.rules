@@ -4,4 +4,5 @@ SUBSYSTEM=="virtio-ports", ATTR{name}=="fx.pad", MODE="0666", TAG+="systemd", EN
 SUBSYSTEM=="virtio-ports", ATTR{name}=="fx.telemetry", MODE="0600", TAG+="systemd", ENV{SYSTEMD_WANTS}+="brinewell-telemetry.service"
 SUBSYSTEM=="virtio-ports", ATTR{name}=="fx.uu", MODE="0600", TAG+="systemd", ENV{SYSTEMD_WANTS}+="brinewell-uu.service"
 SUBSYSTEM=="virtio-ports", ATTR{name}=="fx.graphics", OWNER="root", MODE="0600", TAG+="systemd", ENV{SYSTEMD_WANTS}+="brinewell-graphics.service"
+SUBSYSTEM=="virtio-ports", ATTR{name}=="fx.admin", OWNER="root", GROUP="root", MODE="0600", TAG+="systemd", ENV{SYSTEMD_WANTS}+="brinewell-admin.service"
 SUBSYSTEM=="virtio-ports", ATTR{name}=="fx.clipboard", OWNER="steamos", MODE="0600"

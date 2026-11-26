@@ -828,6 +828,7 @@ private struct SettingsView: View {
                 Text("HTTP and HTTPS proxies do not support UDP. Games and services that rely on UDP may fail to connect. Use a SOCKS5 proxy with UDP support if needed.")
                     .font(.callout).foregroundStyle(.secondary)
             }.disabled(vm.busy)
+            RemoteAccessSettingsSection(model: model, vm: vm)
             Section("Resources") {
                 Stepper("CPU: \(model.configuration.cpuCount)", value: $model.configuration.cpuCount, in: 1...model.host.maximumCPUs)
                 Stepper("Memory: \(model.configuration.memoryGiB) GiB", value: $model.configuration.memoryGiB, in: 1...model.host.maximumMemoryGiB)

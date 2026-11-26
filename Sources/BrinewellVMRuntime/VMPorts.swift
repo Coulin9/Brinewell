@@ -3,6 +3,88 @@ import CKrun
 import Darwin
 import Foundation
 
+enum VMAdminGuestMessage: Decodable, Equatable, Sendable {
+    case hello(version: Int, instance: String, bootId: String, seq: Int, snapshot: VMAdminSnapshot)
+    case state(instance: String, seq: Int, snapshot: VMAdminSnapshot)
+    case reply(instance: String, id: String, ok: Bool, code: VMAdminErrorCode, snapshot: VMAdminSnapshot)
+    case heartbeat(instance: String, seq: Int)
+    case bye(instance: String)
+
+    private enum Keys: String, CodingKey { case type, version, instance, bootId, seq, snapshot, id, ok, code }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: Keys.self)
+        let type = try values.decode(String.self, forKey: .type)
+        let instance = try values.decode(String.self, forKey: .instance)
+        switch type {
+        case "hello":
+            let snapshot = try values.decode(VMAdminSnapshot.self, forKey: .snapshot)
+            self = .hello(version: try values.decode(Int.self, forKey: .version), instance: instance,
+                          bootId: try values.decode(String.self, forKey: .bootId),
+                          seq: try values.decode(Int.self, forKey: .seq), snapshot: snapshot)
+        case "state":
+            let snapshot = try values.decode(VMAdminSnapshot.self, forKey: .snapshot)
+            self = .state(instance: instance, seq: try values.decode(Int.self, forKey: .seq), snapshot: snapshot)
+        case "reply":
+            let snapshot = try values.decode(VMAdminSnapshot.self, forKey: .snapshot)
+            let rawCode = try values.decode(String.self, forKey: .code)
+            self = .reply(instance: instance, id: try values.decode(String.self, forKey: .id),
+                          ok: try values.decode(Bool.self, forKey: .ok),
+                          code: VMAdminErrorCode(rawValue: rawCode) ?? .unknown, snapshot: snapshot)
+        case "heartbeat":
+            self = .heartbeat(instance: instance, seq: try values.decode(Int.self, forKey: .seq))
+        case "bye":
+            self = .bye(instance: instance)
+        default:
+            throw DecodingError.dataCorruptedError(forKey: .type, in: values, debugDescription: "Unknown message")
+        }
+    }
+}
+
+enum VMAdminHostRequest: Encodable, Sendable {
+    case getSnapshot(id: String)
+    case setSSH(id: String, enabled: Bool, targetInstance: String)
+    case setPassword(id: String, password: String, confirmUnlock: Bool, targetInstance: String)
+
+    private enum Keys: String, CodingKey { case type, id, enabled, password, confirmUnlock, targetInstance }
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: Keys.self)
+        switch self {
+        case .getSnapshot(let id):
+            try values.encode("getSnapshot", forKey: .type); try values.encode(id, forKey: .id)
+        case .setSSH(let id, let enabled, let targetInstance):
+            try values.encode("setSSH", forKey: .type); try values.encode(id, forKey: .id)
+            try values.encode(enabled, forKey: .enabled)
+            try values.encode(targetInstance, forKey: .targetInstance)
+        case .setPassword(let id, let password, let confirmUnlock, let targetInstance):
+            try values.encode("setPassword", forKey: .type); try values.encode(id, forKey: .id)
+            try values.encode(password, forKey: .password); try values.encode(confirmUnlock, forKey: .confirmUnlock)
+            try values.encode(targetInstance, forKey: .targetInstance)
+        }
+    }
+}
+
+struct VMAdminLineDecoder {
+    private var line = [UInt8]()
+    private var overflow = false
+
+    mutating func receive(_ bytes: [UInt8]) -> [VMAdminGuestMessage] {
+        var messages = [VMAdminGuestMessage]()
+        for byte in bytes {
+            if byte == 10 {
+                if !overflow, let message = try? JSONDecoder().decode(VMAdminGuestMessage.self, from: Data(line)) {
+                    messages.append(message)
+                }
+                line.removeAll(); overflow = false
+            } else if !overflow {
+                if line.count == 8192 { line.removeAll(); overflow = true }
+                else { line.append(byte) }
+            }
+        }
+        return messages
+    }
+}
+
 @MainActor
 final class VMPorts {
     private let runDirectory: URL
@@ -29,6 +111,16 @@ final class VMPorts {
     private var uuLine = [UInt8]()
     private var uuOverflow = false
     private var uuReady = false
+    private var adminRead: Int32 = -1
+    private var adminWrite: Int32 = -1
+    private var adminInput: Int32 = -1
+    private var adminOutput: Int32 = -1
+    private var adminDecoder = VMAdminLineDecoder()
+    private var adminPending: [(id: String?, data: Data)] = []
+    private var adminCurrentChunk = Data()
+    private var adminWriteSource: DispatchSourceWrite?
+    var onAdminMessage: ((VMAdminGuestMessage) -> Void)?
+    var onAdminDisconnected: (() -> Void)?
     private var graphicsRead: Int32 = -1
     private var graphicsWrite: Int32 = -1
     private var graphicsInput: Int32 = -1
@@ -137,6 +229,7 @@ final class VMPorts {
             let telemetry = try makePort()
             (telemetryRead, telemetryOutput, telemetryInput, telemetryWrite) = telemetry
             (clipboardRead, clipboardOutput, clipboardInput, clipboardWrite) = try makePort()
+            (adminRead, adminOutput, adminInput, adminWrite) = try makePort()
             for fd in descriptors {
                 guard fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else { throw Self.error("fcntl CLOEXEC failed") }
             }
@@ -145,6 +238,8 @@ final class VMPorts {
             try nonblocking(graphicsWrite)
             try nonblocking(clipboardRead)
             try nonblocking(clipboardWrite)
+            try nonblocking(adminRead)
+            try nonblocking(adminWrite)
         } catch {
             for fd in descriptors { Darwin.close(fd) }
             descriptors.removeAll()
@@ -188,6 +283,8 @@ final class VMPorts {
                                               graphicsInput, graphicsOutput), "fx.graphics")
         try check(krun_add_console_port_inout(context, UInt32(console), "fx.clipboard",
                                               clipboardInput, clipboardOutput), "fx.clipboard")
+        try check(krun_add_console_port_inout(context, UInt32(console), "fx.admin",
+                                              adminInput, adminOutput), "fx.admin")
     }
 
     func startTelemetry(sampler: URL) {
@@ -249,6 +346,10 @@ final class VMPorts {
         try watch(uuRead) { [weak self] bytes in self?.readUU(bytes) }
         try watch(graphicsRead) { [weak self] bytes in self?.readGraphics(bytes) }
         try watch(clipboardRead) { [weak self] bytes in self?.clipboard.receive(bytes) }
+        try watch(adminRead, disconnect: { [weak self] in self?.onAdminDisconnected?() }) { [weak self] bytes in
+            guard let self else { return }
+            for message in self.adminDecoder.receive(bytes) { self.onAdminMessage?(message) }
+        }
         try watch(fifoRead) { [weak self] bytes in self?.readFIFO(bytes) }
         physicalGamepad.start()
     }
@@ -271,7 +372,7 @@ final class VMPorts {
         return duplicate
     }
 
-    private func watch(_ fd: Int32, consume: @escaping ([UInt8]) -> Void) throws {
+    private func watch(_ fd: Int32, disconnect: (() -> Void)? = nil, consume: @escaping ([UInt8]) -> Void) throws {
         let duplicate = try duplicateForSource(fd)
         let source = DispatchSource.makeReadSource(fileDescriptor: duplicate, queue: .main)
         source.setEventHandler { [weak self] in
@@ -279,6 +380,7 @@ final class VMPorts {
             var buffer = [UInt8](repeating: 0, count: 4096)
             let count = Darwin.read(duplicate, &buffer, buffer.count)
             if count > 0 { consume(Array(buffer[..<count])) }
+            else if count == 0, let disconnect { source.cancel(); disconnect() }
         }
         source.setCancelHandler { Darwin.close(duplicate) }
         sources.append(source)
@@ -571,6 +673,51 @@ final class VMPorts {
         clipboard.setActive(active)
     }
 
+    func sendAdminLine(_ data: Data, requestID: String? = nil) -> Bool {
+        guard !closed, data.count <= 8192 else { return false }
+        var frame = data
+        if frame.last != 10 { frame.append(10) }
+        let queuedBytes = adminPending.reduce(adminCurrentChunk.count) { $0 + $1.data.count }
+        guard !frame.dropLast().contains(10), queuedBytes + frame.count <= Self.maxPending else { return false }
+        adminPending.append((requestID, frame))
+        flushAdmin()
+        return true
+    }
+
+    func cancelAdminPending(requestID: String) {
+        adminPending.removeAll { $0.id == requestID }
+    }
+
+    func clearAdminPending() { adminPending.removeAll() }
+
+    private func flushAdmin() {
+        while !adminCurrentChunk.isEmpty || !adminPending.isEmpty {
+            // Do not dequeue a frame until at least one byte is accepted.
+            let chunk = adminCurrentChunk.isEmpty ? adminPending[0].data : adminCurrentChunk
+            let written = chunk.withUnsafeBytes { Darwin.write(adminWrite, $0.baseAddress!, $0.count) }
+            if written > 0 {
+                if adminCurrentChunk.isEmpty { adminPending.removeFirst() }
+                adminCurrentChunk = Data(chunk.dropFirst(written))
+            } else if written < 0 && errno == EINTR { continue }
+            else if written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if adminWriteSource == nil, let duplicate = try? duplicateForSource(adminWrite) {
+                    let source = DispatchSource.makeWriteSource(fileDescriptor: duplicate, queue: .main)
+                    source.setEventHandler { [weak self] in self?.flushAdmin() }
+                    source.setCancelHandler { Darwin.close(duplicate) }
+                    adminWriteSource = source
+                    source.resume()
+                }
+                return
+            } else {
+                adminPending.removeAll(); adminCurrentChunk.removeAll()
+                adminWriteSource?.cancel(); adminWriteSource = nil
+                onAdminDisconnected?()
+                return
+            }
+        }
+        adminWriteSource?.cancel(); adminWriteSource = nil
+    }
+
     private func flushClipboard() {
         while clipboardOffset < clipboardPending.count {
             let written = clipboardPending.withUnsafeBytes {
@@ -772,6 +919,10 @@ final class VMPorts {
         graphicsWriteSource?.cancel()
         graphicsWriteSource = nil
         graphicsPending.removeAll()
+        adminWriteSource?.cancel(); adminWriteSource = nil
+        adminPending.removeAll(); adminCurrentChunk.removeAll()
+        adminDecoder = VMAdminLineDecoder()
+        onAdminDisconnected?()
         release?.cancel(); release = nil
         for source in sources { source.cancel() }
         sources.removeAll()

@@ -84,12 +84,20 @@ echo "harnesses synced from $payload ($n files)"
 SH
 }
 
-# The live run dir: the -pid-file directory of the Brinewell gvproxy that
-# forwards guest SSH on 2222 (stale /tmp/brinewell-* dirs are ignored).
-# During the rename transition a still-running older VM may use /tmp/appledeck-*.
+# Derive the live run directory from gvproxy's API listener, not its SSH port.
 live_run_dir() {
-    pgrep -fl gvproxy 2>/dev/null | grep -e '/Brinewell.app/' -e '/AppleDeck.app/' | grep -e '-ssh-port 2222' \
-        | sed -nE 's/.*-pid-file (\/tmp\/(brinewell|appledeck)-[^ ]+)\/gvproxy\.pid.*/\1/p' | sort -u | head -1
+    local dir found= count=0
+    while IFS= read -r dir; do
+        [[ -p "$dir/control.fifo" && -O "$dir/control.fifo" ]] || continue
+        found=$dir
+        count=$((count + 1))
+    done < <(pgrep -fl gvproxy 2>/dev/null | grep -e '/Brinewell.app/' -e '/AppleDeck.app/' \
+        | sed -nE 's#.*-listen unix://(/tmp/(brinewell|appledeck)-[^ /]+)/api\.sock([[:space:]]|$).*#\1#p' | sort -u || true)
+    if (( count > 1 )); then
+        echo 'Multiple active Brinewell run directories; refusing ambiguity' >&2
+        return 1
+    fi
+    [[ -n "$found" ]] && printf '%s\n' "$found"
 }
 
 # PIDs of the VM app process: the current Brinewell.app executable or a

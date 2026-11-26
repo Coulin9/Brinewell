@@ -44,6 +44,13 @@ private final class ShutdownEvent: @unchecked Sendable {
     deinit { close() }
 }
 
+public struct VMAdminRuntimeUpdate: Equatable, Sendable {
+    public let connected: Bool
+    public let snapshot: VMAdminSnapshot?
+    public let forwardState: VMSSHForwardState
+    public let sshPort: Int
+}
+
 @MainActor
 public final class Runtime {
     private static var logInitialized = false
@@ -53,6 +60,24 @@ public final class Runtime {
     private let input: VMInput
     private let network: RuntimeNetwork
     private let workContext = WorkContextService()
+    private let adminQueue = DispatchQueue(label: "brinewell.admin.forwarder")
+    private var adminInstance: String?
+    private var adminSequence = 0
+    private var adminConnected = false
+    private var adminSnapshot: VMAdminSnapshot?
+    private var adminForward: VMSSHForwardState = .unpublished
+    private var adminGeneration = 0
+    private var desiredForwardExposed = false
+    private var forwardSyncInFlight = false
+    private var forwardResyncNeeded = false
+    private var forwardRetryWorkItem: DispatchWorkItem?
+    private var forwardRetryCount = 0
+    private var adminProbe: (id: String, instance: String, seq: Int)?
+    private var adminProbeTimeout: DispatchWorkItem?
+    private var adminPending: (id: String, completion: @Sendable (Result<VMAdminSnapshot, VMAdminErrorCode>) -> Void)?
+    private var adminTimeout: DispatchWorkItem?
+    private var adminWatchdog: DispatchWorkItem?
+    public var onAdminUpdate: (@Sendable (VMAdminRuntimeUpdate) -> Void)?
     private var context: UInt32?
     private let shutdownEvent = ShutdownEvent()
     private var diskFD: Int32 = -1
@@ -108,6 +133,8 @@ public final class Runtime {
             throw error
         }
         ports.onGraphicsRequest = { [weak self] mode in try self?.setGraphicsBackend(mode) }
+        ports.onAdminMessage = { [weak self] message in self?.receiveAdmin(message) }
+        ports.onAdminDisconnected = { [weak self] in self?.disconnectAdmin() }
         diskFD = options.diskFD
         workContext.onReport = { [weak display] line in
             display?.setWorkContextWarning(WorkContextNotice.warning(for: line))
@@ -175,7 +202,7 @@ public final class Runtime {
             let kernel = options.resources.appendingPathComponent("Image").path
             let initrd = options.resources.appendingPathComponent("initramfs.cpio.gz").path
             let telemetrySampler = options.resources.appendingPathComponent("macmon")
-            var cmdline = "console=hvc0 loglevel=4 rootwait brinewell.ssh=1 brinewell.steam_client=deck"
+            var cmdline = "console=hvc0 loglevel=4 rootwait brinewell.steam_client=deck"
             cmdline += HostCPUInfo.kernelArguments(sampler: telemetrySampler)
             // Boot-time seed only; the live authority is the fx.graphics port.
             cmdline += " brinewell.graphics=\(options.graphicsBackend.rawValue)"
@@ -310,6 +337,203 @@ public final class Runtime {
         }
     }
 
+    private func publishAdminUpdate() {
+        onAdminUpdate?(VMAdminRuntimeUpdate(connected: adminConnected, snapshot: adminSnapshot,
+                                            forwardState: adminForward, sshPort: options.sshPort))
+    }
+
+    private func receiveAdmin(_ message: VMAdminGuestMessage) {
+        guard !stopping else { return }
+        let snapshot: VMAdminSnapshot
+        switch message {
+        case .hello(let version, let instance, _, let seq, let value):
+            guard version == 1, !instance.isEmpty, seq > 0 else { return }
+            if adminInstance != instance { ports.clearAdminPending(); completeAdmin(.failure(.disconnected)) }
+            clearAdminProbe()
+            adminInstance = instance; adminSequence = seq; adminConnected = true
+            resetAdminWatchdog(); snapshot = value
+        case .state(let instance, let seq, let value):
+            guard !instance.isEmpty, seq > 0 else { return }
+            if adminInstance != instance { ports.clearAdminPending(); completeAdmin(.failure(.disconnected)) }
+            else if adminConnected && (seq <= adminSequence || seq - adminSequence > 1) { requestAdminRefresh() }
+            clearAdminProbe()
+            adminInstance = instance; adminSequence = seq; adminConnected = true
+            resetAdminWatchdog(); snapshot = value
+        case .reply(let instance, let id, let ok, let code, let value):
+            guard !instance.isEmpty else { return }
+            if !adminConnected {
+                guard let probe = adminProbe, probe.id == id, probe.instance == instance, ok else { return }
+                adminInstance = instance; adminSequence = probe.seq; adminConnected = true
+                clearAdminProbe()
+            } else {
+                guard adminInstance == instance else { return }
+                if adminProbe?.id == id { clearAdminProbe() }
+                if adminPending?.id == id { completeAdmin(ok ? .success(value) : .failure(code)) }
+            }
+            resetAdminWatchdog(); snapshot = value
+        case .heartbeat(let instance, let seq):
+            guard !instance.isEmpty, seq > 0 else { return }
+            if !adminConnected || adminInstance != instance {
+                if adminConnected { disconnectAdmin() }
+                probeAdmin(instance: instance, seq: seq)
+            } else {
+                resetAdminWatchdog()
+                if seq != adminSequence { requestAdminRefresh() }
+            }
+            return
+        case .bye(let instance):
+            if adminConnected && adminInstance == instance { disconnectAdmin() }
+            return
+        }
+        adminSnapshot = snapshot
+        synchronizeAdminForward(desired: snapshot.ssh.shouldExposeHostForward)
+        publishAdminUpdate()
+    }
+
+    private func clearAdminProbe() {
+        if let id = adminProbe?.id { ports.cancelAdminPending(requestID: id) }
+        adminProbe = nil
+        adminProbeTimeout?.cancel(); adminProbeTimeout = nil
+    }
+
+    private func probeAdmin(instance: String, seq: Int) {
+        guard adminProbe == nil, started, !stopping else { return }
+        let id = UUID().uuidString
+        adminProbe = (id, instance, seq)
+        guard sendAdmin(.getSnapshot(id: id), requestID: id) else { clearAdminProbe(); return }
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.adminProbe?.id == id else { return }
+            self.clearAdminProbe()
+        }
+        adminProbeTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+    }
+
+    private func synchronizeAdminForward(desired: Bool) {
+        let changed = desiredForwardExposed != desired
+        desiredForwardExposed = desired
+        if changed {
+            forwardRetryWorkItem?.cancel(); forwardRetryWorkItem = nil
+            forwardRetryCount = 0
+        }
+        if forwardSyncInFlight {
+            forwardResyncNeeded = true
+            return
+        }
+        if forwardRetryWorkItem != nil { return }
+        runAdminForwardSync()
+    }
+
+    private func runAdminForwardSync() {
+        guard !forwardSyncInFlight else { return }
+        let desired = desiredForwardExposed
+        if desired && adminForward != .published { adminForward = .publishing }
+        if !desired && adminForward != .unpublished { adminForward = .unpublishing }
+        publishAdminUpdate()
+        forwardSyncInFlight = true
+        forwardResyncNeeded = false
+        let generation = adminGeneration
+        let client = GVProxyForwarderClient(socketPath: network.apiSocketPath)
+        let port = options.sshPort
+        adminQueue.async { [weak self] in
+            let state = client.syncSSHForward(desiredExposed: desired, localPort: port)
+            Task { @MainActor [weak self] in
+                guard let self, self.adminGeneration == generation else { return }
+                self.forwardSyncInFlight = false
+                if self.forwardResyncNeeded {
+                    self.runAdminForwardSync()
+                    return
+                }
+                switch state {
+                case .conflict(let message) where !desired:
+                    self.adminForward = .error(message)
+                default: self.adminForward = state
+                }
+                self.publishAdminUpdate()
+                switch state {
+                case .conflict, .error:
+                    guard self.forwardRetryCount < 5 else { return }
+                    let delay = (desired ? 5 : 1) * (1 << self.forwardRetryCount)
+                    self.forwardRetryCount += 1
+                    let retry = DispatchWorkItem { [weak self] in
+                        guard let self else { return }
+                        self.forwardRetryWorkItem = nil
+                        self.runAdminForwardSync()
+                    }
+                    self.forwardRetryWorkItem = retry
+                    DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(delay), execute: retry)
+                default: self.forwardRetryCount = 0
+                }
+            }
+        }
+    }
+
+    private func resetAdminWatchdog() {
+        adminWatchdog?.cancel()
+        let watchdog = DispatchWorkItem { [weak self] in self?.disconnectAdmin() }
+        adminWatchdog = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: watchdog)
+    }
+
+    private func disconnectAdmin() {
+        adminWatchdog?.cancel(); adminWatchdog = nil
+        clearAdminProbe()
+        ports.clearAdminPending()
+        guard adminConnected || adminPending != nil else { return }
+        adminConnected = false; adminInstance = nil; adminSequence = 0
+        completeAdmin(.failure(.disconnected))
+        synchronizeAdminForward(desired: false)
+        publishAdminUpdate()
+    }
+
+    private func completeAdmin(_ result: Result<VMAdminSnapshot, VMAdminErrorCode>) {
+        adminTimeout?.cancel(); adminTimeout = nil
+        if let id = adminPending?.id { ports.cancelAdminPending(requestID: id) }
+        let completion = adminPending?.completion
+        adminPending = nil
+        completion?(result)
+    }
+
+    private func sendAdmin(_ request: VMAdminHostRequest, requestID: String? = nil) -> Bool {
+        guard let data = try? JSONEncoder().encode(request) else { return false }
+        return ports.sendAdminLine(data, requestID: requestID)
+    }
+
+    public func requestAdminRefresh() {
+        guard adminConnected, !stopping else { return }
+        _ = sendAdmin(.getSnapshot(id: UUID().uuidString))
+    }
+
+    private func sendAdminWrite(id: String, request: VMAdminHostRequest,
+                                completion: @escaping @Sendable (Result<VMAdminSnapshot, VMAdminErrorCode>) -> Void) {
+        guard adminConnected, adminInstance != nil, !stopping else { completion(.failure(.notConnected)); return }
+        guard adminPending == nil else { completion(.failure(.busy)); return }
+        adminPending = (id, completion)
+        guard sendAdmin(request, requestID: id) else { completeAdmin(.failure(.disconnected)); return }
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.adminPending?.id == id else { return }
+            self.completeAdmin(.failure(.timeout))
+        }
+        adminTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+    }
+
+    public func setGuestSSH(enabled: Bool, completion: @escaping @Sendable (Result<VMAdminSnapshot, VMAdminErrorCode>) -> Void) {
+        guard adminConnected, let instance = adminInstance, !stopping else { completion(.failure(.notConnected)); return }
+        let id = UUID().uuidString
+        sendAdminWrite(id: id, request: .setSSH(id: id, enabled: enabled, targetInstance: instance), completion: completion)
+    }
+
+    public func setGuestSudoPassword(_ password: String, confirmUnlock: Bool,
+                                     completion: @escaping @Sendable (Result<VMAdminSnapshot, VMAdminErrorCode>) -> Void) {
+        guard VMPasswordValidation.validate(password: password, confirmation: password) == nil else {
+            completion(.failure(.invalidPassword)); return
+        }
+        guard adminConnected, let instance = adminInstance, !stopping else { completion(.failure(.notConnected)); return }
+        let id = UUID().uuidString
+        sendAdminWrite(id: id, request: .setPassword(id: id, password: password, confirmUnlock: confirmUnlock, targetInstance: instance), completion: completion)
+    }
+
     private func requestShutdown() {
         if let onShutdownRequested { onShutdownRequested() } else { shutdown() }
     }
@@ -419,6 +643,7 @@ public final class Runtime {
 
     public func shutdown() {
         guard !stopping else { return }
+        disconnectAdmin()
         stopping = true
         hdrWork?.cancel(); hdrWork = nil
         // Registration may be awaiting launchd. The startup continuation will

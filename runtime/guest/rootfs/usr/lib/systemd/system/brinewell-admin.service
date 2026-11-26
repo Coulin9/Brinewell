@@ -1,0 +1,19 @@
+[Unit]
+Description=Brinewell administration control (fx.admin)
+ConditionPathExists=/dev/virtio-ports/fx.admin
+
+[Service]
+ExecStart=/usr/lib/brinewell/admin-control
+User=root
+Restart=always
+RestartSec=2
+UMask=0077
+NoNewPrivileges=yes
+LimitCORE=0
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

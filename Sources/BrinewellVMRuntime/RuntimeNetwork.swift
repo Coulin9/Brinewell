@@ -5,7 +5,8 @@ import Foundation
 
 final class RuntimeNetwork {
     let socket: String
-    private let apiSocket: String
+    let apiSocketPath: String
+    private(set) var sshPort: Int = 0
     private let directory: URL
     private var process: Process?
     private var lifeline: Pipe?
@@ -13,14 +14,15 @@ final class RuntimeNetwork {
     init(directory: URL) throws {
         self.directory = directory
         socket = directory.appendingPathComponent("net.sock").path
-        apiSocket = directory.appendingPathComponent("api.sock").path
+        apiSocketPath = directory.appendingPathComponent("api.sock").path
         // sockaddr_un.sun_path includes a terminating NUL.
-        guard socket.utf8.count < 104, apiSocket.utf8.count < 104 else {
+        guard socket.utf8.count < 104, apiSocketPath.utf8.count < 104 else {
             throw RuntimeError("run directory is too long for network sockets")
         }
     }
 
     func start(binary: String, sshPort: Int, configuration: VMNetworkConfiguration) throws {
+        self.sshPort = sshPort
         try configuration.validate()
         let physical = try PhysicalNetwork.detect()
         guard configuration.proxyEnabled || !physical.dnsServers.isEmpty else {
@@ -53,8 +55,8 @@ final class RuntimeNetwork {
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
         p.arguments = ["-c", script, "gvproxy", binary,
                        "-listen-vfkit", "unixgram://" + socket,
-                       "-listen", "unix://" + apiSocket,
-                       "-ssh-port", String(sshPort),
+                       "-listen", "unix://" + apiSocketPath,
+                       "-ssh-port", "-1",
                        "-outbound-config", outboundURL.path,
                        "-log-file", directory.appendingPathComponent("gvproxy.log").path,
                        "-pid-file", directory.appendingPathComponent("gvproxy.pid").path]

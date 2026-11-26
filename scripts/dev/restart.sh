@@ -37,7 +37,24 @@ shutdown_vm() {
 }
 start_vm() {
     open -a "$DEV_APP" --args --start-vm || return 1
-    wait_for 240 guest_up || fail "guest SSH not ready within 240s"
+    local deadline=$((SECONDS + 240)) ready_since= run=
+    while ! guest_up; do
+        (( SECONDS < deadline )) || fail "guest SSH not ready within 240s"
+        run="$(live_run_dir)" || run=
+        if [[ -n "$run" ]] && { grep -qF 'BRINEWELL state running' "$run/progress.log" 2>/dev/null ||
+                                 grep -qF 'BRINEWELL state running' "$run/host.log" 2>/dev/null; }; then
+            if nc -z 127.0.0.1 2222 >/dev/null 2>&1; then
+                ready_since=
+            elif [[ -z "$ready_since" ]]; then
+                ready_since=$SECONDS
+            elif (( SECONDS - ready_since >= 20 )); then
+                fail "VM is running, but host port 2222 is not listening. Guest SSH may be disabled in settings or in the guest; enable SSH before running development scripts that require it. Logs: $run/progress.log, $run/host.log"
+            fi
+        else
+            ready_since=
+        fi
+        sleep 2
+    done
 }
 
 (( BUILD == 0 )) || step "build" build_all

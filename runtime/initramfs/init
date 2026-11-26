@@ -1024,19 +1024,13 @@ fi
 # Consumers: splctl get-current, kernelsetup.sh, anything grepping rauc.slot=.
 # Kernel parameters go before the first standalone "--" (libkrun always appends
 # one); anything after it belongs to init and is kept verbatim at the end.
-# brinewell.ssh=0 adds systemd.ssh_auto=no: systemd-ssh-generator then creates
-# none of its sshd-unix-local/-vsock/-unix-export sockets (see "SSH switch").
-SSH=$(getarg brinewell.ssh)
-case $SSH in 0|1|"") ;; *) warn "ignoring brinewell.ssh='$SSH' (0 or 1)"; SSH= ;; esac
 _keep=
 for _a in $KARGS; do
     case $_a in
         root=*|rauc.slot=*|steamos.efi=*|init=*) ;;
-        systemd.ssh_auto=*) [ "$SSH" = 0 ] || _keep="$_keep $_a" ;;
         *) _keep="$_keep $_a" ;;
     esac
 done
-[ "$SSH" = 0 ] && _keep="$_keep systemd.ssh_auto=no"
 echo "${_keep# } root=PARTLABEL=rootfs-$SLOT rauc.slot=$SLOT steamos.efi=PARTUUID=$EFI_UUID init=$INIT${HAVE_DDASH:+ --$IARGS}" > /run/brinewell/cmdline
 
 # ---------------------------------------------------------------- unit masks
@@ -1057,7 +1051,7 @@ fi
 # ---------------------------------------------------------------- SSH switch
 # Steam's privileged Devkit helper groups sshd with its debugging services.
 # Keep its stock enable/disable actions for every service except sshd when
-# Brinewell explicitly owns SSH. Patch the booted slot's helper so other
+# users control SSH. Patch the booted slot's helper so other
 # Devkit behavior continues to follow SteamOS updates.
 without_devkit_sshd() {
     awk '
@@ -1069,35 +1063,16 @@ without_devkit_sshd() {
     ' "$1"
 }
 
-if [ "$SSH" = 1 ]; then
-    _devkit=/newroot/usr/bin/steamos-polkit-helpers/steamos-devkit-mode
-    if [ -f "$_devkit" ]; then
-        _devkit_patched=/run/brinewell/steamos-devkit-mode
-        if without_devkit_sshd "$_devkit" > "$_devkit_patched" \
-                && chmod 0755 "$_devkit_patched" \
-                && bind_ro "$_devkit_patched" "$_devkit"; then
-            msg "brinewell.ssh=1: SSH is independent of Steam Devkit"
-        else
-            warn "could not separate sshd from the Steam Devkit helper"
-        fi
+_devkit=/newroot/usr/bin/steamos-polkit-helpers/steamos-devkit-mode
+if [ -f "$_devkit" ]; then
+    _devkit_patched=/run/brinewell/steamos-devkit-mode
+    if without_devkit_sshd "$_devkit" > "$_devkit_patched" \
+            && chmod 0755 "$_devkit_patched" \
+            && bind_ro "$_devkit_patched" "$_devkit"; then
+        msg "SSH is independent of Steam Devkit"
+    else
+        warn "could not separate sshd from the Steam Devkit helper"
     fi
-
-    # Recover slots where Devkit already removed the persistent link.
-    _sshd_unit=/usr/lib/systemd/system/sshd.service
-    _sshd_wants=/run/systemd/system/multi-user.target.wants
-    if [ -f "/newroot$_sshd_unit" ] \
-            && [ ! -L /newroot/etc/systemd/system/multi-user.target.wants/sshd.service ]; then
-        { mkdir -p "$_sshd_wants" && ln -s "$_sshd_unit" "$_sshd_wants/sshd.service"; } \
-            || warn "cannot enable sshd for this boot"
-    fi
-elif [ "$SSH" = 0 ]; then
-    for _unit in sshd.service sshd@.service sshd.socket \
-                 sshd-unix-local.socket sshd-unix-local@.service sshd-vsock.socket sshd-vsock@.service \
-                 sshd-unix-export.socket sshd-unix-export@.service sshd-extra.socket sshd-extra@.service \
-                 sshd-generated@.service; do
-        ln -sfn /dev/null "/run/systemd/system/$_unit"
-    done
-    msg "brinewell.ssh=0: SSH server disabled for this boot (sshd units runtime-masked)"
 fi
 
 # ---------------------------------------------------------------- switch_root

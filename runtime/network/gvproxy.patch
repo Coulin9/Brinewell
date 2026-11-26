@@ -196,3 +196,162 @@ index 57c5daf..e474ba9 100644
  	if err != nil {
  		return nil, err
  	}
+--- a/cmd/gvproxy/main.go
++++ b/cmd/gvproxy/main.go
+@@ -157,15 +157,5 @@
+ 		httpServe(ctx, g, ln, vn.ServicesMux())
+ 	}
+ 
+-	ln, err := vn.Listen("tcp", fmt.Sprintf("%s:80", config.Stack.GatewayIP))
+-	if err != nil {
+-		return err
+-	}
+-	mux := http.NewServeMux()
+-	mux.Handle("/services/forwarder/all", vn.Mux())
+-	mux.Handle("/services/forwarder/expose", vn.Mux())
+-	mux.Handle("/services/forwarder/unexpose", vn.Mux())
+-	httpServe(ctx, g, ln, mux)
+-
+ 	if InDebugMode() {
+ 		g.Go(func() error {
+--- a/pkg/services/forwarder/ports.go
++++ b/pkg/services/forwarder/ports.go
+@@ -261,14 +261,23 @@
+ func key(protocol types.TransportProtocol, local string) ProxyKey {
+ 	return ProxyKey(fmt.Sprintf("%s/%s", protocol, local))
+ }
++
++var errRemoteMismatch = errors.New("proxy remote does not match")
+ 
+ func (f *PortsForwarder) Unexpose(protocol types.TransportProtocol, local string) error {
++	return f.unexpose(protocol, local, "")
++}
++
++func (f *PortsForwarder) unexpose(protocol types.TransportProtocol, local, remote string) error {
+ 	f.proxiesLock.Lock()
+ 	defer f.proxiesLock.Unlock()
+ 	proxy, ok := f.proxies[key(protocol, local)]
+ 	if !ok {
+ 		return errors.New("proxy not found")
+ 	}
++	if remote != "" && proxy.Remote != remote {
++		return errRemoteMismatch
++	}
+ 	delete(f.proxies, key(protocol, local))
+ 	return proxy.underlying.Close()
+ }
+@@ -304,20 +313,22 @@
+ 			req.Protocol = types.TCP
+ 		}
+ 
+-		// contains unparsed remote field
+-		remoteAddr := req.Remote
+-
+-		// TCP and UDP rely on remote() to preparse the remote field
+-		if req.Protocol != types.UNIX && req.Protocol != types.NPIPE {
+-			var err error
+-			remoteAddr, err = remote(req, r.RemoteAddr)
+-			if err != nil {
+-				http.Error(w, err.Error(), http.StatusBadRequest)
+-				return
+-			}
++		if req.Protocol != types.TCP {
++			http.Error(w, "only tcp is allowed", http.StatusBadRequest)
++			return
+ 		}
++		host, port, err := net.SplitHostPort(req.Local)
++		portNumber, portErr := strconv.ParseUint(port, 10, 16)
++		if err != nil || host != "127.0.0.1" || portErr != nil || portNumber == 0 {
++			http.Error(w, "local must be 127.0.0.1 with a valid port", http.StatusBadRequest)
++			return
++		}
++		if req.Remote != "192.168.127.2:22" {
++			http.Error(w, "remote must be 192.168.127.2:22", http.StatusBadRequest)
++			return
++		}
+ 
+-		if err := f.Expose(req.Protocol, req.Local, remoteAddr); err != nil {
++		if err := f.Expose(req.Protocol, req.Local, req.Remote); err != nil {
+ 			http.Error(w, err.Error(), http.StatusInternalServerError)
+ 			return
+ 		}
+@@ -336,7 +347,15 @@
+ 		if req.Protocol == "" {
+ 			req.Protocol = types.TCP
+ 		}
+-		if err := f.Unexpose(req.Protocol, req.Local); err != nil {
++		if req.Protocol != types.TCP {
++			http.Error(w, "only tcp is allowed", http.StatusBadRequest)
++			return
++		}
++		if err := f.unexpose(req.Protocol, req.Local, req.Remote); err != nil {
++			if errors.Is(err, errRemoteMismatch) {
++				http.Error(w, err.Error(), http.StatusConflict)
++				return
++			}
+ 			http.Error(w, err.Error(), http.StatusInternalServerError)
+ 			return
+ 		}
+--- a/pkg/types/handshake.go
++++ b/pkg/types/handshake.go
+@@ -17,6 +17,7 @@
+ 
+ type UnexposeRequest struct {
+ 	Local    string            `json:"local"`
++	Remote   string            `json:"remote,omitempty"`
+ 	Protocol TransportProtocol `json:"protocol"`
+ }
+ 
+--- a/pkg/services/forwarder/brinewell_security_test.go
++++ b/pkg/services/forwarder/brinewell_security_test.go
+@@ -0,0 +1,50 @@
++package forwarder
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
++)
++
++func TestBrinewellForwarderAPI(t *testing.T) {
++	f := NewPortsForwarder(nil)
++	mux := f.Mux()
++	post := func(path, body string) int {
++		w := httptest.NewRecorder()
++		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
++		return w.Code
++	}
++	for _, body := range []string{
++		`{"protocol":"unix","local":"/tmp/socket","remote":"tcp://192.168.127.2:22"}`,
++		`{"protocol":"npipe","local":"127.0.0.1:1234","remote":"192.168.127.2:22"}`,
++		`{"protocol":"udp","local":"127.0.0.1:1234","remote":"192.168.127.2:22"}`,
++		`{"local":"0.0.0.0:1234","remote":"192.168.127.2:22"}`,
++		`{"local":"127.0.0.1:0","remote":"192.168.127.2:22"}`,
++		`{"local":"127.0.0.1:65536","remote":"192.168.127.2:22"}`,
++		`{"local":"/tmp/socket","remote":"192.168.127.2:22"}`,
++		`{"local":"127.0.0.1:1234","remote":"192.168.127.2:23"}`,
++	} {
++		if got := post("/expose", body); got != http.StatusBadRequest {
++			t.Errorf("expose %s: got %d", body, got)
++		}
++	}
++	closed := false
++	local := "127.0.0.1:1234"
++	f.proxies[key(types.TCP, local)] = proxy{Remote: "192.168.127.2:22", underlying: CloseWrapper(func() error { closed = true; return nil })}
++	for _, protocol := range []string{"unix", "npipe", "udp"} {
++		body := fmt.Sprintf(`{"local":%q,"protocol":%q}`, local, protocol)
++		if got := post("/unexpose", body); got != http.StatusBadRequest {
++			t.Errorf("unexpose %s: got %d", body, got)
++		}
++	}
++	if got := post("/unexpose", `{"local":"127.0.0.1:1234","remote":"192.168.127.2:23"}`); got != http.StatusConflict || closed {
++		t.Fatalf("mismatch: status %d, closed %v", got, closed)
++	}
++	if got := post("/unexpose", `{"local":"127.0.0.1:1234","remote":"192.168.127.2:22"}`); got != http.StatusOK || !closed {
++		t.Fatalf("matching remote: status %d, closed %v", got, closed)
++	}
++}
