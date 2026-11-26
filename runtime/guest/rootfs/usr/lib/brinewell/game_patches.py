@@ -29,6 +29,7 @@ PATCHES = {
     "223850": "3dmark",
     "2622380": "nightreign",
     "814380": "sekiro",
+    "782330": "doom-eternal",
 }
 
 
@@ -343,13 +344,19 @@ def prepare(profile, command, environment, cmdline):
     overridden = graphics.graphics_overridden(environment)
     if overridden and appid != "1174180":
         return command, environment, None
-    install = Path(install_value).resolve()
+    try:
+        install = Path(install_value).resolve()
+    except (OSError, RuntimeError):
+        return command, environment, None
     if verb_index + 1 >= len(command):
         return command, environment, None
     value = command[verb_index + 1]
     if not value.lower().endswith(".exe"):
         return command, environment, None
-    executable = Path(value).resolve()
+    try:
+        executable = Path(value).resolve()
+    except (OSError, RuntimeError):
+        return command, environment, None
     if not executable.is_relative_to(install) or not executable.is_file():
         return command, environment, None
     index = verb_index + 1
@@ -359,11 +366,35 @@ def prepare(profile, command, environment, cmdline):
             or (appid == "2622380" and name not in ("nightreign.exe", "start_protected_game.exe"))
             or (appid == "814380" and name != "sekiro.exe")):
         return command, environment, None
+    if appid == "782330" and (not os.path.isabs(value) or
+            Path(value) != Path(install_value) / "launcher/idTechLauncher.exe"):
+        return command, environment, None
     try:
-        mode = MODE_FILE.read_text().strip()
-    except OSError:
-        mode = ""
-    mode = graphics.effective_mode(mode, appid, exe_path=value, install_dir=install_value)
+        live_mode = MODE_FILE.read_text().strip()
+    except (OSError, UnicodeError):
+        live_mode = ""
+    mode = graphics.effective_mode(live_mode, appid, exe_path=value, install_dir=install_value)
+    if appid == "782330":
+        if live_mode not in ("automatic", "venus") or mode != "venus":
+            return command, environment, None
+        try:
+            target = (install / "DOOMEternalx64vk.exe").resolve()
+        except (OSError, RuntimeError):
+            return command, environment, None
+        if target == executable or not target.is_relative_to(install) or not target.is_file():
+            return command, environment, None
+        try:
+            try:
+                prefix = Path(prefix_value).resolve(strict=True)
+            except FileNotFoundError:
+                prefix = Path(prefix_value).resolve()
+            prefix = prefix / "pfx"
+        except (OSError, RuntimeError):
+            return command, environment, None
+        command[index] = str(target)
+        identity = {"appid": appid, "prefix": str(prefix),
+                    "executable": str(target), "affinity": False}
+        return command, environment, identity
     supported = mode in ("neptune", "mullion") and (mode != "neptune" or arch == "x86_64")
     deferred_seed = None
     if appid == "1174180":

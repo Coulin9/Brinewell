@@ -23,6 +23,10 @@ with patch.object(sys, "path", [str(SCRIPTS), *sys.path]):
     spec = importlib.util.spec_from_loader(loader.name, loader)
     game_launch = importlib.util.module_from_spec(spec)
     loader.exec_module(game_launch)
+    loader = importlib.machinery.SourceFileLoader("graphics_wrap", str(SCRIPTS / "brinewell-graphics-wrap"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    graphics_wrap = importlib.util.module_from_spec(spec)
+    loader.exec_module(graphics_wrap)
 
 
 class GamePatchTests(unittest.TestCase):
@@ -69,6 +73,157 @@ class GamePatchTests(unittest.TestCase):
         return ["FEX", "waitforexitandrun", "--", "runtime", "--verb=run", "--",
                 str(self.tool / "proton"),
                 "waitforexitandrun", str(executable), *arguments]
+
+    def doom_launch(self):
+        (self.install / "launcher").mkdir(exist_ok=True)
+        command = self.command("launcher/idTechLauncher.exe", "--caller-option", "two words")
+        environment = dict(self.environment, SteamAppId="782330", CUSTOM="preserved")
+        return command, environment
+
+    def test_doom_venus_replaces_only_launcher(self):
+        command, environment = self.doom_launch()
+        target = self.install / "DOOMEternalx64vk.exe"
+        target.touch()
+        for live_mode in ("venus", "automatic"):
+            with self.subTest(live_mode=live_mode), patch.object(
+                    game_patches.graphics, "resolve_backend_for_app", return_value="venus"):
+                self.mode.write_text(live_mode)
+                changed, actual_env, identity = game_patches.prepare("doom-eternal", command, environment, "")
+                expected = list(command)
+                expected[-3] = str(target.resolve())
+                self.assertEqual(changed, expected)
+                self.assertEqual(actual_env, environment)
+                self.assertNotIn("SteamDeck", actual_env)
+                self.assertEqual(identity, {"appid": "782330", "prefix": str(
+                    (Path(environment["STEAM_COMPAT_DATA_PATH"]) / "pfx").resolve()),
+                    "executable": str(target.resolve()), "affinity": False})
+                self.assertEqual(game_patches.prepare("782330", changed, environment, ""),
+                                 (changed, environment, None))
+
+    def test_doom_other_modes_and_invalid_mode_pass_through(self):
+        command, environment = self.doom_launch()
+        (self.install / "DOOMEternalx64vk.exe").touch()
+        for live_mode, effective in (("neptune", "neptune"), ("mullion", "mullion"),
+                                     ("automatic", "neptune"), ("invalid", "venus"), ("", "venus")):
+            with self.subTest(live_mode=live_mode), patch.object(
+                    game_patches.graphics, "resolve_backend_for_app", return_value=effective):
+                self.mode.write_text(live_mode)
+                self.assertEqual(game_patches.prepare("doom-eternal", command, environment, ""),
+                                 (command, environment, None))
+
+    def test_graphics_wrap_invalid_utf8_mode_falls_back_to_venus(self):
+        self.mode.write_bytes(b"\xff")
+        with patch.object(graphics_wrap, "Path", return_value=self.mode):
+            self.assertEqual(graphics_wrap._mode(), "venus")
+
+    def test_doom_missing_and_invalid_utf8_mode_pass_through(self):
+        command, environment = self.doom_launch()
+        (self.install / "DOOMEternalx64vk.exe").touch()
+        self.mode.unlink()
+        self.assertEqual(game_patches.prepare("doom-eternal", command, environment, ""),
+                         (command, environment, None))
+        self.mode.write_bytes(b"\xff")
+        self.assertEqual(game_patches.prepare("doom-eternal", command, environment, ""),
+                         (command, environment, None))
+
+    def test_doom_symlink_loops_and_self_target_pass_through(self):
+        command, environment = self.doom_launch()
+        self.mode.write_text("venus")
+        target = self.install / "DOOMEternalx64vk.exe"
+        target.symlink_to(target.name)
+        self.assertEqual(game_patches.prepare("doom-eternal", command, environment, ""),
+                         (command, environment, None))
+        target.unlink()
+        target.symlink_to("launcher/idTechLauncher.exe")
+        self.assertEqual(game_patches.prepare("doom-eternal", command, environment, ""),
+                         (command, environment, None))
+        target.unlink()
+        launcher = self.install / "launcher/idTechLauncher.exe"
+        launcher.unlink()
+        launcher.symlink_to(launcher.name)
+        self.assertEqual(game_patches.prepare("doom-eternal", command, environment, ""),
+                         (command, environment, None))
+
+    def test_doom_circular_prefix_passes_through(self):
+        command, environment = self.doom_launch()
+        original = list(command)
+        self.mode.write_text("venus")
+        (self.install / "DOOMEternalx64vk.exe").touch()
+        prefix = self.root / "circular-prefix"
+        prefix.symlink_to(prefix.name)
+        environment["STEAM_COMPAT_DATA_PATH"] = str(prefix)
+        changed, actual_env, identity = game_patches.prepare("doom-eternal", command, environment, "")
+        self.assertEqual(changed, original)
+        self.assertEqual(command, original)
+        self.assertEqual(actual_env, environment)
+        self.assertIsNone(identity)
+
+    def test_doom_rejects_other_entries_and_invalid_targets(self):
+        command, environment = self.doom_launch()
+        self.mode.write_text("venus")
+        target = self.install / "DOOMEternalx64vk.exe"
+        self.assertEqual(game_patches.prepare("doom-eternal", command, environment, ""),
+                         (command, environment, None))
+        outside = self.root / "outside.exe"
+        outside.touch()
+        target.symlink_to(outside)
+        self.assertEqual(game_patches.prepare("doom-eternal", command, environment, ""),
+                         (command, environment, None))
+        target.unlink()
+        target.mkdir()
+        self.assertEqual(game_patches.prepare("doom-eternal", command, environment, ""),
+                         (command, environment, None))
+        target.rmdir()
+        target.touch()
+        (self.install / "other").mkdir()
+        for name in ("other/idTechLauncher.exe", "other.exe", "DOOMEternalx64vk.exe"):
+            candidate = self.command(name)
+            with self.subTest(name=name):
+                self.assertEqual(game_patches.prepare("doom-eternal", candidate, environment, ""),
+                                 (candidate, environment, None))
+        launcher = self.install / "launcher/idTechLauncher.exe"
+        launcher.unlink()
+        launcher.symlink_to(outside)
+        self.assertEqual(game_patches.prepare("doom-eternal", command, environment, ""),
+                         (command, environment, None))
+
+    def test_doom_respects_launch_safety_gates(self):
+        command, environment = self.doom_launch()
+        (self.install / "DOOMEternalx64vk.exe").touch()
+        self.mode.write_text("venus")
+        non_game = list(command)
+        non_game[-4] = "runinprefix"
+        relative = list(command)
+        relative[-3] = "launcher/idTechLauncher.exe"
+        invalid_tool = list(command)
+        invalid_tool[-5] = "/invalid/proton"
+        for candidate, env in ((command, dict(environment, STEAM_COMPAT_APP_ID="42")),
+                               (command, dict(environment, WINEDLLOVERRIDES="d3d12=n")),
+                               (non_game, environment),
+                               (invalid_tool, environment),
+                               (command, dict(environment, STEAM_COMPAT_INSTALL_PATH="relative")),
+                               (command, dict(environment, STEAM_COMPAT_DATA_PATH="relative"))):
+            with self.subTest(candidate=candidate, environment=env):
+                self.assertEqual(game_patches.prepare("doom-eternal", candidate, env, ""),
+                                 (candidate, env, None))
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir(self.install)
+            self.assertEqual(game_patches.prepare("doom-eternal", relative, environment, ""),
+                             (relative, environment, None))
+        finally:
+            os.chdir(previous_cwd)
+
+    def test_existing_profiles_remain_inactive_on_venus(self):
+        self.mode.write_text("venus")
+        for profile, appid, name in (("cyberpunk2077", "1091500", "REDprelauncher.exe"),
+                                     ("rdr2", "1174180", "RDR2.exe")):
+            command = self.command(name)
+            environment = dict(self.environment, SteamAppId=appid)
+            with self.subTest(profile=profile), patch.object(
+                    game_patches, "patch_state_dir", return_value=self.root / "records"):
+                self.assertEqual(game_patches.prepare(profile, command, environment, ""),
+                                 (command, environment, None))
 
     def test_automatic_only_applies_resolved_neptune_patches(self):
         self.mode.write_text("automatic\n")

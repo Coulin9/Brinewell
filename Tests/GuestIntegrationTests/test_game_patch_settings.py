@@ -36,6 +36,9 @@ class GamePatchSettingsTests(unittest.TestCase):
 
     def test_all_supported_patches_are_defaults(self):
         settings.synchronize(self.steam, self.state)
+        self.assertEqual(settings.PATCHES["782330"], "doom-eternal")
+        self.assertEqual(self.options("782330"),
+                         "/usr/lib/brinewell/brinewell-game-launch --profile doom-eternal -- %command%")
         self.assertEqual(settings.PATCHES["1174180"], "rdr2")
         self.assertEqual(self.options("1174180"),
                          "/usr/lib/brinewell/brinewell-game-launch --profile rdr2 -- %command%")

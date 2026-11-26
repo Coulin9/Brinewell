@@ -53,7 +53,7 @@ def _mode():
         mode = Path("/run/brinewell/graphics-backend").read_text().strip()
         if mode in graphics.LIVE_MODES:
             return mode
-    except OSError:
+    except (OSError, UnicodeError):
         pass
     return "venus"
 
