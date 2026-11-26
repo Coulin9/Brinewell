@@ -1,0 +1,14 @@
+#!/bin/sh
+# The ARM Steam client prepends this directory to its absolute replayer path.
+# Publish it only once both paths exist, for Game Mode and Desktop Mode.
+set -eu
+prefix="${XDG_RUNTIME_DIR:?}/brinewell-fossilize"
+if [ -n "${STEAM_FOSSILIZE_REPLAY_WRAP:-}" ] && [ "$STEAM_FOSSILIZE_REPLAY_WRAP" != "$prefix" ]; then
+    exit 0
+fi
+for arch in steamrtarm64 steamrtarm32; do
+    dir="$prefix${HOME:?}/.local/share/Steam/$arch"
+    mkdir -p "$dir"
+    ln -sfn /usr/lib/brinewell/steam-shader-replay "$dir/fossilize_replay"
+done
+printf 'STEAM_FOSSILIZE_REPLAY_WRAP=%s\n' "$prefix"

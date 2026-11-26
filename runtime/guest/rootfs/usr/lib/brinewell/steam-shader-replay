@@ -1,0 +1,114 @@
+#!/usr/bin/python3
+"""Apply Brinewell's game backend at Steam's Fossilize master-process boundary."""
+import os
+from pathlib import Path
+import re
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import brinewell_graphics as graphics
+from brinewell_vdf import vdf_entries
+
+
+MODE_FILE = Path("/run/brinewell/graphics-backend")
+
+
+def replay_app_id(args):
+    if "--master-process" not in args:
+        return None
+    app_ids = set()
+    for path in args[:args.index("--master-process")]:
+        match = re.search(r"/steamapps/shadercache/([0-9]+)/fozpipelinesv[0-9]+/.+\.foz$", path)
+        if not match or not graphics.valid_app_id(match[1]):
+            return None
+        app_ids.add(match[1])
+    return app_ids.pop() if len(app_ids) == 1 else None
+
+
+def selected_tool(steam, app_id, libraries):
+    # Steam records its effective mapping here, including native, overrides and
+    # unmaps. Discard previous sessions and do not infer a tool from an old prefix.
+    selected = None
+    tools = {}
+    local_manifests = set()
+    with (steam / "logs/compat_log.txt").open(errors="replace") as log:
+        for line in log:
+            message = line.partition("] ")[2].rstrip()
+            if message.startswith("Client version:"):
+                selected = None
+                tools.clear()
+                local_manifests.clear()
+            elif message.startswith("Processing local tool list at ") and message.endswith("..."):
+                local_manifests.add(Path(message[len("Processing local tool list at "):-3]))
+            elif message.startswith("Registering tool "):
+                match = re.fullmatch(r"Registering tool (.+), AppID ([0-9]+)", message)
+                if match:
+                    tools[match[1]] = match[2]
+            elif message.startswith(f"Mapping AppID {app_id} to tool "):
+                match = re.fullmatch(r'Mapping AppID [0-9]+ to tool "([^"]+)" with priority [0-9]+', message)
+                selected = match[1] if match else None
+            elif message == f"Unmapping AppID {app_id}":
+                selected = None
+    if not selected or selected == "native":
+        return None
+    tool_id = tools.get(selected)
+    if graphics.valid_app_id(tool_id):
+        tool = install_dir(libraries, tool_id)
+        if tool:
+            return tool
+    # Local Proton builds may have no Steam depot. Use the manifest Steam loaded.
+    for manifest in local_manifests:
+        if not manifest.is_absolute() or not manifest.is_file():
+            continue
+        entries, _, _ = vdf_entries(manifest.read_text())
+        path = entries.get(("compatibilitytools", "compat_tools", selected.lower(), "install_path"))
+        if path:
+            return manifest.parent / path[0]
+    return None
+
+
+def install_dir(libraries, app_id):
+    for library in libraries:
+        manifest = library / "steamapps" / f"appmanifest_{app_id}.acf"
+        if not manifest.is_file():
+            continue
+        values, _, _ = vdf_entries(manifest.read_text())
+        name = values[("appstate", "installdir")][0]
+        if name and name not in (".", "..") and Path(name).name == name:
+            return library / "steamapps/common" / name
+    return None
+
+
+def skip_pipelines(steam, args, mode):
+    app_id = replay_app_id(args)
+    if mode not in ("automatic", "neptune") or not app_id or graphics.graphics_overridden(os.environ):
+        return False
+    entries, _, _ = vdf_entries((steam / "config/libraryfolders.vdf").read_text())
+    libraries = [Path(value[0]) for key, value in entries.items()
+                 if len(key) == 3 and key[0] == "libraryfolders" and key[-1] == "path"]
+    tool = selected_tool(steam, app_id, libraries)
+    if not tool or not (tool / "proton").is_file() or graphics.select_arch(tool) != "x86_64":
+        return False
+    game = install_dir(libraries, app_id)
+    return graphics.effective_mode(mode, app_id, install_dir=game) == "neptune"
+
+
+def main(argv):
+    prefix = Path(os.environ["STEAM_FOSSILIZE_REPLAY_WRAP"])
+    replay = Path("/") / Path(os.path.normpath(argv[0])).relative_to(prefix)
+    args = argv[1:]
+    try:
+        mode = MODE_FILE.read_text().strip()
+        if skip_pipelines(replay.parent.parent, args, mode):
+            # Let Fossilize finish the shared-memory/control-fd protocol itself.
+            # Empty ranges spawn no compiler workers or pipeline-cache entries.
+            args += ["--graphics-pipeline-range", "0", "0",
+                     "--compute-pipeline-range", "0", "0",
+                     "--raytracing-pipeline-range", "0", "0"]
+    except (OSError, UnicodeError, KeyError, ValueError):
+        pass  # Incomplete Steam metadata: run the original replay.
+    os.execv(replay, [str(replay), *args])
+
+
+if __name__ == "__main__":
+    main(sys.argv)
