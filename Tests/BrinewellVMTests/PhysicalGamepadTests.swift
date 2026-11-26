@@ -21,6 +21,8 @@ final class PhysicalGamepadTests: XCTestCase {
             frames.append(state)
             onEmit?(state)
         }, sendScript: { _, _ in true }, cancelRelease: {})
+        var selections: [Bool] = []
+        input.onSelectionChange = { selections.append($0) }
         let bridge = PhysicalGamepad(input: input)
         defer { bridge.stop() }
 
@@ -75,6 +77,7 @@ final class PhysicalGamepadTests: XCTestCase {
         let replacementOriginal = replacementButtons.map(\.preferredSystemGestureState)
         home.setValue(1)
         bridge.setController(replacement)
+        XCTAssertEqual(selections, [true])
         XCTAssertEqual(buttons.map(\.preferredSystemGestureState), original)
         XCTAssertTrue(replacementButtons.allSatisfy { $0.preferredSystemGestureState == .disabled })
         frames.removeAll()

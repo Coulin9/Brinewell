@@ -4,6 +4,13 @@ import XCTest
 @testable import BrinewellVMRuntime
 
 final class GamepadInputTests: XCTestCase {
+    private final class Reports: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [String] = []
+        func append(_ line: String) { lock.lock(); defer { lock.unlock() }; storage.append(line) }
+        func values() -> [String] { lock.lock(); defer { lock.unlock() }; return storage }
+        func clear() { lock.lock(); defer { lock.unlock() }; storage.removeAll() }
+    }
     func testAxisConversions() {
         XCTAssertEqual(GamepadState.stick(-2), -32768)
         XCTAssertEqual(GamepadState.stick(2), 32767)
@@ -25,6 +32,7 @@ final class GamepadInputTests: XCTestCase {
         })
         defer { ports.close() }
         ports.readPad(Array("hello\n".utf8))
+        ports.control("pad attach")
         let cases = [
             ("pad axis lx -32768", "3:0:-32768", "3:0:0"),
             ("pad axis ly 32767 2000", "3:1:32767", "3:1:0"),
@@ -58,6 +66,7 @@ final class GamepadInputTests: XCTestCase {
         XCTAssertTrue(output.isEmpty)
         XCTAssertNil(ports.input.script)
         ports.readPad(Array("hello\n".utf8))
+        ports.control("pad attach")
         output.removeAll()
         let token = ports.input.token
         for command in [
@@ -85,6 +94,7 @@ final class GamepadInputTests: XCTestCase {
         })
         defer { ports.close() }
         ports.readPad(Array("hello\n".utf8))
+        ports.control("pad attach")
         output.removeAll()
         ports.control("pad axis ly -32768 50")
         XCTAssertEqual(String(decoding: output, as: UTF8.self), "ev 3:1:-32768\n")
@@ -102,6 +112,7 @@ final class GamepadInputTests: XCTestCase {
         })
         defer { ports.close() }
         ports.readPad(Array("hello\n".utf8))
+        ports.control("pad attach")
         output.removeAll()
         ports.control("pad axis lx 15000 2000")
         let token = ports.input.token
@@ -132,6 +143,7 @@ final class GamepadInputTests: XCTestCase {
         })
         defer { ports.close() }
         ports.readPad(Array("hello\n".utf8))
+        ports.control("pad attach")
         output.removeAll()
         blocked = true
         ports.control("pad axis rx 10000 2000")
@@ -236,6 +248,7 @@ final class GamepadInputTests: XCTestCase {
         })
         defer { ports.close() }
         ports.readPad(Array("hello\n".utf8))
+        ports.control("pad attach")
         output.removeAll()
         blocked = true
         let input = GamepadInputState(
@@ -285,10 +298,10 @@ final class GamepadInputTests: XCTestCase {
         let text = String(decoding: output, as: UTF8.self)
         XCTAssertTrue(text.hasSuffix("\n"))
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        XCTAssertEqual(lines.count, 5)
-        guard lines.count == 5 else { return }
+        XCTAssertEqual(lines.count, 6)
+        guard lines.count == 6 else { return }
         let create = "create 0003 045e 028e 0114 304,305,307,308,310,311,314,315,316,317,318 0:-32768:32767:16:128,1:-32768:32767:16:128,2:0:255:0:0,3:-32768:32767:16:128,4:-32768:32767:16:128,5:0:255:0:0,16:-1:1:0:0,17:-1:1:0:0 Microsoft X-Box 360 pad"
-        XCTAssertEqual(lines, [create, state.frame, create, state.frame, ""])
+        XCTAssertEqual(lines, [create, state.frame, "destroy", create, state.frame, ""])
     }
 
     @MainActor
@@ -311,6 +324,259 @@ final class GamepadInputTests: XCTestCase {
         XCTAssertEqual(writes, count)
         XCTAssertNil(ports.input.script)
         XCTAssertEqual(ports.input.token, token)
+    }
+
+    @MainActor
+    func testOnDemandOwnersAndFocus() throws {
+        var output = [UInt8]()
+        let ports = try VMPorts(runDirectory: FileManager.default.temporaryDirectory, padWriter: { bytes in
+            output.append(contentsOf: bytes); return bytes.count
+        })
+        defer { ports.close() }
+        ports.control("pad state")
+        ports.readPad(Array("hello\n".utf8))
+        ports.control("pad neutral")
+        ports.control("pad press invalid")
+        XCTAssertTrue(output.isEmpty)
+        var held = GamepadState()
+        held.pressed.insert(304)
+        ports.input.setActive(true)
+        ports.input.select(true, state: held)
+        var lines = String(decoding: output, as: UTF8.self).split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines.count, 2)
+        guard lines.count == 2 else { return }
+        XCTAssertTrue(lines[0].hasPrefix("create "))
+        XCTAssertEqual(lines[1], held.frame)
+        output.removeAll()
+        ports.input.setActive(false)
+        ports.input.setActive(true)
+        lines = String(decoding: output, as: UTF8.self).split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines, [GamepadState().frame, held.frame])
+        output.removeAll()
+        ports.control("pad attach")
+        ports.control("pad attach")
+        ports.control("pad detach")
+        XCTAssertTrue(output.isEmpty)
+        ports.input.select(false)
+        lines = String(decoding: output, as: UTF8.self).split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines, [GamepadState().frame, "destroy"])
+    }
+
+    @MainActor
+    func testUnfocusedSelectionCreatesWithoutSnapshot() throws {
+        var output = [UInt8]()
+        let ports = try VMPorts(runDirectory: FileManager.default.temporaryDirectory, padWriter: { bytes in
+            output.append(contentsOf: bytes); return bytes.count
+        })
+        defer { ports.close() }
+        var held = GamepadState()
+        held.pressed.insert(304)
+        ports.input.select(true, state: held)
+        ports.readPad(Array("hello\n".utf8))
+        let lines = String(decoding: output, as: UTF8.self).split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertTrue(lines.first?.hasPrefix("create ") == true)
+        output.removeAll()
+        ports.input.setActive(true)
+        XCTAssertEqual(String(decoding: output, as: UTF8.self), held.frame + "\n")
+    }
+
+    @MainActor
+    func testDisconnectAndReconnectUnderBackpressure() throws {
+        var blocked = false
+        var output = [UInt8]()
+        let ports = try VMPorts(runDirectory: FileManager.default.temporaryDirectory, padWriter: { bytes in
+            if blocked { errno = EAGAIN; return -1 }
+            output.append(contentsOf: bytes); return bytes.count
+        })
+        defer { ports.close() }
+        var held = GamepadState()
+        held.pressed.insert(304)
+        ports.input.select(true, state: held)
+        ports.input.setActive(true)
+        ports.readPad(Array("hello\n".utf8))
+        output.removeAll()
+        blocked = true
+        ports.input.select(false)
+        ports.input.select(true, state: held)
+        blocked = false
+        ports.flush()
+        let lines = String(decoding: output, as: UTF8.self).split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines.count, 4)
+        guard lines.count == 4 else { return }
+        XCTAssertEqual(lines[0], GamepadState().frame)
+        XCTAssertEqual(lines[1], "destroy")
+        XCTAssertTrue(lines[2].hasPrefix("create "))
+        XCTAssertEqual(lines[3], held.frame)
+    }
+
+    @MainActor
+    func testLazyPinAndReconnectFence() throws {
+        var output = [UInt8]()
+        let ports = try VMPorts(runDirectory: FileManager.default.temporaryDirectory, padWriter: { bytes in
+            output.append(contentsOf: bytes); return bytes.count
+        })
+        defer { ports.close() }
+        ports.readPad(Array("hello\n".utf8))
+        ports.control("pad press a 2000")
+        let token = ports.input.token
+        XCTAssertTrue(String(decoding: output, as: UTF8.self).contains("\nev 1:304:1\n"))
+        output.removeAll()
+        ports.readPad(Array("hello\n".utf8))
+        XCTAssertNil(ports.input.script)
+        ports.input.release(token)
+        let text = String(decoding: output, as: UTF8.self)
+        XCTAssertTrue(text.hasPrefix("destroy\ncreate "))
+        XCTAssertFalse(text.contains("ev 1:304:0"))
+        output.removeAll()
+        ports.control("pad neutral")
+        XCTAssertTrue(output.isEmpty)
+        ports.control("pad detach")
+        ports.control("pad detach")
+        XCTAssertEqual(String(decoding: output, as: UTF8.self), "destroy\n")
+    }
+
+    @MainActor
+    func testColdStateAndPreHelloCommands() throws {
+        var output = [UInt8]()
+        let reports = Reports()
+        let ports = try VMPorts(runDirectory: FileManager.default.temporaryDirectory, padWriter: { bytes in
+            output.append(contentsOf: bytes); return bytes.count
+        })
+        defer { ports.close() }
+        let old = reportHandler
+        defer { reportHandler = old }
+        reportHandler = { reports.append($0) }
+        ports.control("pad attach")
+        ports.control("pad detach")
+        ports.readPad(Array("hello\n".utf8))
+        ports.control("pad state")
+        XCTAssertEqual(reports.values(), ["BRINEWELL control error pad not ready", "BRINEWELL control error pad not ready",
+                                 "BRINEWELL control pad ready=true active=false physical=false selected=false created=0 pinned=0"])
+        XCTAssertTrue(output.isEmpty)
+    }
+
+    @MainActor
+    func testInterruptedFenceSurvivesHardErrorAndNoOwnerReconnect() throws {
+        var output = [UInt8]()
+        var mode = 0
+        let ports = try VMPorts(runDirectory: FileManager.default.temporaryDirectory, padWriter: { bytes in
+            switch mode {
+            case 0: mode = 1; output.append(contentsOf: bytes.prefix(4)); return 4
+            case 1: errno = EAGAIN; return -1
+            case 2: errno = EIO; return -1
+            default: output.append(contentsOf: bytes); return bytes.count
+            }
+        })
+        defer { ports.close() }
+        ports.readPad(Array("hello\n".utf8))
+        ports.control("pad attach")
+        mode = 2
+        ports.readPad(Array("hello\n".utf8))
+        mode = 3
+        ports.readPad(Array("hello\n".utf8))
+        XCTAssertTrue(String(decoding: output, as: UTF8.self).hasPrefix("crea\ndestroy\ncreate "))
+    }
+
+    @MainActor
+    func testInterruptedFenceSurvivesFailureWithoutOwner() throws {
+        var output = [UInt8]()
+        var mode = 0
+        let ports = try VMPorts(runDirectory: FileManager.default.temporaryDirectory, padWriter: { bytes in
+            switch mode {
+            case 0: mode = 1; output.append(contentsOf: bytes.prefix(4)); return 4
+            case 1: errno = EAGAIN; return -1
+            case 2: errno = EIO; return -1
+            default: output.append(contentsOf: bytes); return bytes.count
+            }
+        })
+        defer { ports.close() }
+        ports.input.select(true)
+        ports.readPad(Array("hello\n".utf8))
+        mode = 2
+        ports.readPad(Array("hello\n".utf8))
+        ports.input.select(false)
+        mode = 3
+        ports.readPad(Array("hello\n".utf8))
+        XCTAssertEqual(String(decoding: output, as: UTF8.self), "crea\ndestroy\n")
+    }
+
+    @MainActor
+    func testDetachHeldScriptSendsFullNeutral() throws {
+        var output = [UInt8]()
+        let ports = try VMPorts(runDirectory: FileManager.default.temporaryDirectory, padWriter: { bytes in
+            output.append(contentsOf: bytes); return bytes.count
+        })
+        defer { ports.close() }
+        ports.readPad(Array("hello\n".utf8))
+        ports.control("pad press a 2000")
+        output.removeAll()
+        ports.control("pad detach")
+        XCTAssertNil(ports.input.script)
+        XCTAssertEqual(String(decoding: output, as: UTF8.self), GamepadState().frame + "\ndestroy\n")
+    }
+
+    @MainActor
+    func testSynchronousWriteErrorsAreReported() throws {
+        var fail = true
+        let reports = Reports()
+        let ports = try VMPorts(runDirectory: FileManager.default.temporaryDirectory, padWriter: { bytes in
+            if fail { errno = EIO; return -1 }
+            return bytes.count
+        })
+        defer { ports.close() }
+        let old = reportHandler
+        defer { reportHandler = old }
+        reportHandler = { reports.append($0) }
+        ports.readPad(Array("hello\n".utf8))
+        ports.control("pad attach")
+        ports.control("pad state")
+        XCTAssertTrue(reports.values().contains("BRINEWELL control error pad channel write failed"))
+        XCTAssertTrue(reports.values().contains("BRINEWELL control pad ready=false active=false physical=false selected=false created=0 pinned=1"))
+        fail = false
+        ports.readPad(Array("hello\n".utf8))
+        reports.clear()
+        fail = true
+        ports.control("pad detach")
+        XCTAssertTrue(reports.values().contains("BRINEWELL control error pad channel write failed"))
+        ports.control("pad state")
+        XCTAssertTrue(reports.values().contains("BRINEWELL control pad ready=false active=false physical=false selected=false created=0 pinned=0"))
+    }
+
+    @MainActor
+    func testRepeatedBlockedLifecycleCoalescesAndCloseDiscardsWork() throws {
+        let old = reportHandler
+        defer { reportHandler = old }
+        reportHandler = { _ in }
+        var blocked = false, output = [UInt8](), largest = 0
+        let ports = try VMPorts(runDirectory: FileManager.default.temporaryDirectory, padWriter: { bytes in
+            largest = max(largest, bytes.count)
+            if blocked { errno = EAGAIN; return -1 }
+            output.append(contentsOf: bytes); return bytes.count
+        })
+        ports.readPad(Array("hello\n".utf8))
+        ports.control("pad attach")
+        output.removeAll()
+        blocked = true
+        for _ in 0..<10000 { ports.control("pad detach"); ports.control("pad attach") }
+        blocked = false
+        ports.flush()
+        let lines = String(decoding: output, as: UTF8.self).split(separator: "\n")
+        XCTAssertLessThanOrEqual(largest, 65536)
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertEqual(lines.first, "destroy")
+        XCTAssertTrue(lines.last?.hasPrefix("create ") == true)
+        ports.control("pad detach")
+        blocked = true
+        ports.control("pad press a 2000")
+        let token = ports.input.token
+        ports.control("pad detach")
+        output.removeAll()
+        blocked = false
+        ports.close()
+        ports.input.release(token)
+        XCTAssertTrue(output.isEmpty)
+        XCTAssertNil(ports.input.script)
     }
 
     private func assertNeutral(_ frame: String, file: StaticString = #filePath, line: UInt = #line) {

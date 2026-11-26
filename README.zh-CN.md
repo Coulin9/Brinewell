@@ -440,7 +440,8 @@ printf 'shutdown\n'                     > "$RUN_DIR/control.fifo"
 
 | 命令 | 说明 |
 |---|---|
-| `pad state` | 查看虚拟控制器就绪状态（客体发送 `hello` 后就绪）、脚本动作及物理手柄状态 |
+| `pad state` | 查看就绪、脚本动作和物理手柄状态；`created` 表示已排队创建，`pinned` 表示 FIFO 自动化持有控制器 |
+| `pad attach`、`pad detach` | 固定或解除固定虚拟控制器；物理手柄仍被选中时解除固定不会销毁控制器 |
 | `pad press <按键> [毫秒]`、`pad dpad <方向> [毫秒]` | 按下 50–2000 毫秒（默认 150）后自动释放 |
 | `pad axis lx\|ly\|rx\|ry <值> [毫秒]` | 将摇杆轴保持在 −32768…32767（X 负值向左，Y 负值向上） |
 | `pad neutral` | 提前结束当前脚本动作 |
@@ -449,7 +450,7 @@ printf 'shutdown\n'                     > "$RUN_DIR/control.fifo"
 | `uu status`、`uu install` | 查询或安装 UU；进度记录为 `BRINEWELL uu ...` |
 | `shutdown` | 请求优雅关机 |
 
-一次只执行一个脚本动作。物理手柄接管输入时会取消脚本动作，接管期间拒绝新的脚本动作。
+客体虚拟手柄按需创建：选中物理手柄或 FIFO 自动化固定手柄时才创建，单独使用键鼠不会创建。有效的脚本动作会隐式固定手柄，超时或 `pad neutral` 后仍保持固定，直到执行 `pad detach`。一次只执行一个脚本动作；物理手柄接管输入时会取消脚本动作，接管期间拒绝新的脚本动作。
 
 ## 已知限制
 

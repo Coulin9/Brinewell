@@ -35,6 +35,7 @@ final class GamepadInputState {
     private let sendScript: (String, Bool) -> Bool
     private let cancelRelease: () -> Void
     private let physicalPending: () -> Bool
+    var onSelectionChange: ((Bool) -> Void)?
 
     init(emit: @escaping (GamepadState, Bool) -> Void,
          sendScript: @escaping (String, Bool) -> Bool,
@@ -47,9 +48,11 @@ final class GamepadInputState {
     var physical: Bool { selected && active }
 
     func select(_ selected: Bool, state: GamepadState = GamepadState()) {
+        let changed = self.selected != selected
         if physical { emit(GamepadState(), true) }
         self.selected = selected
-        current = state
+        current = selected ? state : GamepadState()
+        if changed { onSelectionChange?(selected) }
         if physical { _ = resetScript(); emit(current, false) }
     }
 
@@ -87,6 +90,12 @@ final class GamepadInputState {
         cancelRelease()
         script = nil
         return true
+    }
+
+    func invalidateScript() {
+        token &+= 1
+        cancelRelease()
+        script = nil
     }
 
     func release(_ token: UInt64) {

@@ -534,7 +534,8 @@ printf 'shutdown\n'                     > "$RUN_DIR/control.fifo"
 
 | Command | Description |
 |---|---|
-| `pad state` | Virtual pad readiness (after the guest sends `hello`), scripted action and physical pad state |
+| `pad state` | Readiness (after guest `hello`), scripted action and physical pad state; `created` means creation is queued and `pinned` means FIFO automation owns the pad |
+| `pad attach`, `pad detach` | Pin or unpin the virtual pad; detach leaves it present while a physical controller is selected |
 | `pad press <button> [ms]`, `pad dpad <dir> [ms]` | Press for 50–2000 ms (default 150), then release |
 | `pad axis lx\|ly\|rx\|ry <value> [ms]` | Hold a stick axis at −32768…32767 (negative X = left, negative Y = up) |
 | `pad neutral` | End the current scripted action early |
@@ -543,8 +544,7 @@ printf 'shutdown\n'                     > "$RUN_DIR/control.fifo"
 | `uu status`, `uu install` | Query or install UU; progress is logged as `BRINEWELL uu ...` |
 | `shutdown` | Request graceful shutdown |
 
-Only one scripted action runs at a time. A physical gamepad taking over cancels it, and new
-scripted actions are rejected while it is in control.
+The guest pad is created on demand when a physical controller is selected or FIFO automation pins it; keyboard and mouse alone do not create one. A valid scripted action implicitly pins the pad until `pad detach`, including after its timeout or `pad neutral`. Only one scripted action runs at a time. A physical gamepad taking over cancels it, and new scripted actions are rejected while it is in control.
 
 ## Known limitations
 

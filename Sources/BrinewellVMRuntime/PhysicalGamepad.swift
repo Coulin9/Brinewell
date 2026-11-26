@@ -51,9 +51,11 @@ final class PhysicalGamepad {
         controller?.extendedGamepad?.valueChangedHandler = nil
         controller?.extendedGamepad?.buttonHome?.pressedChangedHandler = nil
         restoreSystemGestures()
-        input.select(false)
         controller = next
-        guard let next, let gamepad = next.extendedGamepad else { return }
+        guard let next, let gamepad = next.extendedGamepad else {
+            input.select(false)
+            return
+        }
         next.handlerQueue = .main
         if active { disableSystemGestures() }
         input.select(true, state: Self.snapshot(gamepad))

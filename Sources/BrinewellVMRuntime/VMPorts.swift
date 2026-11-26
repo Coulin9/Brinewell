@@ -172,10 +172,21 @@ final class VMPorts {
     private var progressOverflow = false
     private var padOverflow = false
     private var fifoOverflow = false
-    private var ready = false
+    private var padChannelReady = false
+    private var padCreateQueued = false
+    private var padTargetCreated = false
+    private var scriptPinned = false
+    private var padFramePartial = false
+    private var padEpochWrote = false
+    private var padHadEpoch = false
+    private var padFenceOutstanding = false
+    private var padFenceBytesRemaining = 0
+    private var padLifecycle: [(bytes: [UInt8], created: Bool)] = []
+    private static let padCreate = "create 0003 045e 028e 0114 304,305,307,308,310,311,314,315,316,317,318 0:-32768:32767:16:128,1:-32768:32767:16:128,2:0:255:0:0,3:-32768:32767:16:128,4:-32768:32767:16:128,5:0:255:0:0,16:-1:1:0:0,17:-1:1:0:0 Microsoft X-Box 360 pad\n"
     private var physicalPending: GamepadState?
     private var physicalResetPending = false
-    private(set) lazy var input = GamepadInputState(
+    private(set) lazy var input: GamepadInputState = {
+        let input = GamepadInputState(
         emit: { [weak self] state, reset in self?.queuePhysical(state, reset: reset) },
         sendScript: { [weak self] line, releasing in self?.send(line, releasing: releasing) ?? false },
         cancelRelease: { [weak self] in self?.release?.cancel(); self?.release = nil },
@@ -183,7 +194,10 @@ final class VMPorts {
             guard let self else { return false }
             return self.physicalPending != nil || self.physicalResetPending
         }
-    )
+        )
+        input.onSelectionChange = { [weak self] _ in self?.reconcilePad() }
+        return input
+    }()
     private lazy var physicalGamepad = PhysicalGamepad(input: input)
     private var release: DispatchWorkItem?
     private var closed = false
@@ -626,17 +640,26 @@ final class VMPorts {
         for line in Self.lines(bytes, buffer: &padLine, overflow: &padOverflow) {
             guard !closed else { return }
             guard line == "hello" else { continue } // Rumble is intentionally unsupported.
-            ready = false
-            _ = input.resetScript()
+            input.invalidateScript()
+            let fence = padHadEpoch && (padEpochWrote || padFenceOutstanding)
+            let interrupted = padFramePartial
+            pending.removeAll()
             physicalPending = nil
             physicalResetPending = false
-            guard send("create 0003 045e 028e 0114 304,305,307,308,310,311,314,315,316,317,318 0:-32768:32767:16:128,1:-32768:32767:16:128,2:0:255:0:0,3:-32768:32767:16:128,4:-32768:32767:16:128,5:0:255:0:0,16:-1:1:0:0,17:-1:1:0:0 Microsoft X-Box 360 pad") else {
-                report("BRINEWELL pad error: cannot queue create")
-                continue
+            padLifecycle.removeAll()
+            padCreateQueued = false
+            padTargetCreated = false
+            padChannelReady = true
+            padHadEpoch = true
+            padEpochWrote = false
+            padFenceOutstanding = fence
+            if fence {
+                pending.append(contentsOf: (interrupted ? "\ndestroy\n" : "destroy\n").utf8)
             }
-            guard !closed else { return }
-            ready = true
-            input.synchronize()
+            padFenceBytesRemaining = pending.count
+            reconcilePad()
+            if input.selected { input.synchronize() }
+            flush()
         }
     }
 
@@ -650,18 +673,57 @@ final class VMPorts {
         }
     }
 
+    private func reconcilePad() {
+        guard padChannelReady, !closed, !closing else { return }
+        let wanted = input.selected || scriptPinned
+        guard wanted != padTargetCreated else { return }
+        padTargetCreated = wanted
+        // An entirely unwritten, standalone create has no guest-side effect.
+        if !wanted, !padFramePartial, pending == Array(Self.padCreate.utf8), padLifecycle.isEmpty {
+            pending.removeAll()
+            padCreateQueued = false
+            physicalPending = nil
+            physicalResetPending = false
+            writeSource?.cancel(); writeSource = nil
+            return
+        }
+        var bytes = [UInt8]()
+        if wanted {
+            bytes = Array(Self.padCreate.utf8)
+        } else {
+            if physicalResetPending || physicalPending != nil {
+                bytes.append(contentsOf: (GamepadState().frame + "\n").utf8)
+            }
+            physicalResetPending = false
+            physicalPending = nil
+            bytes.append(contentsOf: "destroy\n".utf8)
+        }
+        // Only the unsent suffix may be coalesced. A pending destroy is kept
+        // as a boundary if an earlier create has entered the ordered queue.
+        if !wanted, padLifecycle.last?.created == true {
+            padLifecycle.removeLast()
+            if padLifecycle.isEmpty, padCreateQueued {
+                padLifecycle.append((bytes, false))
+            }
+        } else {
+            padLifecycle.append((bytes, wanted))
+        }
+        flush()
+    }
+
     private func send(_ line: String, releasing: Bool = false) -> Bool {
-        guard !closed else { return false }
+        guard !closed, padChannelReady, padCreateQueued, padLifecycle.isEmpty else { return false }
         let bytes = Array((line + "\n").utf8)
-        let limit = releasing ? Self.maxPending : Self.maxPending - 1024
+        // Keep room both for a release and for two coalesced lifecycle boundaries.
+        let limit = releasing ? Self.maxPending - 1024 : Self.maxPending - 2048
         guard pending.count + bytes.count <= limit else { return false }
         pending.append(contentsOf: bytes)
         flush()
-        return true
+        return padChannelReady
     }
 
     func queuePhysical(_ state: GamepadState, reset: Bool) {
-        guard ready, !closed else { return }
+        guard padChannelReady, padTargetCreated, !closed, !closing else { return }
         if reset { physicalResetPending = true }
         physicalPending = state
         flush()
@@ -754,7 +816,13 @@ final class VMPorts {
 
     func flush() {
         guard !closed else { return }
-        while !pending.isEmpty || physicalPending != nil || physicalResetPending {
+        while !pending.isEmpty || !padLifecycle.isEmpty || physicalPending != nil || physicalResetPending {
+            if pending.isEmpty, let boundary = padLifecycle.first {
+                pending.append(contentsOf: boundary.bytes)
+                padCreateQueued = boundary.created
+                padLifecycle.removeFirst()
+            }
+            if pending.isEmpty, !padLifecycle.isEmpty { break }
             if pending.isEmpty, physicalResetPending {
                 physicalResetPending = false
                 if physicalPending == GamepadState() { physicalPending = nil }
@@ -766,13 +834,34 @@ final class VMPorts {
             let n = padWriter?(pending) ?? pending.withUnsafeBytes {
                 Darwin.write(padWrite, $0.baseAddress!, $0.count)
             }
-            if n > 0 { pending.removeFirst(n) }
-            else if n < 0 && errno == EINTR { continue }
-            else { break }
+            if n > 0 {
+                padEpochWrote = true
+                if padFenceBytesRemaining > 0 {
+                    padFenceBytesRemaining = max(0, padFenceBytesRemaining - n)
+                    if padFenceBytesRemaining == 0 { padFenceOutstanding = false }
+                }
+                padFramePartial = pending[n - 1] != 10
+                pending.removeFirst(n)
+            } else if n < 0 && errno == EINTR { continue }
+            else if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { break }
+            else {
+                report("BRINEWELL pad error: cannot write command")
+                padChannelReady = false
+                padCreateQueued = false
+                padTargetCreated = false
+                pending.removeAll()
+                padFenceBytesRemaining = 0
+                padLifecycle.removeAll()
+                physicalPending = nil
+                physicalResetPending = false
+                input.invalidateScript()
+                writeSource?.cancel(); writeSource = nil
+                return
+            }
         }
         if pending.isEmpty {
             writeSource?.cancel(); writeSource = nil
-        } else if writeSource == nil {
+        } else if writeSource == nil, padWriter == nil {
             let duplicate: Int32
             do {
                 duplicate = try duplicateForSource(padWrite)
@@ -843,14 +932,41 @@ final class VMPorts {
             return
         }
         if args == ["pad", "state"] {
-            reply("pad ready=\(ready) active=\(input.script != nil) physical=\(input.physical) selected=\(input.selected)")
+            reply("pad ready=\(padChannelReady) active=\(input.script != nil) physical=\(input.physical) selected=\(input.selected) created=\(padCreateQueued ? 1 : 0) pinned=\(scriptPinned ? 1 : 0)")
             return
         }
+        if args == ["pad", "attach"] {
+            guard padChannelReady else { reply("error pad not ready"); return }
+            // Pins are desired ownership and survive a channel failure for reconnect.
+            scriptPinned = true
+            reconcilePad()
+            guard padChannelReady else { reply("error pad channel write failed"); return }
+            reply("ok pad attach"); return
+        }
+        if args == ["pad", "detach"] {
+            guard padChannelReady else { reply("error pad not ready"); return }
+            if input.script != nil {
+                if !input.selected {
+                    input.invalidateScript()
+                    physicalResetPending = true
+                } else {
+                    guard input.resetScript() else {
+                        reply(padChannelReady ? "error pad queue full" : "error pad channel write failed"); return
+                    }
+                }
+            }
+            scriptPinned = false
+            reconcilePad()
+            guard padChannelReady else { reply("error pad channel write failed"); return }
+            reply("ok pad detach"); return
+        }
         if args == ["pad", "neutral"] {
-            guard ready else { reply("error pad not ready"); return }
+            guard padChannelReady else { reply("error pad not ready"); return }
             guard !input.physical else { reply("error physical pad active"); return }
             guard physicalPending == nil, !physicalResetPending else { reply("error physical release pending"); return }
-            guard input.neutralScript() else { reply("error pad queue full"); return }
+            guard input.neutralScript() else {
+                reply(padChannelReady ? "error pad queue full" : "error pad channel write failed"); return
+            }
             reply("ok pad neutral"); return
         }
         guard args.count >= 3, args[0] == "pad",
@@ -876,12 +992,23 @@ final class VMPorts {
             type = 3; code = axis; value = axisValue
         }
         else { reply("error invalid pad action"); return }
-        guard ready else { reply("error pad not ready"); return }
+        guard padChannelReady else { reply("error pad not ready"); return }
         guard !input.physical else { reply("error physical pad active"); return }
         guard physicalPending == nil, !physicalResetPending else { reply("error physical release pending"); return }
         guard input.script == nil else { reply("error pad action active"); return }
-        guard let token = input.press(type: type, code: code, value: value) else {
+        let event = "ev \(type):\(code):\(value)\n"
+        let createBytes = padTargetCreated ? 0 : Self.padCreate.utf8.count
+        guard padLifecycle.isEmpty,
+              pending.count + createBytes + event.utf8.count <= Self.maxPending - 2048 else {
             reply("error pad queue full"); return
+        }
+        let wasPinned = scriptPinned
+        scriptPinned = true
+        reconcilePad()
+        guard let token = input.press(type: type, code: code, value: value) else {
+            scriptPinned = wasPinned
+            reconcilePad()
+            reply(padChannelReady ? "error pad queue full" : "error pad channel write failed"); return
         }
         let item = DispatchWorkItem { [weak self] in
             guard let self, !self.closed else { return }
@@ -896,6 +1023,13 @@ final class VMPorts {
     func close() {
         guard !closed, !closing else { return }
         closing = true
+        input.invalidateScript()
+        padChannelReady = false
+        pending.removeAll()
+        padLifecycle.removeAll()
+        physicalPending = nil
+        physicalResetPending = false
+        writeSource?.cancel(); writeSource = nil
         // The main-queue read source may not have run before the VM exits.
         // Consume complete commands before removing the FIFO, without waiting
         // for a writer or allowing a shutdown callback to re-enter close().
@@ -910,9 +1044,12 @@ final class VMPorts {
         }
         stopTelemetry()
         physicalGamepad.stop()
-        flush()
         closed = true
-        ready = false
+        padChannelReady = false
+        padCreateQueued = false
+        padTargetCreated = false
+        scriptPinned = false
+        padLifecycle.removeAll()
         uuReady = false
         graphicsReady = false
         resetGraphicsResolutions()
