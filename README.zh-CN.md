@@ -292,7 +292,7 @@ macOS 宿主（Apple Silicon）                        SteamOS 客体（ARM64）
 │  启动器 · VM 窗口 · 输入 · 性能叠层     │        │ guest layer (EROFS):             │
 │  └─ libkrun VMM (Hypervisor.framework)  │◄──────►│  Mesa (Venus/zink) · agent       │
 │      ├─ virtio-gpu ─ virglrenderer      │virtio  │  Neptune 载荷 · MangoApp         │
-│      │   ├─ Venus → MoltenVK/KosmicKrisp│        │ Steam → Proton + FEX             │
+│      │   ├─ Venus → KosmicKrisp         │        │ Steam → Proton + FEX             │
 │      │   └─ Neptune 渲染 worker         │        │  └─ Neptune d3d11/d3d12/dxgi DLL │
 │      │       ├─ d3dmetal-native (x86-64)│        │     （来自 virtio-win-mesa）     │
 │      │       │   └─ D3DMetal.framework  │        └──────────────────────────────────┘
@@ -302,7 +302,8 @@ macOS 宿主（Apple Silicon）                        SteamOS 客体（ARM64）
 ```
 
 在 Proton 中，游戏使用 Brinewell 的 Neptune Wine DLL，经 virtio-gpu 把 D3D11/D3D12 工作发送到
-宿主上按上下文创建的渲染 worker。桌面和 Vulkan 内容使用 Venus。显示 scanout 以 Metal 纹理
+宿主上按上下文创建的渲染 worker。对于桌面和 Vulkan 应用，Venus 在承载 VM 的进程内通过渲染线程向
+KosmicKrisp 提交绘制。普通 GPU 图像由驱动分配内存，客体需要访问的缓冲区和交给合成器的图像使用共享内存。显示 scanout 以 Metal 纹理
 导入，不兼容的资源回退到以 IOSurface 为后备的有界 CPU 帧池。
 
 ## 从源码构建
@@ -363,7 +364,7 @@ cd Brinewell
 | d3dmetal | `../d3dmetal-native`，x86-64；框架由用户提供 | `libd3dmetal-native.dylib` |
 | mullion | `../Mullion`，arm64；LLVM 15 + Xcode Metal Toolchain | `libmullion-native.dylib` |
 | libkrun | `../libkrun`，关闭 init-blob | `libkrun.1.dylib` |
-| kosmicrisp | 上游 Mesa 26.3 提交 `ce576c29ed` | `libvulkan_kosmickrisp.dylib`、`libSPIRV-Tools.dylib` |
+| kosmicrisp | `deps.lock.json` 固定的 Mesa 官方原版发布包 | `libvulkan_kosmickrisp.dylib`、`libSPIRV-Tools.dylib` |
 | moltenvk | KhronosGroup 官方 release 1.4.2 | `libMoltenVK.dylib` |
 | gvproxy | v0.8.9 + `runtime/network` 出站策略 | `gvproxy` |
 | macmon | vladkens/macmon v0.11.0 发行包 | 宿主硬件指标采样器 |

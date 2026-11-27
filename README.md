@@ -360,7 +360,7 @@ macOS host (Apple Silicon)                         SteamOS guest (ARM64)
 │  launcher · VM window · input · HUD     │        │ guest layer (EROFS):             │
 │  └─ libkrun VMM (Hypervisor.framework)  │◄──────►│  Mesa (Venus/zink) · agent       │
 │      ├─ virtio-gpu ─ virglrenderer      │virtio  │  Neptune payload · MangoApp      │
-│      │   ├─ Venus → MoltenVK/KosmicKrisp│        │ Steam → Proton + FEX             │
+│      │   ├─ Venus → KosmicKrisp         │        │ Steam → Proton + FEX             │
 │      │   └─ Neptune render workers      │        │  └─ Neptune d3d11/d3d12/dxgi DLLs│
 │      │       ├─ d3dmetal-native (x86-64)│        │     (from virtio-win-mesa)       │
 │      │       │   └─ D3DMetal.framework  │        └──────────────────────────────────┘
@@ -370,7 +370,10 @@ macOS host (Apple Silicon)                         SteamOS guest (ARM64)
 ```
 
 Inside Proton, games use Brinewell's Neptune Wine DLLs, which send D3D11/D3D12 work over
-virtio-gpu to per-context host render workers. Desktop and Vulkan content uses Venus.
+virtio-gpu to per-context host render workers. For the desktop and Vulkan applications,
+Venus submits draws to KosmicKrisp on rendering threads in the process that runs the VM.
+Ordinary GPU images use driver-managed memory. Guest-visible buffers and images exchanged
+with the compositor use shared memory.
 Display scanouts are imported as Metal textures. Incompatible resources fall back to a
 bounded CPU frame pool backed by IOSurface.
 
@@ -450,7 +453,7 @@ contains `payload.json`, so a Neptune change applies on the next game launch.
 | d3dmetal | `../d3dmetal-native`, x86-64; framework supplied by user | `libd3dmetal-native.dylib` |
 | mullion | `../Mullion`, arm64; LLVM 15 + Xcode Metal Toolchain | `libmullion-native.dylib` |
 | libkrun | `../libkrun`, init-blob disabled | `libkrun.1.dylib` |
-| kosmicrisp | upstream Mesa 26.3 commit `ce576c29ed` | `libvulkan_kosmickrisp.dylib`, `libSPIRV-Tools.dylib` |
+| kosmicrisp | unmodified official Mesa release pinned in `deps.lock.json` | `libvulkan_kosmickrisp.dylib`, `libSPIRV-Tools.dylib` |
 | moltenvk | KhronosGroup release 1.4.2 | `libMoltenVK.dylib` |
 | gvproxy | v0.8.9 + `runtime/network` egress policy | `gvproxy` |
 | macmon | vladkens/macmon v0.11.0 release | host telemetry sampler |
