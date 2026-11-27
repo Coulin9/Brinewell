@@ -1,0 +1,17 @@
+"compatibilitytools"
+{
+	"compat_tools"
+	{
+		"proton-experimental"
+		{
+			"install_path"	"."
+			"display_name"	"Proton Experimental (x86-64)"
+			"appid"	"1493710"
+			"depotid"	"1493711"
+			"require_tool_appid"	"4183110"
+			"from_oslist"	"windows"
+			"to_oslist"	"linux"
+			"unlisted"	"1"
+		}
+	}
+}
