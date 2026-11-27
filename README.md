@@ -391,8 +391,11 @@ bounded CPU frame pool backed by IOSurface.
 Pinned third-party sources and releases in [`deps.lock.json`](deps.lock.json) are
 downloaded on demand and verified by SHA-256.
 
-Host KosmicKrisp and guest Venus/Zink build from the same official Mesa source
-tree at `.build/out/kosmicrisp/src/`. Neptune's guest code lives in
+Host KosmicKrisp and guest Venus/Zink use the official Mesa source tree at
+`.build/out/kosmicrisp/src/`. The host build applies the patches in
+[`runtime/patches/kosmickrisp/`](runtime/patches/kosmickrisp/) in filename order
+to a disposable copy. When updating Mesa, update the lock and check each patch
+against the new release. Neptune's guest code lives in
 [`runtime/neptune/`](runtime/neptune/) and uses that Mesa release for its build.
 
 ### Workspace layout
@@ -455,7 +458,7 @@ contains `payload.json`, so a Neptune change applies on the next game launch.
 | d3dmetal | `../d3dmetal-native`, x86-64; framework supplied by user | `libd3dmetal-native.dylib` |
 | mullion | `../Mullion`, arm64; LLVM 15 + Xcode Metal Toolchain | `libmullion-native.dylib` |
 | libkrun | `../libkrun`, init-blob disabled | `libkrun.1.dylib` |
-| kosmicrisp | unmodified official Mesa release pinned in `deps.lock.json` | `libvulkan_kosmickrisp.dylib`, `libSPIRV-Tools.dylib` |
+| kosmicrisp | pinned Mesa release with Brinewell's host driver patches | `libvulkan_kosmickrisp.dylib`, `libSPIRV-Tools.dylib` |
 | moltenvk | KhronosGroup release 1.4.2 | `libMoltenVK.dylib` |
 | gvproxy | v0.8.9 + `runtime/network` egress policy | `gvproxy` |
 | macmon | vladkens/macmon v0.11.0 release | host telemetry sampler |
@@ -515,6 +518,11 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --disable-sa
 
 # Guest integration tests
 python3 -m unittest discover -s Tests/GuestIntegrationTests
+
+# Read back polygon and geometry shader output on Apple Silicon
+./scripts/test/kosmickrisp/build.sh /tmp/brinewell-vk-check
+VK_DRIVER_FILES="$PWD/.build/out/kosmicrisp/prefix/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json" \
+  /tmp/brinewell-vk-check/vk-draw-check KosmicKrisp all
 
 # Fresh 64 GiB test disk from an existing SteamOS disk
 ./scripts/test-image.sh [SOURCE_DISK]

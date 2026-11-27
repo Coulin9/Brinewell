@@ -320,6 +320,7 @@ KosmicKrisp 提交绘制。普通 GPU 图像由驱动分配内存，客体需要
 [`deps.lock.json`](deps.lock.json) 中固定版本的第三方源码和发行文件会按需下载，并以 SHA-256 校验。
 
 宿主 KosmicKrisp 和客体 Venus/Zink 共用 `.build/out/kosmicrisp/src/` 下的官方 Mesa 源码。
+宿主构建在临时副本中按文件名顺序应用 [`runtime/patches/kosmickrisp/`](runtime/patches/kosmickrisp/) 的补丁。升级 Mesa 时，更新锁文件并逐个核对补丁。
 Neptune 的客体代码位于 [`runtime/neptune/`](runtime/neptune/)，构建时使用同一版本的 Mesa。
 
 ### 工作区布局
@@ -365,7 +366,7 @@ cd Brinewell
 | d3dmetal | `../d3dmetal-native`，x86-64；框架由用户提供 | `libd3dmetal-native.dylib` |
 | mullion | `../Mullion`，arm64；LLVM 15 + Xcode Metal Toolchain | `libmullion-native.dylib` |
 | libkrun | `../libkrun`，关闭 init-blob | `libkrun.1.dylib` |
-| kosmicrisp | `deps.lock.json` 固定的 Mesa 官方原版发布包 | `libvulkan_kosmickrisp.dylib`、`libSPIRV-Tools.dylib` |
+| kosmicrisp | 锁定的 Mesa 官方发布包和 Brinewell 的宿主驱动补丁 | `libvulkan_kosmickrisp.dylib`、`libSPIRV-Tools.dylib` |
 | moltenvk | KhronosGroup 官方 release 1.4.2 | `libMoltenVK.dylib` |
 | gvproxy | v0.8.9 + `runtime/network` 出站策略 | `gvproxy` |
 | macmon | vladkens/macmon v0.11.0 发行包 | 宿主硬件指标采样器 |
@@ -418,6 +419,11 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --disable-sa
 
 # 客体集成测试
 python3 -m unittest discover -s Tests/GuestIntegrationTests
+
+# 在 Apple Silicon 上逐像素检查线框、点模式和几何着色器的输出
+./scripts/test/kosmickrisp/build.sh /tmp/brinewell-vk-check
+VK_DRIVER_FILES="$PWD/.build/out/kosmicrisp/prefix/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json" \
+  /tmp/brinewell-vk-check/vk-draw-check KosmicKrisp all
 
 # 从现有 SteamOS 磁盘创建全新的 64 GiB 测试磁盘
 ./scripts/test-image.sh [SOURCE_DISK]

@@ -1,0 +1,1156 @@
+Subject: [PATCH 1/2] kosmickrisp: rasterize line and point polygon modes
+
+Use Metal triangle wireframe for lines. For polygon points, keep the
+assembled triangle through clipping and face selection so point fragments
+receive the original polygon's flat attributes and rasterization state.
+
+Base: Mesa 26.3.1 (fec8830e9c94b1d67f3d8469467d5529fb2978cd)
+
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.h b/src/kosmickrisp/bridge/mtl_compiler.h
+index d097653..f9496cf 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.h
++++ b/src/kosmickrisp/bridge/mtl_compiler.h
+@@ -36,6 +36,7 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
+ 
+ /* Render pipeline descriptor */
+ mtl_render_pipeline_descriptor *mtl_new_render_pipeline_descriptor(void);
++mtl_render_pipeline_descriptor *mtl_new_mesh_pipeline_descriptor(mtl_function_descriptor *mesh);
+ 
+ void mtl_render_pipeline_descriptor_set_vertex_shader(
+    mtl_render_pipeline_descriptor *descriptor, mtl_function_descriptor *shader);
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.m b/src/kosmickrisp/bridge/mtl_compiler.m
+index f0f6a61..bfbcfa1 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.m
++++ b/src/kosmickrisp/bridge/mtl_compiler.m
+@@ -10,6 +10,7 @@
+ #include <Metal/MTL4ComputePipeline.h>
+ #include <Metal/MTL4LibraryDescriptor.h>
+ #include <Metal/MTL4LibraryFunctionDescriptor.h>
++#include <Metal/MTL4MeshRenderPipeline.h>
+ #include <Metal/MTL4RenderPipeline.h>
+ #include <Metal/MTLDevice.h>
+ 
+@@ -103,6 +104,18 @@
+    }
+ }
+ 
++mtl_render_pipeline_descriptor *
++mtl_new_mesh_pipeline_descriptor(mtl_function_descriptor *mesh)
++{
++   @autoreleasepool {
++      MTL4MeshRenderPipelineDescriptor *desc =
++         [MTL4MeshRenderPipelineDescriptor new];
++      desc.meshFunctionDescriptor = (MTL4FunctionDescriptor *)mesh;
++      desc.maxTotalThreadsPerMeshThreadgroup = 32;
++      return desc;
++   }
++}
++
+ /* Render pipeline descriptor */
+ mtl_render_pipeline_descriptor *
+ mtl_new_render_pipeline_descriptor()
+diff --git a/src/kosmickrisp/bridge/mtl_encoder.h b/src/kosmickrisp/bridge/mtl_encoder.h
+index 02fe86f..24b093f 100644
+--- a/src/kosmickrisp/bridge/mtl_encoder.h
++++ b/src/kosmickrisp/bridge/mtl_encoder.h
+@@ -9,6 +9,7 @@
+ 
+ #include "mtl_types.h"
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ 
+ /* Common encoder utils */
+@@ -94,6 +95,8 @@ void mtl_set_stencil_references(mtl_render_encoder *encoder, uint32_t front,
+ void mtl_set_front_face_winding(mtl_render_encoder *encoder,
+                                 enum mtl_winding winding);
+ 
++void mtl_set_triangle_wireframe(mtl_render_encoder *encoder, bool enable);
++
+ void mtl_set_cull_mode(mtl_render_encoder *encoder, enum mtl_cull_mode mode);
+ 
+ void mtl_set_visibility_result_mode(mtl_render_encoder *encoder,
+@@ -116,6 +119,9 @@ void mtl_render_set_argument_table(mtl_render_encoder *encoder,
+                                    mtl_argument_table *table,
+                                    enum mtl_render_stages stages);
+ 
++void mtl_draw_polygon_mesh(mtl_render_encoder *encoder, uint64_t indirect,
++                           uint32_t triangles, uint32_t instances);
++
+ void mtl_draw_primitives(mtl_render_encoder *encoder,
+                          enum mtl_primitive_type primitve_type,
+                          uint32_t vertexStart, uint32_t vertexCount,
+diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_encoder.m
+index 2c35562..c433739 100644
+--- a/src/kosmickrisp/bridge/mtl_encoder.m
++++ b/src/kosmickrisp/bridge/mtl_encoder.m
+@@ -342,6 +342,16 @@
+    }
+ }
+ 
++void
++mtl_set_triangle_wireframe(mtl_render_encoder *encoder, bool enable)
++{
++   @autoreleasepool {
++      id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
++      [enc setTriangleFillMode:enable ? MTLTriangleFillModeLines
++                                      : MTLTriangleFillModeFill];
++   }
++}
++
+ void
+ mtl_set_cull_mode(mtl_render_encoder *encoder, enum mtl_cull_mode mode)
+ {
+@@ -418,6 +428,25 @@
+    }
+ }
+ 
++void
++mtl_draw_polygon_mesh(mtl_render_encoder *encoder, uint64_t indirect,
++                      uint32_t triangles, uint32_t instances)
++{
++   @autoreleasepool {
++      id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
++      MTLSize object = MTLSizeMake(1, 1, 1), mesh = MTLSizeMake(32, 1, 1);
++      if (indirect) {
++         [enc drawMeshThreadgroupsWithIndirectBuffer:indirect
++                         threadsPerObjectThreadgroup:object
++                           threadsPerMeshThreadgroup:mesh];
++      } else if (triangles && instances) {
++         [enc drawMeshThreadgroups:MTLSizeMake(triangles, instances, 1)
++            threadsPerObjectThreadgroup:object
++              threadsPerMeshThreadgroup:mesh];
++      }
++   }
++}
++
+ void
+ mtl_draw_primitives(mtl_render_encoder *encoder,
+                     enum mtl_primitive_type primitve_type, uint32_t vertexStart,
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_compiler.c b/src/kosmickrisp/bridge/stubs/mtl_compiler.c
+index 11af4e7..26973a4 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_compiler.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_compiler.c
+@@ -42,6 +42,12 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
+ }
+ 
+ /* Render pipeline descriptor */
++mtl_render_pipeline_descriptor *
++mtl_new_mesh_pipeline_descriptor(mtl_function_descriptor *mesh)
++{
++   return NULL;
++}
++
+ mtl_render_pipeline_descriptor *
+ mtl_new_render_pipeline_descriptor(void)
+ {
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_encoder.c b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
+index 57810ab..1625aaa 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -168,6 +168,11 @@ mtl_set_front_face_winding(mtl_render_encoder *encoder,
+ {
+ }
+ 
++void
++mtl_set_triangle_wireframe(mtl_render_encoder *encoder, bool enable)
++{
++}
++
+ void
+ mtl_set_cull_mode(mtl_render_encoder *encoder, enum mtl_cull_mode mode)
+ {
+@@ -210,6 +215,12 @@ mtl_render_set_argument_table(mtl_render_encoder *encoder,
+ {
+ }
+ 
++void
++mtl_draw_polygon_mesh(mtl_render_encoder *encoder, uint64_t indirect,
++                      uint32_t triangles, uint32_t instances)
++{
++}
++
+ void
+ mtl_draw_primitives(mtl_render_encoder *encoder,
+                     enum mtl_primitive_type primitve_type, uint32_t vertexStart,
+diff --git a/src/kosmickrisp/compiler/meson.build b/src/kosmickrisp/compiler/meson.build
+index 91cb3f9..debfd51 100644
+--- a/src/kosmickrisp/compiler/meson.build
++++ b/src/kosmickrisp/compiler/meson.build
+@@ -22,10 +22,15 @@ msl_nir_algebraic_c = custom_target(
+   depend_files : nir_algebraic_depends,
+ )
+ 
++polygon_points_source = custom_target(
++  input : 'polygon_points.metal',
++  output : 'polygon_points_metal.h',
++  command : [prog_python, files_xxd, '@INPUT@', '@OUTPUT@', '-n', 'polygon_points_metal'],
++)
+ 
+ libmsl_compiler = static_library(
+     'msl_compiler',
+-    [libmsl_compiler_files, msl_nir_algebraic_c],
++    [libmsl_compiler_files, msl_nir_algebraic_c, polygon_points_source],
+     dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime],
+     gnu_symbol_visibility: 'hidden',
+     build_by_default: false,
+diff --git a/src/kosmickrisp/compiler/msl_iomap.c b/src/kosmickrisp/compiler/msl_iomap.c
+index 669e655..25abebe 100644
+--- a/src/kosmickrisp/compiler/msl_iomap.c
++++ b/src/kosmickrisp/compiler/msl_iomap.c
+@@ -196,6 +196,119 @@ vs_output_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
+    P(ctx, "};\n");
+ }
+ 
++/* Interpolate clipped vertices once per rasterized point. Its fragment
++ * inputs are constant across every covered sample. Keep the original
++ * interpolation modes for newly created clip intersections. */
++void
++msl_emit_polygon_helpers(struct nir_to_msl_ctx *ctx)
++{
++   nir_shader *s = ctx->shader;
++   P(ctx, "#define KK_STENCIL_POINTS %d\n", ctx->stencil_points);
++   P(ctx, "struct PolygonPrimitive { uint id [[primitive_id]]; "
++          "uint front [[user(kk_front)]];\n");
++   if (s->info.outputs_written & VARYING_BIT_VIEWPORT)
++      P(ctx, "uint viewport [[viewport_array_index]];\n");
++   if (s->info.outputs_written & VARYING_BIT_LAYER)
++      P(ctx, "uint layer [[render_target_array_index]];\n");
++   u_foreach_bit64(loc, s->info.outputs_written) {
++      if (!VARYING_SLOT_INFO[loc].user)
++         continue;
++      struct io_slot_info info = ctx->outputs_info[loc];
++      bool scalarized = VARYING_SLOT_INFO[loc].scalarized;
++      unsigned n = scalarized ? info.num_components : 1;
++      for (unsigned c = 0; c < n; c++) {
++         P(ctx, "%s%s ", alu_type_to_string(info.type),
++           scalarized ? "" : vector_suffixes[info.num_components]);
++         varying_slot_name(ctx, loc, c);
++         P(ctx, " ");
++         varying_slot_semantic(ctx, loc, c);
++         P(ctx, ";\n");
++      }
++   }
++   P(ctx, "};\n");
++   P(ctx,
++     "inline PolygonPrimitive primitive_payload(VertexOut v, uint id, bool front) {"
++     "PolygonPrimitive p; p.front = front; p.id = %s;\n",
++     s->info.outputs_written & VARYING_BIT_PRIMITIVE_ID ? "v.primitive_id"
++                                                        : "id");
++   if (s->info.outputs_written & VARYING_BIT_VIEWPORT)
++      P(ctx, "p.viewport = v.viewport_array_index;\n");
++   if (s->info.outputs_written & VARYING_BIT_LAYER)
++      P(ctx, "p.layer = v.render_target_array_index;\n");
++   u_foreach_bit64(loc, s->info.outputs_written) {
++      if (!VARYING_SLOT_INFO[loc].user)
++         continue;
++      unsigned n = VARYING_SLOT_INFO[loc].scalarized
++                      ? ctx->outputs_info[loc].num_components
++                      : 1;
++      for (unsigned c = 0; c < n; c++) {
++         P(ctx, "p.");
++         varying_slot_name(ctx, loc, c);
++         P(ctx, " = v.");
++         varying_slot_name(ctx, loc, c);
++         P(ctx, ";\n");
++      }
++   }
++   P(ctx, "return p; }\n");
++   P(ctx, "#define KK_CLIP_DISTANCES %u\n", s->info.clip_distance_array_size);
++   P(ctx, "inline uint get_viewport(VertexOut v) { return %s; }\n",
++     s->info.outputs_written & VARYING_BIT_VIEWPORT ? "v.viewport_array_index"
++                                                    : "0u");
++   P(ctx, "inline bool cull_distances(threadgroup VertexOut *v) {\n");
++   for (unsigned i = 0; i < s->info.cull_distance_array_size; i++) {
++      /* The existing vertex lowering writes a 0/1 vertex classification
++       * for each cull plane, used by the native fragment path. */
++      unsigned slot = VARYING_SLOT_CULL_PRIMITIVE + i / 4;
++      for (unsigned j = 0; j < 3; j++) {
++         P(ctx, "%s(v[%u].", j == 0 ? "if (" : " && ", j);
++         varying_slot_name(ctx, slot, i % 4);
++         P(ctx, " == 0)");
++      }
++      P(ctx, ") return true;\n");
++   }
++   P(ctx, "return false; }\n");
++   P(ctx,
++     "inline VertexOut interpolate_vertex(threadgroup VertexOut *v, "
++     "float3 b, ulong flatMask, ulong linearMask) {\n"
++     "uint original = b.x == 1 ? 0u : b.y == 1 ? 1u : b.z == 1 ? 2u : 3u;\n"
++     "VertexOut out = v[0];\n"
++     "float3 w = float3(v[0].position.w,v[1].position.w,v[2].position.w);\n"
++     "float3 linear = b*w / dot(b,w);\n");
++   u_foreach_bit64(loc, s->info.outputs_written) {
++      struct io_slot_info info = ctx->outputs_info[loc];
++      unsigned n = VARYING_SLOT_INFO[loc].scalarized ? info.num_components : 1;
++      for (unsigned c = 0; c < n; ++c) {
++         if (loc == VARYING_SLOT_CULL_PRIMITIVE ||
++             loc == VARYING_SLOT_CULL_PRIMITIVE + 1) {
++            P(ctx, "out.");
++            varying_slot_name(ctx, loc, c);
++            P(ctx, " = 1;\n");
++            continue;
++         }
++         if (nir_alu_type_get_base_type(info.type) != nir_type_float)
++            continue; /* Vulkan requires flat interpolation for integers. */
++         P(ctx,
++           "if (!(flatMask & (1ul << %u))) {\n"
++           "float3 k = (linearMask & (1ul << %u)) ? linear : b;\n",
++           (unsigned)loc, (unsigned)loc);
++         P(ctx, "out.");
++         varying_slot_name(ctx, loc, c);
++         P(ctx, " = original < 3 ? v[original].");
++         varying_slot_name(ctx, loc, c);
++         P(ctx, " : ");
++         for (unsigned j = 0; j < 3; ++j) {
++            if (j)
++               P(ctx, " + ");
++            P(ctx, "v[%u].", j);
++            varying_slot_name(ctx, loc, c);
++            P(ctx, " * k[%u]", j);
++         }
++         P(ctx, "; }\n");
++      }
++   }
++   P(ctx, "return out; }\n");
++}
++
+ static void
+ fs_input_interpolant(struct nir_to_msl_ctx *ctx, uint64_t location)
+ {
+@@ -235,7 +348,7 @@ fs_input_no_interpolant(struct nir_to_msl_ctx *ctx, uint64_t location)
+       scalarized ? "" : vector_suffixes[info.num_components];
+    unsigned components = scalarized ? info.num_components : 1;
+    const char *interp = "";
+-   switch (info.interpolation) {
++   switch (ctx->polygon_points ? INTERP_MODE_FLAT : info.interpolation) {
+    case INTERP_MODE_NOPERSPECTIVE:
+       if (info.centroid)
+          interp = "[[centroid_no_perspective]]";
+@@ -269,9 +382,17 @@ fs_input_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
+ {
+    P(ctx, "struct FragmentIn {\n");
+    ctx->indentlevel++;
++   if (ctx->polygon_points &&
++       BITSET_TEST(shader->info.system_values_read, SYSTEM_VALUE_FRONT_FACE))
++      P_IND(ctx, "uint kk_front [[user(kk_front), flat]];\n");
++   if (ctx->stencil_points &&
++       BITSET_TEST(shader->info.system_values_read, SYSTEM_VALUE_POINT_COORD))
++      P_IND(
++         ctx,
++         "float2 kk_point_coord [[user(kk_point_coord), center_no_perspective]];\n");
+    u_foreach_bit64(location, shader->info.inputs_read) {
+       struct io_slot_info info = ctx->inputs_info[location];
+-      if (info.uses_interpolant)
++      if (!ctx->polygon_points && info.uses_interpolant)
+          fs_input_interpolant(ctx, location);
+       else
+          fs_input_no_interpolant(ctx, location);
+diff --git a/src/kosmickrisp/compiler/msl_private.h b/src/kosmickrisp/compiler/msl_private.h
+index 75da653..20ca001 100644
+--- a/src/kosmickrisp/compiler/msl_private.h
++++ b/src/kosmickrisp/compiler/msl_private.h
+@@ -19,6 +19,8 @@ struct io_slot_info {
+ };
+ 
+ struct nir_to_msl_ctx {
++   bool polygon_points;
++   bool stencil_points;
+    FILE *output;
+    struct hash_table *types;
+    nir_shader *shader;
+@@ -62,6 +64,7 @@ void msl_src_as_const(struct nir_to_msl_ctx *ctx, nir_src *src);
+ 
+ void msl_emit_io_blocks(struct nir_to_msl_ctx *ctx, nir_shader *shader);
+ 
++void msl_emit_polygon_helpers(struct nir_to_msl_ctx *ctx);
+ void msl_emit_output_var(struct nir_to_msl_ctx *ctx, nir_shader *shader);
+ 
+ void msl_gather_io_info(struct nir_to_msl_ctx *ctx,
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 580fcaa..6c7e9fb 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -8,6 +8,7 @@
+ #include "msl_private.h"
+ #include "nir.h"
+ #include "nir_builder.h"
++#include "polygon_points_metal.h"
+ 
+ static const char *
+ get_stage_string(mesa_shader_stage stage)
+@@ -79,6 +80,11 @@ emit_sysvals(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+ 
+    unsigned i;
+    BITSET_FOREACH_SET(i, shader->info.system_values_read, SYSTEM_VALUE_MAX) {
++      if (ctx->polygon_points &&
++          (i == SYSTEM_VALUE_FRONT_FACE ||
++           (ctx->stencil_points && i == SYSTEM_VALUE_POINT_COORD)))
++         continue;
++
+       const char *sysval;
+       if (is_frag_with_post_depth_coverage && i == SYSTEM_VALUE_SAMPLE_MASK_IN)
+          sysval = sysval_sample_mask_in_post_depth_coverage;
+@@ -1162,7 +1168,8 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       P(ctx, "gl_FragCoord;\n");
+       break;
+    case nir_intrinsic_load_point_coord:
+-      P(ctx, "gl_PointCoord;\n");
++      P(ctx, "%s;\n",
++        ctx->stencil_points ? "in.kk_point_coord" : "gl_PointCoord");
+       break;
+    case nir_intrinsic_load_first_vertex:
+       P(ctx, "gl_FirstVertex;\n");
+@@ -1197,7 +1204,8 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       P(ctx, ");\n");
+       break;
+    case nir_intrinsic_load_front_face:
+-      P(ctx, "gl_FrontFacing;\n");
++      P(ctx, "%s;\n",
++        ctx->polygon_points ? "bool(in.kk_front)" : "gl_FrontFacing");
+       break;
+    case nir_intrinsic_load_layer_id:
+       P(ctx, "gl_Layer;\n");
+@@ -1227,7 +1235,7 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       uint32_t location = io.location + idx;
+ 
+       msl_input_name(ctx, location, component);
+-      if (ctx->inputs_info[location].uses_interpolant)
++      if (!ctx->polygon_points && ctx->inputs_info[location].uses_interpolant)
+          msl_interpolant_method(ctx, &instr->src[0u]);
+       if (instr->num_components < msl_input_num_components(ctx, location)) {
+          P(ctx, ".");
+@@ -2483,9 +2491,13 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
+ 
+    struct nir_to_msl_ctx ctx = {
+       .shader = shader,
++      .polygon_points = options->polygon_points,
++      .stencil_points = options->stencil_points,
+       .text = _mesa_string_buffer_create(options->mem_ctx, 1024),
+       .disabled_workarounds = options->disabled_workarounds,
+    };
++   bool polygon_vertex =
++      options->polygon_points && shader->info.stage == MESA_SHADER_VERTEX;
+    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+    msl_gather_info(&ctx, options);
+ 
+@@ -2496,19 +2508,29 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
+    P(&ctx, "#include <metal_stdlib>\n");
+    P(&ctx, "using namespace metal;\n");
+ 
++   if (polygon_vertex)
++      P(&ctx, "#include <metal_mesh>\n");
+    msl_emit_constant_data(&ctx, shader);
+ 
+    msl_emit_io_blocks(&ctx, shader);
+    if (shader->info.stage == MESA_SHADER_FRAGMENT &&
+        shader->info.fs.early_fragment_tests)
+       P(&ctx, "[[early_fragment_tests]]\n");
+-   P(&ctx, "%s %s %s(\n", get_stage_string(shader->info.stage),
+-     output_type(shader), get_entrypoint_name(shader));
+-   ctx.indentlevel++;
+-   emit_sysvals(&ctx, shader);
+-   emit_inputs(&ctx, shader);
+-   ctx.indentlevel--;
+-   P(&ctx, ")\n");
++   if (polygon_vertex) {
++      P(&ctx,
++        "inline VertexOut shade_vertex(uint gl_VertexID, uint gl_InstanceID, "
++        "uint gl_BaseInstance, uint gl_FirstVertex, uint mtl_AmplificationID, "
++        "uint gl_SubGroupSize, uint gl_SubGroupInvocation, constant Buffer &buf0, "
++        "constant SamplerTable &sampler_table, constant Buffer &per_draw)\n");
++   } else {
++      P(&ctx, "%s %s %s(\n", get_stage_string(shader->info.stage),
++        output_type(shader), get_entrypoint_name(shader));
++      ctx.indentlevel++;
++      emit_sysvals(&ctx, shader);
++      emit_inputs(&ctx, shader);
++      ctx.indentlevel--;
++      P(&ctx, ")\n");
++   }
+    P(&ctx, "{\n");
+    ctx.indentlevel++;
+    msl_emit_output_var(&ctx, shader);
+@@ -2520,6 +2542,10 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
+    emit_output_return(&ctx, shader);
+    ctx.indentlevel--;
+    P(&ctx, "}\n");
++   if (polygon_vertex) {
++      msl_emit_polygon_helpers(&ctx);
++      P(&ctx, "%s\n", (const char *)polygon_points_metal);
++   }
+    char *ret = ctx.text->buf;
+    _mesa_hash_table_destroy(ctx.types, NULL);
+    ralloc_steal(options->mem_ctx, ctx.text->buf);
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.h b/src/kosmickrisp/compiler/nir_to_msl.h
+index 423df8a..22f137d 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.h
++++ b/src/kosmickrisp/compiler/nir_to_msl.h
+@@ -16,6 +16,8 @@ struct vk_color_attachment_location_state;
+ 
+ struct nir_to_msl_options {
+    void *mem_ctx;
++   bool polygon_points;
++   bool stencil_points;
+    uint64_t disabled_workarounds;
+ 
+    /* Required to correctly declare fragment outputs. Shader may contain
+diff --git a/src/kosmickrisp/compiler/polygon_points.metal b/src/kosmickrisp/compiler/polygon_points.metal
+new file mode 100644
+index 0000000..4a4ede0
+--- /dev/null
++++ b/src/kosmickrisp/compiler/polygon_points.metal
+@@ -0,0 +1,216 @@
++/* SPDX-License-Identifier: MIT */
++
++/* A triangle gains at most one vertex per clip half-space. Carry barycentric
++ * weights through clipping, then interpolate each shader output only once.
++ * The generated prefix supplies VertexOut, shade_vertex, the varying
++ * interpolation function and any shader-declared clip/cull distances. */
++struct PolygonDraw {
++   constant uint *args;
++   device const uchar *indices;
++   ulong indexBytes;
++   uint indexSize, cull, clockwise, clipZ;
++   ulong flatMask, linearMask;
++   float biasConstant, biasSlope, biasClamp, fixedDepthStep;
++   float4 viewport[16]; /* inverse width/height, depth near/far */
++};
++
++inline uint
++read_vertex_id(constant PolygonDraw &d, uint element)
++{
++   if (!d.indexSize)
++      return d.args[2] + element;
++
++   ulong i = ulong(element) + d.args[2];
++   uint v = 0;
++   if (i < d.indexBytes / d.indexSize) {
++      if (d.indexSize == 4)
++         v = ((device const uint *)d.indices)[i];
++      else if (d.indexSize == 2)
++         v = ((device const ushort *)d.indices)[i];
++      else
++         v = d.indices[i];
++   }
++   return d.args[3] + v;
++}
++
++enum : uint { maxCorners = 3 + 6 + KK_CLIP_DISTANCES };
++
++/* Clip in place using a temporary polygon only when the triangle crosses
++ * this plane. Coincident boundary vertices must appear exactly once. */
++inline uint
++clip_polygon(thread float3 *poly, uint n, float3 distance)
++{
++   if (all(distance >= 0.0f))
++      return n;
++   if (all(distance < 0.0f) || !n)
++      return 0;
++
++   float3 output[maxCorners];
++   uint count = 0;
++   float3 prev = poly[n - 1];
++   float a = dot(prev, distance);
++   for (uint i = 0; i < n; ++i) {
++      float3 cur = poly[i];
++      float b = dot(cur, distance);
++      if ((a < 0 && b > 0) || (a > 0 && b < 0))
++         output[count++] = mix(prev, cur, a / (a - b));
++      if (b >= 0)
++         output[count++] = cur;
++      prev = cur;
++      a = b;
++   }
++   for (uint i = 0; i < count; ++i)
++      poly[i] = output[i];
++   return count;
++}
++
++struct PolygonVertex {
++   float4 position [[position]];
++#if KK_STENCIL_POINTS
++   float2 uv [[user(kk_point_coord)]];
++#else
++   float pointSize [[point_size]];
++#endif
++};
++
++#if KK_STENCIL_POINTS
++using PolygonMesh = mesh<PolygonVertex, PolygonPrimitive, 4 * maxCorners,
++                         2 * maxCorners, topology::triangle>;
++#else
++using PolygonMesh = mesh<PolygonVertex, PolygonPrimitive, maxCorners,
++                         maxCorners, topology::point>;
++#endif
++
++[[mesh]] void
++main_entrypoint(PolygonMesh out, uint amplification [[amplification_id]],
++                uint lane [[thread_index_in_threadgroup]],
++                uint3 group [[threadgroup_position_in_grid]],
++                uint simdWidth [[threads_per_simdgroup]],
++                uint simdLane [[thread_index_in_simdgroup]],
++                constant Buffer &buf0 [[buffer(0)]],
++                constant SamplerTable &sampler_table [[buffer(1)]],
++                constant Buffer &per_draw [[buffer(2)]],
++                constant PolygonDraw &d [[buffer(3)]])
++{
++   threadgroup VertexOut v[3];
++   threadgroup float3 weights[maxCorners];
++   threadgroup uint n;
++   threadgroup bool front;
++   threadgroup float depthBias;
++   if (lane < 3) {
++      uint baseInstance = d.args[d.indexSize ? 4 : 3];
++      uint baseVertex = d.args[d.indexSize ? 3 : 2];
++      v[lane] = shade_vertex(read_vertex_id(d, 3 * group.x + lane),
++                             baseInstance + group.y, baseInstance, baseVertex,
++                             amplification, simdWidth, simdLane, buf0,
++                             sampler_table, per_draw);
++   }
++   threadgroup_barrier(mem_flags::mem_threadgroup);
++
++   if (lane == 0) {
++      float3 x(v[0].position.x, v[1].position.x, v[2].position.x);
++      float3 y(v[0].position.y, v[1].position.y, v[2].position.y);
++      float3 z(v[0].position.z, v[1].position.z, v[2].position.z);
++      float3 w(v[0].position.w, v[1].position.w, v[2].position.w);
++      float3 p[maxCorners] = {float3(1, 0, 0), float3(0, 1, 0),
++                              float3(0, 0, 1)};
++      uint count = cull_distances(v) ? 0 : 3;
++      count = clip_polygon(p, count, w + x);
++      count = clip_polygon(p, count, w - x);
++      count = clip_polygon(p, count, w + y);
++      count = clip_polygon(p, count, w - y);
++      if (d.clipZ) {
++         count = clip_polygon(p, count, z);
++         count = clip_polygon(p, count, w - z);
++      }
++#if KK_CLIP_DISTANCES
++      for (uint i = 0; i < KK_CLIP_DISTANCES; ++i)
++         count = clip_polygon(
++            p, count,
++            float3(v[0].gl_ClipDistance[i], v[1].gl_ClipDistance[i],
++                   v[2].gl_ClipDistance[i]));
++#endif
++      const float4 vp = d.viewport[get_viewport(v[0])];
++      float area = 0, maxDepth = 0;
++      if (count) {
++         float2 last = float2(dot(p[count - 1], x), dot(p[count - 1], y)) /
++                       dot(p[count - 1], w);
++         for (uint i = 0; i < count; ++i) {
++            float2 xy = float2(dot(p[i], x), dot(p[i], y)) / dot(p[i], w);
++            area += last.x * xy.y - last.y * xy.x;
++            if (d.biasConstant != 0 && d.fixedDepthStep == 0) {
++               float depth = mix(vp.z, vp.w, dot(p[i], z) / dot(p[i], w));
++               maxDepth = max(maxDepth, abs(depth));
++            }
++            weights[i] = p[i];
++            last = xy;
++         }
++      }
++      depthBias = 0;
++      if (d.biasSlope != 0 || d.biasConstant != 0) {
++         /* Solve z = A*x + B*y + C*w in homogeneous coordinates. This
++          * keeps the slope valid if a vertex is behind the view plane. */
++         float slope = 0;
++         float det = dot(x, cross(y, w));
++         if (det != 0 && d.biasSlope != 0) {
++            float2 grad =
++               float2(dot(z, cross(y, w)), dot(z, cross(w, x))) / det;
++            grad *= 2 * vp.xy * (vp.w - vp.z);
++            slope = max(abs(grad.x), abs(grad.y));
++         }
++         float r = d.fixedDepthStep;
++         if (r == 0 && maxDepth > 0)
++            r = ldexp(1.f, ilogb(maxDepth) - 23);
++         float bias = slope * d.biasSlope + r * d.biasConstant;
++         depthBias = d.biasClamp > 0   ? min(d.biasClamp, bias)
++                     : d.biasClamp < 0 ? max(d.biasClamp, bias)
++                                       : bias;
++      }
++      bool flipped = vp.y < 0;
++      front = bool(d.clockwise) == flipped ? area < 0 : area > 0;
++      n = (d.cull & (front ? 1u : 2u)) ? 0u : count;
++      out.set_primitive_count((KK_STENCIL_POINTS ? 2 : 1) * n);
++   }
++   threadgroup_barrier(mem_flags::mem_threadgroup);
++   if (lane < n) {
++      VertexOut point =
++         interpolate_vertex(v, weights[lane], d.flatMask, d.linearMask);
++      const float4 vp = d.viewport[get_viewport(v[0])];
++      float depth =
++         mix(vp.z, vp.w, point.position.z / point.position.w) + depthBias;
++      point.position.z =
++         clamp(depth, min(vp.z, vp.w), max(vp.z, vp.w)) * point.position.w;
++      PolygonPrimitive primitive = primitive_payload(point, group.x, front);
++      PolygonVertex outVertex;
++#if KK_STENCIL_POINTS
++      /* Native points always select the front stencil state. Generate a
++       * one-pixel square with the polygon's original winding where hardware
++       * can select different front and back stencil operations. */
++      float2 inverse = vp.xy;
++      for (uint i = 0; i < 4; ++i) {
++         outVertex.uv = float2(i == 1 || i == 2, i >= 2);
++         outVertex.position = point.position;
++         outVertex.position.xy +=
++            (2 * outVertex.uv - 1) * inverse * point.position.w;
++         out.set_vertex(4 * lane + i, outVertex);
++      }
++      bool clockwise = front == bool(d.clockwise);
++      uint a = clockwise ? 1 : 3, b = 4 - a;
++      uint first = 4 * lane;
++      out.set_index(6 * lane + 0, first);
++      out.set_index(6 * lane + 1, first + a);
++      out.set_index(6 * lane + 2, first + 2);
++      out.set_index(6 * lane + 3, first);
++      out.set_index(6 * lane + 4, first + 2);
++      out.set_index(6 * lane + 5, first + b);
++      out.set_primitive(2 * lane, primitive);
++      out.set_primitive(2 * lane + 1, primitive);
++#else
++      outVertex.position = point.position;
++      outVertex.pointSize = 1;
++      out.set_vertex(lane, outVertex);
++      out.set_index(lane, lane);
++      out.set_primitive(lane, primitive);
++#endif
++   }
++}
+diff --git a/src/kosmickrisp/libkk/kk_draws.cl b/src/kosmickrisp/libkk/kk_draws.cl
+index af5b362..03cf270 100644
+--- a/src/kosmickrisp/libkk/kk_draws.cl
++++ b/src/kosmickrisp/libkk/kk_draws.cl
+@@ -26,6 +26,15 @@ libkk_predicate_draw(global uint32_t *out, constant uint32_t *in,
+    }
+ }
+ 
++/* Mesh dispatch dimensions for a triangle list. Keep draw arguments on the GPU. */
++KERNEL(1)
++libkk_polygon_grid(global uint *grid, constant uint *draw)
++{
++   grid[0] = draw[0] / 3;
++   grid[1] = draw[1];
++   grid[2] = 1;
++}
++
+ /*
+  * Indirect Draw predicate: value > draw_id
+  */
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index 22f4bf7..d690344 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -133,7 +133,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+    {
+       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
+       /* Root at 0, samplers at 1 and per draw data at 2 */
+-      mtl_set_max_buffer_binding_count(desc, 3u);
++      mtl_set_max_buffer_binding_count(desc, 4u);
+       cmd->argument_table = mtl_new_argument_table(dev->mtl_handle, desc);
+       mtl_set_address(cmd->argument_table, dev->samplers.table.bo->gpu, 1u);
+       mtl_release(desc);
+@@ -287,9 +287,10 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+    mtl_set_vertex_amplification_count(cmd->metal.render, layer_ids, count);
+ 
+    /* Argument table won't ever change */
+-   mtl_render_set_argument_table(
+-      cmd->metal.render, cmd->argument_table,
+-      MTL_RENDER_STAGE_VERTEX | MTL_RENDER_STAGE_FRAGMENT);
++   mtl_render_set_argument_table(cmd->metal.render, cmd->argument_table,
++                                 MTL_RENDER_STAGE_VERTEX |
++                                    MTL_RENDER_STAGE_FRAGMENT |
++                                    MTL_RENDER_STAGE_MESH);
+ 
+    kk_cmd_buffer_dirty_all_gfx(cmd);
+ }
+@@ -475,7 +476,8 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+          cs_end(cmd);
+          cs_start_render(cmd);
+       } else
+-         mtl_barrier_after_encoder_stages(cmd->metal.render, MTL_STAGE_VERTEX,
++         mtl_barrier_after_encoder_stages(cmd->metal.render,
++                                          MTL_STAGE_VERTEX | MTL_STAGE_MESH,
+                                           MTL_STAGE_FRAGMENT);
+    } else if (cmd->metal.compute) {
+       /* We chain encoders, so an intra-encoder barrier is enough here:
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 8f627aa..e78a79d 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -792,14 +792,15 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
+       viewports[i].width = vp->width;
+       viewports[i].height = -vp->height;
+ 
+-      if (dyn->rs.depth_clamp_enable ||
+-          vk_rasterization_state_depth_clip_enable(&dyn->rs)) {
++      if (!cmd->state.shaders[MESA_SHADER_VERTEX]->info.vs.polygon_points &&
++          (dyn->rs.depth_clamp_enable ||
++           vk_rasterization_state_depth_clip_enable(&dyn->rs))) {
+          viewports[i].znear = vp->minDepth;
+          viewports[i].zfar = vp->maxDepth;
+       } else {
+-         /* When clamp and clip are disabled, we set the viewport Z range to
+-          * [0, 1] to disable hardware clamping. The viewport transform will be
+-          * applied in shader */
++         /* Polygon points bias depth once per source triangle in framebuffer
++          * coordinates. Their mesh shader also performs the viewport transform.
++          * The normal vertex shader handles the clip-off, clamp-off case. */
+          viewports[i].znear = 0.f;
+          viewports[i].zfar = 1.f;
+       }
+@@ -1170,7 +1171,7 @@ kk_upload_vertex_params(struct kk_cmd_buffer *cmd,
+ 
+    cmd->state.gfx.per_draw_data.vertex_outputs = params.outputs;
+ 
+-   return kk_pool_upload(cmd, &params, sizeof(params), 8).gpu;
++   return kk_pool_upload(cmd, &params, sizeof(params), 16).gpu;
+ }
+ 
+ static void
+@@ -1255,6 +1256,19 @@ kk_upload_tess_params(struct kk_cmd_buffer *cmd, struct poly_tess_params *out,
+    memcpy(out, &args, sizeof(args));
+ }
+ 
++static enum mtl_winding
++kk_front_winding(const struct kk_cmd_buffer *cmd)
++{
++   const struct vk_dynamic_graphics_state *dyn =
++      &cmd->vk.dynamic_graphics_state;
++   bool ccw = dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
++   if (cmd->state.shaders[MESA_SHADER_TESS_EVAL]) {
++      ccw ^= cmd->state.gfx.tess.info.ccw;
++      ccw ^= dyn->ts.domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
++   }
++   return ccw ? MTL_WINDING_COUNTER_CLOCKWISE : MTL_WINDING_CLOCKWISE;
++}
++
+ static void
+ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+ {
+@@ -1273,6 +1287,10 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+       desc->root_dirty = true;
+    }
+ 
++   if (IS_DIRTY(RS_POLYGON_MODE))
++      mtl_set_triangle_wireframe(enc,
++                                 dyn->rs.polygon_mode == VK_POLYGON_MODE_LINE);
++
+    if (IS_DIRTY(RS_RASTERIZER_DISCARD_ENABLE)) {
+       if (dyn->rs.rasterizer_discard_enable) {
+          set_empty_scissor(enc);
+@@ -1299,9 +1317,10 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+ 
+    /* We enable raster discard by setting scissor to size (0, 0) */
+    if (!(dyn->rs.rasterizer_discard_enable || gfx->is_cull_front_and_back) &&
+-       (IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS) ||
+-        IS_DIRTY(VP_SCISSOR_COUNT) || IS_DIRTY(VP_SCISSORS) ||
+-        IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE)))
++       (IS_SHADER_DIRTY(VERTEX) || IS_DIRTY(VP_VIEWPORT_COUNT) ||
++        IS_DIRTY(VP_VIEWPORTS) || IS_DIRTY(VP_SCISSOR_COUNT) ||
++        IS_DIRTY(VP_SCISSORS) || IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) ||
++        IS_DIRTY(RS_DEPTH_CLIP_ENABLE)))
+       kk_flush_vp_state(cmd);
+ 
+    if (IS_DIRTY(VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE)) {
+@@ -1312,19 +1331,13 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+ 
+    if (IS_DIRTY(RS_FRONT_FACE) || IS_DIRTY(TS_DOMAIN_ORIGIN) ||
+        IS_SHADER_DIRTY(TESS_CTRL) || IS_SHADER_DIRTY(TESS_EVAL)) {
+-      bool front_face_ccw = dyn->rs.front_face != VK_FRONT_FACE_CLOCKWISE;
+-      if (cmd->state.shaders[MESA_SHADER_TESS_EVAL]) {
+-         front_face_ccw ^= gfx->tess.info.ccw;
+-         front_face_ccw ^=
+-            dyn->ts.domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+-      }
+-      mtl_set_front_face_winding(enc, front_face_ccw
+-                                         ? MTL_WINDING_COUNTER_CLOCKWISE
+-                                         : MTL_WINDING_CLOCKWISE);
++      mtl_set_front_face_winding(enc, kk_front_winding(cmd));
+    }
+ 
+-   if (IS_DIRTY(RS_DEPTH_BIAS_FACTORS) || IS_DIRTY(RS_DEPTH_BIAS_ENABLE)) {
+-      if (dyn->rs.depth_bias.enable)
++   if (IS_SHADER_DIRTY(VERTEX) || IS_DIRTY(RS_DEPTH_BIAS_FACTORS) ||
++       IS_DIRTY(RS_DEPTH_BIAS_ENABLE)) {
++      if (!cmd->state.shaders[MESA_SHADER_VERTEX]->info.vs.polygon_points &&
++          dyn->rs.depth_bias.enable)
+          mtl_set_depth_bias(enc, dyn->rs.depth_bias.constant_factor,
+                             dyn->rs.depth_bias.slope_factor,
+                             dyn->rs.depth_bias.clamp);
+@@ -1669,9 +1682,95 @@ kk_sanitize_index_range(struct kk_cmd_buffer *cmd, struct kk_addr_range range)
+    return range;
+ }
+ 
++/* Source offsets in an indirect draw must be read after all producer commands.
++ * For direct indexed draws build_draw_data already applied firstIndex. */
++static void
++kk_draw_polygon_points(struct kk_cmd_buffer *cmd,
++                       const struct kk_draw_data *draw)
++{
++   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
++   bool indexed = draw->index.el_size_B != 0;
++   bool indirect = kk_grid_is_indirect(draw->grid);
++   uint32_t direct[5] = {0};
++   uint64_t grid = 0, args = draw->grid.addr;
++   if (indirect) {
++      grid = kk_pool_alloc(cmd, 3 * sizeof(uint32_t), 4).gpu;
++      if (!grid)
++         return;
++      libkk_polygon_grid(cmd, kk_grid_1d(1), true, grid, args);
++      if (cmd->state.gfx.need_to_start_render_pass)
++         kk_flush_gfx_state(cmd);
++   } else {
++      direct[0] = draw->grid.size.x;
++      direct[1] = draw->grid.size.y;
++      direct[indexed ? 3 : 2] = draw->vertex_offset;
++      direct[indexed ? 4 : 3] = draw->grid.size.z;
++      args = kk_pool_upload(cmd, direct, sizeof(direct), 4).gpu;
++   }
++   /* Layout shared with PolygonDraw in polygon_points.metal. */
++   struct polygon_draw {
++      uint64_t args, indices, index_range;
++      uint32_t index_size, cull, clockwise, clip_z;
++      uint64_t flat_mask, linear_mask;
++      float bias_constant, bias_slope, bias_clamp, fixed_depth_step;
++      _Alignas(16) float viewport[KK_MAX_VIEWPORTS][4];
++   } params = {
++      args,
++      draw->index.gpu.addr,
++      draw->index.gpu.range,
++      draw->index.el_size_B,
++      dyn->rs.cull_mode,
++      kk_front_winding(cmd) == MTL_WINDING_CLOCKWISE,
++      vk_rasterization_state_depth_clip_enable(&dyn->rs),
++   };
++   struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
++   if (fs) {
++      params.flat_mask = fs->info.fs.flat_mask;
++      params.linear_mask = fs->info.fs.linear_mask;
++   }
++   if (dyn->rs.depth_bias.enable) {
++      params.bias_constant = dyn->rs.depth_bias.constant_factor;
++      params.bias_slope = dyn->rs.depth_bias.slope_factor;
++      params.bias_clamp = dyn->rs.depth_bias.clamp;
++      switch (cmd->state.gfx.render.depth_att.vk_format) {
++      case VK_FORMAT_D16_UNORM:
++      case VK_FORMAT_D16_UNORM_S8_UINT:
++         params.fixed_depth_step = 0x1p-16f;
++         break;
++      case VK_FORMAT_X8_D24_UNORM_PACK32:
++      case VK_FORMAT_D24_UNORM_S8_UINT:
++         params.fixed_depth_step = 0x1p-24f;
++         break;
++      default:
++         break;
++      }
++   }
++   for (unsigned i = 0; i < dyn->vp.viewport_count; i++) {
++      const VkViewport *vp = &dyn->vp.viewports[i];
++      params.viewport[i][0] = 1.0f / vp->width;
++      params.viewport[i][1] = 1.0f / vp->height;
++      const bool z_already_transformed =
++         !params.clip_z && !dyn->rs.depth_clamp_enable;
++      params.viewport[i][2] = z_already_transformed ? 0.f : vp->minDepth;
++      params.viewport[i][3] = z_already_transformed ? 1.f : vp->maxDepth;
++   }
++   static_assert(offsetof(struct polygon_draw, viewport) == 80, "Metal ABI");
++   size_t size = offsetof(struct polygon_draw, viewport) +
++                 MAX2(dyn->vp.viewport_count, 1) * sizeof(params.viewport[0]);
++   uint64_t param_addr = kk_pool_upload(cmd, &params, size, 16).gpu;
++   if (!args || !param_addr)
++      return;
++   mtl_set_address(cmd->argument_table, param_addr, 3);
++   mtl_draw_polygon_mesh(cs_get_render(cmd), grid, direct[0] / 3, direct[1]);
++}
++
+ static void
+ kk_dispatch_draw(struct kk_cmd_buffer *cmd, struct kk_draw_data data)
+ {
++   if (cmd->state.shaders[MESA_SHADER_VERTEX]->info.vs.polygon_points) {
++      kk_draw_polygon_points(cmd, &data);
++      return;
++   }
+    mtl_render_encoder *enc = cs_get_render(cmd);
+ 
+    if (kk_grid_is_indirect(data.grid)) {
+@@ -1839,6 +1938,10 @@ requires_unroll(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    if (tess)
+       return false;
+ 
++   if (cmd->state.shaders[MESA_SHADER_VERTEX]->info.vs.polygon_points &&
++       (data->prim == MESA_PRIM_TRIANGLE_STRIP || !data->flatshade_first))
++      return true;
++
+    /* Metal does not support triangle fans */
+    if (data->prim == MESA_PRIM_TRIANGLE_FAN)
+       return true;
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 65b99ed..fc639e1 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -233,6 +233,7 @@ kk_get_device_features(
+       .dualSrcBlend = true,
+       .fragmentStoresAndAtomics = true,
+       .fullDrawIndexUint32 = true,
++      .fillModeNonSolid = true,
+       .imageCubeArray = true,
+       .independentBlend = true,
+       .inheritedQueries = true,
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index f5dd748..4faec09 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -102,7 +102,8 @@ has_static_depth_stencil_state(const struct vk_graphics_pipeline_state *state)
+ }
+ 
+ struct kk_vs_key {
+-   bool is_points;
++   uint32_t topology;
++   bool polygon_points;
+    struct vk_vertex_input_state vi;
+ };
+ 
+@@ -111,8 +112,9 @@ kk_populate_vs_key(struct kk_vs_key *key,
+                    const struct vk_graphics_pipeline_state *state)
+ {
+    memset(key, 0, sizeof(*key));
+-   key->is_points =
+-      (state->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
++   key->topology = state->ia->primitive_topology;
++   key->polygon_points =
++      state->rs && state->rs->polygon_mode == VK_POLYGON_MODE_POINT;
+    key->vi = *state->vi;
+ }
+ 
+@@ -880,6 +882,25 @@ gather_vs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+    return false;
+ }
+ 
++static bool
++polygon_interp_modes(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   struct kk_shader_info *info = data;
++   if (intr->intrinsic == nir_intrinsic_load_input ||
++       intr->intrinsic == nir_intrinsic_load_interpolated_input) {
++      bool flat = intr->intrinsic == nir_intrinsic_load_input;
++      unsigned offset = nir_src_as_uint(intr->src[flat ? 0 : 1]);
++      uint64_t mask =
++         BITFIELD64_BIT(nir_intrinsic_io_semantics(intr).location + offset);
++      if (flat)
++         info->fs.flat_mask |= mask;
++      else if (nir_intrinsic_interp_mode(nir_src_as_intrinsic(intr->src[0])) ==
++               INTERP_MODE_NOPERSPECTIVE)
++         info->fs.linear_mask |= mask;
++   }
++   return false;
++}
++
+ static bool
+ fs_uses_flat_varying(nir_shader *nir)
+ {
+@@ -914,6 +935,10 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
+       if (nir->info.fs.depth_layout == FRAG_DEPTH_LAYOUT_NONE)
+          nir->info.fs.depth_layout = FRAG_DEPTH_LAYOUT_ANY;
+       shader->info.fs.uses_flat_varyings = fs_uses_flat_varying(nir);
++      if (state && state->rs &&
++          state->rs->polygon_mode == VK_POLYGON_MODE_POINT)
++         nir_shader_intrinsics_pass(nir, polygon_interp_modes, nir_metadata_all,
++                                    &shader->info);
+    } else if (nir->info.stage == MESA_SHADER_COMPUTE) {
+       shader->info.cs.local_size.x = nir->info.workgroup_size[0];
+       shader->info.cs.local_size.y = nir->info.workgroup_size[1];
+@@ -1075,6 +1100,27 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       .mem_ctx = NULL,
+       .disabled_workarounds = pdev->settings.disabled_workarounds,
+    };
++   if (state && state->rs && state->ia &&
++       nir->info.stage == MESA_SHADER_VERTEX &&
++       state->rs->polygon_mode == VK_POLYGON_MODE_POINT) {
++      bool triangles =
++         stage == MESA_SHADER_TESS_EVAL
++            ? !(shader->info.tess.info.points ||
++                shader->info.tess.info.mode == TESS_PRIMITIVE_ISOLINES)
++            : vk_primitive_topology_to_mtl_primitive_topology_class(
++                 state->ia->primitive_topology) ==
++                 MTL_PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE;
++      shader->info.raster_polygon_points = triangles;
++   } else if (nir->info.stage == MESA_SHADER_FRAGMENT && prev_stage) {
++      shader->info.raster_polygon_points =
++         prev_stage->info.raster_polygon_points;
++   }
++   translate_options.polygon_points = shader->info.raster_polygon_points;
++   translate_options.stencil_points =
++      translate_options.polygon_points &&
++      state->rp->stencil_attachment_format != VK_FORMAT_UNDEFINED &&
++      (!has_static_depth_stencil_state(state) ||
++       state->ds->stencil.test_enable);
+    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+       for (uint32_t i = 0u; i < MAX_DRAW_BUFFERS; ++i) {
+          /* If the attachment is unused, default to 4 to avoid issues with alpha
+@@ -1429,6 +1475,9 @@ gather_graphics_pipeline_create_info(
+ 
+    info->vs.topology =
+       vk_primitive_topology_to_mtl_primitive_topology_class(topology);
++   info->vs.polygon_points =
++      state->rs && state->rs->polygon_mode == VK_POLYGON_MODE_POINT &&
++      info->vs.topology == MTL_PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE;
+ }
+ 
+ static VkResult
+@@ -1481,17 +1530,19 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+       mtl_new_library_function_descriptor(fragment_library,
+                                           fs_data->entrypoint_name);
+ 
+-   mtl_render_pipeline_descriptor *pipeline_descriptor =
+-      mtl_new_render_pipeline_descriptor();
+-   mtl_render_pipeline_descriptor_set_vertex_shader(pipeline_descriptor,
+-                                                    vertex_function);
++   mtl_render_pipeline_descriptor *pipeline_descriptor;
++   if (vs->info.vs.polygon_points) {
++      pipeline_descriptor = mtl_new_mesh_pipeline_descriptor(vertex_function);
++   } else {
++      pipeline_descriptor = mtl_new_render_pipeline_descriptor();
++      mtl_render_pipeline_descriptor_set_vertex_shader(pipeline_descriptor,
++                                                       vertex_function);
++      mtl_render_pipeline_descriptor_set_input_primitive_topology(
++         pipeline_descriptor, vs->info.vs.topology);
++   }
+    mtl_render_pipeline_descriptor_set_fragment_shader(pipeline_descriptor,
+                                                       fragment_function);
+ 
+-   /* Layered rendering in Metal requires setting primitive topology class */
+-   mtl_render_pipeline_descriptor_set_input_primitive_topology(
+-      pipeline_descriptor, vs->info.vs.topology);
+-
+    /* If color attachments are reordered there might be unused / invalid gaps
+     * in the array so need to check them all, not just first
+     * color_attachment_count entries.
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index dc5e060..b651073 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -48,6 +48,7 @@ kk_tess_info_merge(struct kk_tess_info a, struct kk_tess_info b)
+ struct kk_shader_info {
+    mesa_shader_stage stage;
+    bool uses_per_draw_data;
++   bool raster_polygon_points;
+ 
+    /* Required for fragment shader cull distance discards. */
+    uint8_t num_cull_distances;
+@@ -82,6 +83,7 @@ struct kk_shader_info {
+             uint8_t write_mask;
+          } stencil_front, stencil_back;
+          uint8_t color_attachment_count;
++         bool polygon_points;
+          bool has_ms;
+          bool has_ds;
+          bool has_depth_write;
+@@ -99,6 +101,7 @@ struct kk_shader_info {
+ 
+       struct {
+          bool uses_flat_varyings;
++         uint64_t flat_mask, linear_mask;
+       } fs;
+ 
+       struct {
