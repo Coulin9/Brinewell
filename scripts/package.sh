@@ -90,7 +90,7 @@ fi
 mkdir -p "$OUT/app-icon"
 DEVELOPER_DIR="$icon_developer_dir" xcrun actool "$ROOT/Resources/Brinewell.icon" \
     --compile "$OUT/app-icon" --app-icon Brinewell \
-    --platform macosx --target-device mac --minimum-deployment-target 15.0 \
+    --platform macosx --target-device mac --minimum-deployment-target 26.0 \
     --output-partial-info-plist "$OUT/app-icon/partial-info.plist" \
     --output-format human-readable-text
 

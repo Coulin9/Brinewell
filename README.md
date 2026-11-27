@@ -87,7 +87,7 @@ with 8 vCPUs.
 
 To run Brinewell:
 
-- A Mac with Apple Silicon running macOS 15 or later.
+- A Mac with Apple Silicon running macOS 26 or later.
 - Rosetta 2, for the D3DMetal backend (its render worker is x86-64).
 - For the D3DMetal backend: an x86-64 `D3DMetal.framework` that you obtain yourself, for
   example from Apple's Game Porting Toolkit. The context integration targets D3DMetal
@@ -378,7 +378,7 @@ bounded CPU frame pool backed by IOSurface.
 
 ### Prerequisites
 
-- macOS 15+ on Apple Silicon and Xcode 26+ (Swift 6, macOS SDK, icon compiler), with
+- macOS 26+ on Apple Silicon and Xcode 26+ (Swift 6, macOS SDK, icon compiler), with
   the Metal Toolchain installed: `xcodebuild -downloadComponent MetalToolchain`.
 - Go 1.25+, Homebrew, and a linux/arm64 Podman machine named `brinewell-builder`
   (`podman machine init brinewell-builder && podman machine start brinewell-builder`).
@@ -487,7 +487,7 @@ digests are in `.build/` and `build/manifest.json`.
   notes. Run it after the release tag is pushed. It checks every link unless you pass
   `--no-check-links`.
 - The app icon source is `Resources/Brinewell.icon`, compiled to `Assets.car`.
-  `Resources/Brinewell.icns` is the macOS 15 fallback. Packaging uses the Xcode selected
+  `Resources/Brinewell.icns` is the compatibility fallback icon. Packaging uses the Xcode selected
   by `DEVELOPER_DIR`/`xcode-select`, or `/Applications/Xcode.app` when only the Command
   Line Tools are selected.
 

@@ -9,7 +9,7 @@ let frameworks = environment["BRINEWELL_LIBKRUN_DIR"] ?? root.appendingPathCompo
 
 let package = Package(
     name: "Brinewell",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS("26.0")],
     products: [
         .library(name: "BrinewellCore", targets: ["BrinewellCore"]),
         .library(name: "BrinewellDisplay", targets: ["BrinewellDisplay"]),

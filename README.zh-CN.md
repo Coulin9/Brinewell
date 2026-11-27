@@ -78,7 +78,7 @@ Brinewell 四轮显卡分数为 10548、10481、10463、10478，极差 0.8%；�
 
 运行 Brinewell 需要：
 
-- macOS 15 或更高版本的 Apple Silicon Mac。
+- macOS 26 或更高版本的 Apple Silicon Mac。
 - Rosetta 2，用于 D3DMetal 后端（其渲染 worker 为 x86-64）。
 - 使用 D3DMetal 后端时，需自行获取 x86-64 `D3DMetal.framework`，例如来自 Apple 的 Game
   Porting Toolkit。工作上下文适配针对 D3DMetal 4.0b3，其他版本使用普通渲染路径。
@@ -309,7 +309,7 @@ macOS 宿主（Apple Silicon）                        SteamOS 客体（ARM64）
 
 ### 前置条件
 
-- Apple Silicon 上的 macOS 15+，Xcode 26+（含 Swift 6、macOS SDK 和图标编译工具），并安装
+- Apple Silicon 上的 macOS 26+，Xcode 26+（含 Swift 6、macOS SDK 和图标编译工具），并安装
   Metal Toolchain：`xcodebuild -downloadComponent MetalToolchain`。
 - Go 1.25+、Homebrew，以及名为 `brinewell-builder` 的 linux/arm64 Podman 虚拟机
   （`podman machine init brinewell-builder && podman machine start brinewell-builder`）。
@@ -395,7 +395,7 @@ cd Brinewell
   GPL/LGPL 组件的源码链接表，用于发布说明。请在推送发布标签后运行；默认会检查每个链接，
   加 `--no-check-links` 可跳过。
 - 应用图标源工程为 `Resources/Brinewell.icon`，编译为 `Assets.car`；`Resources/Brinewell.icns`
-  是 macOS 15 的兼容图标。打包使用 `DEVELOPER_DIR`/`xcode-select` 指定的 Xcode；若只选中了
+  是兼容后备图标。打包使用 `DEVELOPER_DIR`/`xcode-select` 指定的 Xcode；若只选中了
   Command Line Tools，则使用 `/Applications/Xcode.app`。
 
 > [!IMPORTANT]

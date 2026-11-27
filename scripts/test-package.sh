@@ -87,6 +87,7 @@ fi
 set -euo pipefail
 touch "${FIXTURE_APP%/*}/xcrun-called"
 if [[ "$1" == --find ]]; then printf '/fixture/actool\\n'; exit 0; fi
+printf '%s\\n' "$@" > "${FIXTURE_APP%/*}/actool-args"
 while [[ $# -gt 0 ]]; do
     if [[ "$1" == --compile ]]; then
         touch "$2/Assets.car"
@@ -202,6 +203,10 @@ stamp_write "$name" "$input" "$@"
 
     subprocess.run(['bash', str(package)], env=env, check=True)
     assert (app / 'Contents/registered-marker').is_file(), 'bundle was not published'
+    actool_args = (app.parent / 'actool-args').read_text().splitlines()
+    target_index = actool_args.index('--minimum-deployment-target')
+    assert actool_args[target_index + 1] == '26.0', 'incorrect actool deployment target'
+    assert (app / 'Contents/Resources/Brinewell.icns').is_file(), 'fallback icon missing'
     assert (app / 'Contents/Resources/steam-graphics-index.json').read_bytes() == index.read_bytes()
     assert app.stat().st_mtime > old_mtime, 'outer bundle mtime stayed stale'
     assert not sentinel.exists(), 'old executable remained in published bundle'
@@ -224,6 +229,7 @@ stamp_write "$name" "$input" "$@"
     for license_file in licenses.iterdir():
         assert (bundled_licenses / license_file.name).read_bytes() == license_file.read_bytes()
     info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+    assert info['LSMinimumSystemVersion'] == '26.0'
     assert info['CFBundleDevelopmentRegion'] == 'en'
     for language in localizations:
         table = f'Resources/{language}.lproj/Localizable.strings'

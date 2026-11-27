@@ -15,7 +15,7 @@ MANIFEST="$ROOT/build/manifest.json"
 mkdir -p "$CACHE" "$SRC" "$OUT" "$STAMPS" "$LOGS" "$ROOT/build"
 
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.0}"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1762377600}"
 export LC_ALL="${LC_ALL:-C}"
 
