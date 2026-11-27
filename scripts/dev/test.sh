@@ -9,10 +9,10 @@
 #   scripts/dev/test.sh --all           every repository
 #   scripts/dev/test.sh REPO...         named repositories (Brinewell,
 #                                       neptune-protocol, virglrenderer,
-#                                       d3dmetal-native, virtio-win-mesa)
+#                                       d3dmetal-native)
 source "$(dirname "$0")/lib.sh"
 
-REPOS=(Brinewell neptune-protocol virglrenderer d3dmetal-native virtio-win-mesa)
+REPOS=(Brinewell neptune-protocol virglrenderer d3dmetal-native)
 TB="$DEV_ROOT/.build/test"
 export PATH="$DEV_ROOT/.build/toolchain/venv/bin:/opt/homebrew/bin:$PATH"
 
@@ -61,6 +61,10 @@ PY
 
 t_Brinewell() {
     (cd "$DEV_ROOT" && python3 -B -m unittest discover -s Tests/GuestIntegrationTests -p 'test_*.py') || return 1
+    local test
+    for test in test_pipeline_library_ring.py test_present_resource_creation.py; do
+        python3 -B "$DEV_ROOT/runtime/neptune/tests/$test" || return 1
+    done
     local swift_paths=(Sources Tests/BrinewellCoreTests Tests/BrinewellDisplayTests Tests/BrinewellVMTests Package.swift)
     local swift_changed
     swift_changed="$(git -C "$DEV_ROOT" status --porcelain -- "${swift_paths[@]}")"
@@ -91,12 +95,6 @@ t_d3dmetal-native() {
     D3DMETAL_FRAMEWORK_PATH="${D3DMETAL_FRAMEWORK_PATH:-$fw}" \
         meson_suite d3dmetal-native "$WORKSPACE/d3dmetal-native" \
         --cross-file "$WORKSPACE/d3dmetal-native/build-macos-x86_64.txt" -Dtests=enabled
-}
-t_virtio-win-mesa() {
-    local t
-    for t in test_pipeline_library_ring.py test_present_resource_creation.py; do
-        python3 "$WORKSPACE/virtio-win-mesa/src/virtio/neptune/tests/$t" || return 1
-    done
 }
 
 selected=()

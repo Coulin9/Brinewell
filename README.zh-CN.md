@@ -294,7 +294,7 @@ macOS 宿主（Apple Silicon）                        SteamOS 客体（ARM64）
 │      ├─ virtio-gpu ─ virglrenderer      │virtio  │  Neptune 载荷 · MangoApp         │
 │      │   ├─ Venus → KosmicKrisp         │        │ Steam → Proton + FEX             │
 │      │   └─ Neptune 渲染 worker         │        │  └─ Neptune d3d11/d3d12/dxgi DLL │
-│      │       ├─ d3dmetal-native (x86-64)│        │     （来自 virtio-win-mesa）     │
+│      │       ├─ d3dmetal-native (x86-64)│        │     （来自 runtime/neptune）     │
 │      │       │   └─ D3DMetal.framework  │        └──────────────────────────────────┘
 │      │       └─ Mullion (arm64)         │
 │      └─ gvproxy（网络）                 │
@@ -319,6 +319,9 @@ KosmicKrisp 提交绘制。普通 GPU 图像由驱动分配内存，客体需要
 
 [`deps.lock.json`](deps.lock.json) 中固定版本的第三方源码和发行文件会按需下载，并以 SHA-256 校验。
 
+宿主 KosmicKrisp 和客体 Venus/Zink 共用 `.build/out/kosmicrisp/src/` 下的官方 Mesa 源码。
+Neptune 的客体代码位于 [`runtime/neptune/`](runtime/neptune/)，构建时使用同一版本的 Mesa。
+
 ### 工作区布局
 
 Brinewell 从同级目录中 `steamos-d3dmetal` 分支的检出构建多个组件：
@@ -328,7 +331,6 @@ workspace/
 ├── Brinewell/         本仓库
 ├── libkrun/           https://github.com/Coulin9/libkrun
 ├── virglrenderer/     https://github.com/Coulin9/virglrenderer
-├── virtio-win-mesa/   https://github.com/Coulin9/mesa
 ├── d3dmetal-native/   https://github.com/Coulin9/d3dmetal-native
 ├── Mullion/           https://github.com/Coulin9/mullion
 ├── neptune-protocol/  https://github.com/Coulin9/neptune-protocol（协议生成器，可选）
@@ -339,7 +341,6 @@ workspace/
 mkdir workspace && cd workspace
 git clone https://github.com/Coulin9/libkrun.git -b steamos-d3dmetal
 git clone https://github.com/Coulin9/virglrenderer.git -b steamos-d3dmetal
-git clone https://github.com/Coulin9/mesa.git virtio-win-mesa -b steamos-d3dmetal
 git clone https://github.com/Coulin9/d3dmetal-native.git -b steamos-d3dmetal
 git clone https://github.com/Coulin9/mullion.git Mullion -b steamos-d3dmetal
 git clone https://github.com/Coulin9/Brinewell.git -b steamos-d3dmetal
@@ -369,14 +370,14 @@ cd Brinewell
 | gvproxy | v0.8.9 + `runtime/network` 出站策略 | `gvproxy` |
 | macmon | vladkens/macmon v0.11.0 发行包 | 宿主硬件指标采样器 |
 | initramfs | busybox-static、dosfstools、e2fsprogs、btrfs-progs + `runtime/initramfs/init` | `initramfs.cpio.gz` |
-| mesa | `../virtio-win-mesa`（Mesa 26.3 基线，`-Dneptune=false`） | layer 内 Mesa |
+| mesa | 与 KosmicKrisp 共用官方 Mesa 发布包 | 客体层内的 Venus 和 Zink |
 | agent | `runtime/guest/agent` | `brinewell-agent` |
 | uu-runtime | 固定版本 FEX 及专用网络工具 | layer 内 UU 运行依赖 |
 | fex-eac | StonkGuy/FEX `eac-2610.5`，Steam 模式，按 `apple-m1` 调优 | 供 Steam FEX-Emu 工具使用的 EAC 版 FEX |
 | mangoapp | MangoHud v0.8.4 + `runtime/patches/mangohud` | 客体 `mangoapp` |
 | guest-integration | `runtime/guest/rootfs` | layer 内 units/scripts |
 | neptune-probe | `runtime/guest/tools`，静态 aarch64 | `brinewell-api-probe`、`brinewell-gpu-probe` |
-| neptune | `../virtio-win-mesa`，固定版本 llvm-mingw + x86-64 Linux 交叉工具链 | x86-64 Wine DLL、`nptunix.so`、`payload.json` |
+| neptune | `runtime/neptune/`、官方 Mesa、固定版本的 llvm-mingw 和 Linux 工具链 | x86-64 和 ARM64EC Wine DLL、x86-64 和 AArch64 `nptunix.so`、`payload.json` |
 | layer | 上述 guest 产物 | `brinewell-layer.img`（EROFS，lz4） |
 | swift | `Sources/` | `Brinewell`、`brinewell-vm`、`brinewell-diagnostics` |
 

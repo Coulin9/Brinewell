@@ -1,0 +1,92 @@
+# Copyright 2026 Turing Software LLC
+# SPDX-License-Identifier: MIT
+
+triton_src = files(
+  'triton.c',
+  'tritonDDI.c',
+  'tritonDDI12.c',
+  'tritonDescriptor12.c',
+  'tritonResource12.c',
+  'tritonQueue12.c',
+  'tritonList12.c',
+  'tritonPipeline12.c',
+  'tritonPresent12.c',
+  'tritonResource.c',
+  'tritonView.c',
+  'tritonState.c',
+  'tritonShader.c',
+  'tritonDxbc.c',
+  'tritonDxil.c',
+  'tritonQuery.c',
+  'tritonDxgi.c',
+  'tritonPresent.c',
+  'tritonKm.c',
+  'tritonSharedBridge.c',
+  'tritonHostCaps.c',
+)
+
+triton_incs = [
+  npt_incs,
+  include_directories('.'),
+  include_directories('..'),
+]
+
+umd_version = get_option('npt_umd_version')
+if umd_version.split('.').length() != 4
+  error('npt_umd_version must be four dot-separated numbers, got "@0@"'.format(umd_version))
+endif
+umd_version_rc = import('windows').compile_resources(
+  files('neptune_umd.rc'),
+  args : ['/dVER=' + umd_version,
+          '/dVER_COMMA=' + ','.join(umd_version.split('.'))],
+)
+
+libneptune_umd = shared_library(
+  'neptune_umd',
+  [npt_common_src, triton_src, umd_version_rc,
+   files('../npt_entry_d3d11.c', '../npt_entry_dxgi.c',
+         '../npt_entry_d3d12.c')],
+  include_directories : triton_incs,
+  dependencies : npt_deps,
+  c_args : npt_c_args,
+  # d3d10umddi.h redeclares many D3D10_* numeric constants as file-scope
+  # `const UINT` variables on top of the #define forms in d3d10.h.  In C
+  # those have external linkage, so every TU that includes the umddi
+  # header emits an identical symbol and the linker raises LNK2005.
+  # Both definitions agree, so picking the first instance is safe.
+  # dxguid.lib provides the IID_ID3D11Device*/IID_ID3D11DeviceContext* GUIDs.
+  link_args : ['/FORCE:MULTIPLE', '/IGNORE:4006', 'dxguid.lib'],
+  vs_module_defs : 'neptune_umd.def',
+  name_prefix : '',
+  gnu_symbol_visibility : 'hidden',
+  install : true,
+)
+
+if with_tests
+  # Self-contained: #includes tritonDxbc.c and loads d3dcompiler_47.dll at
+  # runtime as the reference compiler.
+  test(
+    'triton-dxbc',
+    executable(
+      'triton_dxbc_test',
+      files('tests/tritonDxbcTest.c'),
+      include_directories : triton_incs,
+      c_args : npt_c_args,
+    ),
+    suite : ['neptune'],
+  )
+  # Checks the DXIL input-signature reader against DXC's reflection and
+  # the containers' ISG1 chunks; loads dxcompiler.dll (beside the exe or
+  # on PATH), dxilconv.dll and d3dcompiler_47.dll at runtime.
+  test(
+    'triton-dxil',
+    executable(
+      'triton_dxil_test',
+      files('tests/tritonDxilTest.cpp', 'tritonDxil.c', 'tritonDxbc.c'),
+      include_directories : triton_incs,
+      c_args : npt_c_args,
+      link_args : ['ole32.lib'],
+    ),
+    suite : ['neptune'],
+  )
+endif

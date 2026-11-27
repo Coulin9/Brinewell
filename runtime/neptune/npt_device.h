@@ -1,0 +1,269 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ *
+ * Per-process Neptune device: refcounted singleton owning the
+ * renderer, primary ring, wrapper cache, TLS / DC-SC / instance
+ * rings, data shmem pool, and Win32 event emulation.
+ */
+
+#ifndef NPT_DEVICE_H
+#define NPT_DEVICE_H
+
+#include "npt_common.h"
+#include "npt_renderer.h"
+#include "npt_ring.h"
+#include "npt_object.h"
+#include "npt_shmem_pool.h"
+
+/*
+ * Wrapper cache: host_id -> guest wrapper, so a host pointer returned
+ * twice (e.g. from GetParent) maps to the same wrapper.  Holds a weak
+ * reference; the wrapper removes itself in Release.
+ */
+#define NPT_WRAPPER_CACHE_BUCKETS 1024
+
+struct npt_wrapper_cache_entry {
+   uint64_t host_id;
+   void *wrapper;
+   struct npt_wrapper_cache_entry *next;
+};
+
+struct npt_wrapper_cache {
+   mtx_t mutex;
+   struct npt_wrapper_cache_entry *buckets[NPT_WRAPPER_CACHE_BUCKETS];
+   uint32_t count;
+};
+
+/* Public typed format of a swapchain back buffer whose host twin was
+ * created typeless, keyed by the back buffer's host object id. */
+struct npt_bb_format_entry {
+   struct list_head head;
+   uint64_t host_id;
+   DXGI_FORMAT format;
+};
+
+struct npt_device {
+   struct npt_renderer *renderer;
+   /* Primary ring; fallback when TLS rings are disabled. */
+   struct npt_ring *ring;
+
+   struct npt_shmem_pool data_pool;
+
+   /* D3D11 Map shadow-staging pool: every npt_d3d_map_ring slot
+    * sub-allocates here instead of creating its own RESOURCE_CREATE_BLOB,
+    * since per-resource shmems make qemu's ram_block_add list walk
+    * (O(n) in find_ram_offset) the dominant cost.  Pool grows on
+    * overflow; old blocks linger via per-slot refs until those slots
+    * release. */
+   struct npt_shmem_pool map_pool;
+
+   /* Shared-memory feedback slots (D3D11 queries, ID3D11Fence, ...);
+    * the host writes status so guest reads stay local.  Bump
+    * allocator: grown shmems stay alive via per-wrapper refs taken
+    * at allocation, so existing slots remain valid.  Lazily inited
+    * so non-feedback workloads pay nothing. */
+   mtx_t feedback_pool_init_mutex;
+   _Atomic bool feedback_pool_inited;
+   struct npt_shmem_pool feedback_pool;
+   /* Query feedback slots given back by released queries, oldest first
+    * (struct npt_feedback_free_slot).  The pool only bump-allocates, so
+    * a title that creates queries as it renders would otherwise consume a
+    * fresh pool shmem every 128 queries: a blob create and map, later an
+    * unmap, each a host round trip and a KVM memslot change.  A slot is
+    * reused only once the host has run its query's unregister (dev->ring
+    * head past free_seqno): from then on the host never writes it. */
+   mtx_t feedback_free_mutex;
+   struct list_head feedback_free;
+   uint32_t feedback_free_count;
+
+   _Atomic uint64_t next_ring_id;
+
+   /* Per-thread TLS ring list.  Walked by device_destroy and by the
+    * cross-ring drain barrier. */
+   mtx_t tls_rings_mutex;
+   struct list_head tls_rings;
+
+   /* Per-instance rings for single-threaded-per-instance interfaces;
+    * walked alongside tls_rings by the drain barrier. */
+   mtx_t instance_rings_mutex;
+   struct list_head instance_rings;
+
+   /* Shared ring for DC + SC: DXGI requires Present on the immediate-
+    * context thread and the host D3D library has no internal locking
+    * to coordinate DC vs SC vs Device, so DC and SC must share one
+    * dispatch thread.  Lazy under instance_rings_mutex.  Torn down
+    * when dc_sc_ring_refs hits zero. */
+   _Atomic(struct npt_ring *) dc_sc_ring;
+   _Atomic uint32_t dc_sc_ring_refs;
+   _Atomic(struct npt_ring *) pipeline_library_ring;
+
+   /*
+    * Multi-ring toggle: per-thread TLS rings for non-DC/SC traffic
+    * AND the shared DC/SC instance ring.  Off => everything funnels
+    * to primary.  Set once in npt_device_create from NPT_PERF_MULTI_RING.
+    */
+   bool multi_ring_enabled;
+
+   struct npt_wrapper_cache wrapper_cache;
+
+   /* Back-buffer public formats (struct npt_bb_format_entry).  Host
+    * object ids are process-wide monotonic and never reused, so an
+    * entry keeps answering correctly after the wrapper that was
+    * created with it is gone; stale entries are harmless and few --
+    * at most one per swapchain (re)creation -- and the list is freed
+    * at device destroy. */
+   mtx_t bb_format_mutex;
+   struct list_head bb_formats;
+
+   /* Win32 event-HANDLE emulation; opaque, defined in npt_event.c. */
+   struct npt_event_state *event;
+
+   /* Set at the start of npt_device_destroy.  See sc_wsi_stop for the
+    * one path that consumes it (skip an INFINITE thread join that can
+    * stall on a server-side-closed X11 connection). */
+   _Atomic bool shutting_down;
+};
+
+/*
+ * Primary-ring size:
+ *   Multi-ring: primary carries only COM_RELEASE_BATCH and stragglers;
+ *   the DC/SC and TLS rings soak up high-volume traffic, so 256 KiB is
+ *   plenty.
+ *   Single-ring: primary IS the whole bus, so 2 MiB to absorb Create
+ *   and Release bursts.  Keeps the direct/indirect threshold
+ *   (buffer_size >> 4) at 128 KiB, large enough that most
+ *   RESOURCE_UPDATE payloads stay on the fast inline path.
+ */
+#define NPT_RING_BUFFER_SIZE_MULTI   (256u * 1024u)
+#define NPT_RING_BUFFER_SIZE_SINGLE  (2u * 1024u * 1024u)
+/* Power-of-two initial; pool doubles on growth and never recycles
+ * slot offsets, so old shmems just stick around. */
+#define NPT_FEEDBACK_POOL_INITIAL_SIZE (16u * 1024u)
+
+/* Cache-line align so neighbouring slots don't false-share between
+ * the host poll thread and guest readers. */
+#define NPT_FEEDBACK_SLOT_ALIGN 64u
+
+/* Same 16 KiB sizing as TLS rings -- DC/SC method dispatches are small
+ * and latency dominates. */
+#define NPT_DC_SC_RING_BUFFER_SIZE   (16u * 1024u)
+#define NPT_DATA_SHMEM_MIN_ALLOC   (64 * 1024)
+/* Map-pool starts large enough to hold a fair working set of dynamic
+ * CB / vertex-buffer Maps without immediately growing.  Doubles on
+ * demand up to whatever the renderer caps us at. */
+#define NPT_MAP_POOL_INITIAL_SIZE  (16u * 1024u * 1024u)
+
+struct npt_device *
+npt_device_create(void);
+
+struct npt_renderer_shmem *
+npt_device_alloc_data(struct npt_device *dev, size_t size, size_t *out_offset);
+
+/*
+ * Allocate a feedback slot (rounded to NPT_FEEDBACK_SLOT_ALIGN).
+ * Caller takes a ref on the returned shmem and passes it through
+ * npt_ring_ensure_shmem_visible before naming its res_id.  NULL return
+ * => caller falls back to the sync wire path.
+ */
+struct npt_renderer_shmem *
+npt_device_alloc_feedback_slot(struct npt_device *dev,
+                               uint32_t slot_size,
+                               uint32_t *out_offset);
+
+/*
+ * Give a query's feedback slot back for reuse, transferring the caller's
+ * shmem ref.  free_seqno is the dev->ring position returned by the
+ * query's unregister; the slot is not handed out again before the host
+ * head passes it.
+ */
+void
+npt_device_free_feedback_slot(struct npt_device *dev,
+                              struct npt_renderer_shmem *shmem,
+                              uint32_t offset, uint32_t slot_size,
+                              uint32_t free_seqno);
+
+/*
+ * Ring for handwritten paths that touch DC state (Map/Unmap, fence
+ * arming, CreateBuffer initial data, ...): the shared DC/SC ring if
+ * lazily created, else primary.  Falls back to primary on the first
+ * setup calls (D3D11CreateDevice) which don't race DC state.
+ */
+struct npt_ring *
+npt_device_method_ring(struct npt_device *dev);
+
+struct npt_ring *
+npt_device_get_pipeline_library_ring(struct npt_device *dev);
+
+/* Hit returns the wrapper with refcount bumped (caller owns the new
+ * ref), miss returns NULL. */
+void *
+npt_device_wrapper_cache_lookup(struct npt_device *dev, uint64_t host_id);
+
+/*
+ * Insert if absent, else bump the existing wrapper's pub_ref and
+ * return it (caller must free its own).  NULL return either way:
+ * `new_wrapper` won the race, OR the existing wrapper is being
+ * destroyed -- in which case *retry_needed is true and the caller
+ * should yield and re-lookup.
+ */
+void *
+npt_device_wrapper_cache_insert_if_absent(struct npt_device *dev,
+                                          uint64_t host_id,
+                                          void *new_wrapper,
+                                          bool *retry_needed);
+
+void
+npt_device_wrapper_cache_remove(struct npt_device *dev, uint64_t host_id);
+
+/* Record / query the public typed format of a typeless-twinned swapchain
+ * back buffer (npt_overrides_d3d11_device.c).  The lookup returns
+ * DXGI_FORMAT_UNKNOWN for any id that is not a recorded back buffer. */
+void
+npt_device_backbuffer_format_add(struct npt_device *dev, uint64_t host_id,
+                                 DXGI_FORMAT format);
+
+DXGI_FORMAT
+npt_device_backbuffer_format(struct npt_device *dev, uint64_t host_id);
+
+/* Liveness check: true iff (host_id -> wrapper) is still mapped in the
+ * device cache.  Used by per-wrapper sibling caches (e.g. swapchain's
+ * buffer_cache) to verify a cached wrapper pointer is still valid
+ * before dropping its ref -- npt_com_destroy's first step is cache_
+ * remove, so any wrapper still in the cache is alive. */
+bool
+npt_device_wrapper_cache_is_live(struct npt_device *dev,
+                                 uint64_t host_id, const void *wrapper);
+
+/* `cb` may call cache_remove on its own entry but must not otherwise
+ * mutate the cache.  Used at device teardown to drain leaked
+ * wrappers' COM refs. */
+typedef void (*npt_wrapper_cache_iter_fn)(uint64_t host_id, void *wrapper,
+                                          void *user_data);
+void
+npt_device_wrapper_cache_foreach(struct npt_device *dev,
+                                 npt_wrapper_cache_iter_fn cb,
+                                 void *user_data);
+
+/*
+ * Refcounted singleton.  Each top-level COM wrapper holds one
+ * acquire-ref (children ride parent-priv_ref coupling instead).
+ * Last release tears down the device.  NULL return = creation
+ * failure; subsequent acquires cannot fail.
+ */
+struct npt_device *
+npt_device_acquire(void);
+
+void
+npt_device_release(void);
+
+bool
+npt_device_is_shutting_down(const struct npt_device *dev);
+
+static inline bool
+npt_device_lost(struct npt_device *dev)
+{
+   return dev && dev->renderer && npt_renderer_is_lost(dev->renderer);
+}
+
+#endif /* NPT_DEVICE_H */

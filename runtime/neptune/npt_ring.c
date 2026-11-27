@@ -1,0 +1,1702 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "npt_ring.h"
+#include "npt_desc_stage.h"
+#include "npt_workaround.h"
+#include "npt_device.h"
+#include "npt_profile.h"
+#include "npt_tls.h"
+#ifdef __WINE__
+#include "nptunix/npt_unixlib.h"
+#endif
+
+#include "util/macros.h"
+#include "util/detect_arch.h"
+#include "util/os_misc.h"
+#ifndef _WIN32
+#include <errno.h>
+#include <sys/resource.h>
+#include "util/os_time.h"
+#endif
+
+static_assert(ATOMIC_INT_LOCK_FREE >= 1 && sizeof(atomic_uint) == 4,
+              "npt_ring requires lock-free 32-bit atomic_uint");
+
+static void
+npt_ring_notify(struct npt_ring *ring);
+
+static void
+npt_ring_yield(void)
+{
+#ifdef __WINE__
+   npt_wine_unix_call(npt_unix_ring_yield, NULL);
+#else
+   thrd_yield();
+#endif
+}
+
+#define NPT_RING_IDLE_TIMEOUT_NS (1000000) /* 1ms */
+/* TLS rings park 10x longer than the primary ring's 1ms idle so
+ * worker-thread traffic doesn't churn the host wakeup path.  +9ms
+ * worst-case first-submit-after-park latency. */
+#define NPT_TLS_RING_IDLE_TIMEOUT_NS (10000000) /* 10ms */
+
+/* The host monitor's heartbeat period; the watchdog's checks are spaced
+ * well beyond it so a healthy host isn't killed. */
+#define NPT_RING_WATCHDOG_REPORT_PERIOD_US (3 * 1000 * 1000)
+
+/* buffer_size >> NPT_RING_DIRECT_ORDER threshold. */
+#define NPT_RING_DIRECT_ORDER 4u
+
+/* Grows on demand. */
+#define NPT_RING_UPLOAD_INITIAL_SIZE (1u << 20)
+
+/* Grows on demand. */
+#define NPT_RING_REPLY_POOL_MIN_SIZE (1u << 20)
+
+/*
+ * Adaptive backoff with watchdog.  After warn_order iters, check the
+ * ring's heartbeat counter (the host stamps it at CREATE_RING and its ring
+ * monitor advances it every NPT_RING_WATCHDOG_REPORT_PERIOD_US); too many
+ * misses = host worker gone.  `ring` may be NULL when the watchdog isn't
+ * wanted (pre-shmem-map paths).
+ */
+static void
+npt_ring_relax(struct npt_ring *ring, uint32_t *iter)
+{
+   /* busy_wait_order=8 (256 yields) hides a virtio-gpu HOST3D blob
+    * page-staleness race: each yield is a scheduler slice for the
+    * kernel to reconcile the guest VMA with the host memfd pages.  A
+    * shorter budget lets reply reads see stale pre-submission bytes. */
+   const uint32_t busy_wait_order = 8;
+   const uint32_t base_sleep_us = 160;
+   /* Warn at iter=4096 (~3.5s slept). */
+   const uint32_t warn_order = 12;
+   const uint32_t max_misses = 3;
+
+   (*iter)++;
+   if (*iter < (1u << busy_wait_order)) {
+      npt_ring_yield();
+   } else {
+      const uint32_t shift = npt_util_last_bit(*iter) - busy_wait_order - 1;
+      npt_relax_sleep_us(base_sleep_us << shift);
+   }
+
+   if (ring && *iter >= (1u << warn_order) &&
+       !(*iter & ((1u << warn_order) - 1))) {
+      const uint32_t status =
+         atomic_load_explicit(ring->status, memory_order_seq_cst);
+      if (status & NPT_RING_STATUS_FATAL_BIT)
+         return;
+      const uint32_t beat = status >> NPT_RING_STATUS_HEARTBEAT_SHIFT;
+      /* The monitor ticks the counter from its own host thread, so it
+       * keeps moving while the ring thread sits in a long command and
+       * stops only when the worker process is gone or frozen.  Checks
+       * here are at least three report periods apart, so a counter that
+       * stands still across max_misses checks is a dead worker: mark the
+       * renderer lost so every wait bails and the runtime removes the
+       * device, instead of waiting forever for a reply nobody will write.
+       * A counter stuck at 0 counts too: it is either a host that never
+       * serviced CREATE_RING or a mapping torn down to the zero page
+       * (WDDM TDR removed the D3DKMT device). */
+      if (beat != ring->heartbeat_seen) {
+         ring->heartbeat_seen = beat;
+         ring->watchdog_misses = 0;
+      } else if (++ring->watchdog_misses >= max_misses) {
+         const uint32_t head =
+            atomic_load_explicit(ring->head, memory_order_acquire);
+         const uint32_t tail =
+            atomic_load_explicit(ring->tail, memory_order_acquire);
+         npt_log("watchdog: ring %llu heartbeat stopped at %u for %u "
+                 "checks, status=0x%x head=%u tail=%u cur=%u is_tls=%d -- "
+                 "host worker gone; marking renderer lost",
+                 (unsigned long long)ring->id, beat, ring->watchdog_misses,
+                 status, head, tail, ring->cur, (int)ring->is_tls_ring);
+         if (ring->renderer)
+            npt_renderer_set_lost(ring->renderer);
+         ring->watchdog_misses = 0;
+      }
+   }
+}
+
+void
+npt_ring_get_layout(size_t buf_size, size_t extra_size,
+                    struct npt_ring_layout *layout)
+{
+   assert(buf_size && npt_util_is_power_of_two_nonzero(buf_size));
+
+   /* Explicit constants instead of alignas for MinGW portability. */
+   layout->head_offset = 0;
+   layout->tail_offset = 64;
+   layout->status_offset = 128;
+   layout->buffer_offset = 192;
+   layout->buffer_size = buf_size;
+   layout->extra_offset = layout->buffer_offset + buf_size;
+   layout->extra_size = extra_size;
+   layout->shmem_size = layout->extra_offset + extra_size;
+}
+
+static inline uint32_t
+npt_ring_load_head(const struct npt_ring *ring)
+{
+   return atomic_load_explicit(ring->head, memory_order_acquire);
+}
+
+static inline void
+npt_ring_store_tail(struct npt_ring *ring)
+{
+   /* Ring shmem is mapped WC (virglrenderer returns
+    * VIRGL_RENDERER_MAP_CACHE_WC for the ring blob), so x86 TSO does
+    * not order the cmd-data stores against the tail store -- without
+    * a drain the consumer can see a new tail value while earlier cmd
+    * bytes are still in the producer's WC store buffer.
+    *
+    * x86: SFENCE drains the WC store buffer, after which a relaxed mov
+    * publishes the tail (it cannot reorder ahead of the SFENCE).  A
+    * seq_cst store lowers to LOCK/MFENCE instead, and on a WC mapping
+    * that MFENCE is far more than the textbook ~30 cycles: it must both
+    * drain the WC buffers and fence for global visibility, so SFENCE is
+    * the cheaper primitive here.
+    *
+    * The GCC/Clang SFENCE builtin is gated on __x86_64__/__i386__, which
+    * the guest's MSVC (cl.exe) toolchain does not define, so MSVC uses the
+    * _mm_sfence() intrinsic (from <intrin.h>, pulled in via windows.h;
+    * same intrinsic family as the __rdtsc/_BitScanReverse used elsewhere).
+    *
+    * ARM64 (and other non-x86): seq_cst lowers to STLR, which is already
+    * cheap and is the correct primitive for ordering Normal Non-cacheable
+    * stores -- keep seq_cst there.
+    *
+    * arm64ec must not take the MSVC x86 branch: MSVC defines _M_X64 for it
+    * (it uses the x64 ABI for source compatibility) while emitting ARM64
+    * code, so that branch would publish the tail with a plain relaxed store
+    * on ARM, where nothing would then order it ahead of the submit path's
+    * later loads.  seq_cst (STLR) publishes it promptly. */
+#if (DETECT_ARCH_X86_64 || DETECT_ARCH_X86) && \
+    __has_builtin(__builtin_ia32_sfence)
+   __builtin_ia32_sfence();
+   atomic_store_explicit(ring->tail, ring->cur, memory_order_relaxed);
+#elif defined(_MSC_VER) && (DETECT_ARCH_X86_64 || DETECT_ARCH_X86)
+   _mm_sfence();
+   atomic_store_explicit(ring->tail, ring->cur, memory_order_relaxed);
+#else
+   atomic_store_explicit(ring->tail, ring->cur, memory_order_seq_cst);
+#endif
+   /* Make the tail globally visible before the submit path goes on: a
+    * host deciding whether to park reads it, and the doorbell rule only
+    * covers work published after that decision (npt_ring_doorbell_locked).
+    * The store buffer is already SFENCE-drained on x86, so this is cheap
+    * there. */
+   atomic_thread_fence(memory_order_seq_cst);
+}
+
+static inline uint32_t
+npt_ring_load_status(const struct npt_ring *ring)
+{
+   /* acquire is enough: the producer side only reads status to test
+    * IDLE / FATAL bits; release-on-write from host pairs with this. */
+   return atomic_load_explicit(ring->status, memory_order_acquire);
+}
+
+static inline bool
+npt_ring_has_space(const struct npt_ring *ring, uint32_t size)
+{
+   const uint32_t head = npt_ring_load_head(ring);
+   return ring->cur + size - head <= ring->buffer_size;
+}
+
+/* A cheap monotonic tick for the doorbell rule, which runs on every
+ * submit.  QueryPerformanceCounter is a ~77 ns syscall under Wine on FEX
+ * (RDTSC: 0.3 ns) and cost a busy recording thread ~10% of Fire Strike
+ * GT1 there, so x86/x64 builds read the TSC, its rate calibrated once
+ * against QPC.  Native arm64 Windows reads QPC in user mode, so keeps it. */
+#if defined(_WIN32) && (DETECT_ARCH_X86_64 || DETECT_ARCH_X86)
+#define NPT_RING_TICKS_TSC 1
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#endif
+
+static inline uint64_t
+npt_ring_ticks(void)
+{
+#if defined(NPT_RING_TICKS_TSC)
+   return __rdtsc();
+#elif defined(_WIN32)
+   LARGE_INTEGER c;
+   QueryPerformanceCounter(&c);
+   return (uint64_t)c.QuadPart;
+#else
+   return (uint64_t)os_time_get_nano();
+#endif
+}
+
+/* npt_ring_ticks() per second. */
+static uint64_t
+npt_ring_tick_hz(void)
+{
+   static uint64_t hz;
+   if (hz)
+      return hz;
+#if defined(NPT_RING_TICKS_TSC)
+   LARGE_INTEGER f, q0, q1;
+   QueryPerformanceFrequency(&f);
+   QueryPerformanceCounter(&q0);
+   const uint64_t t0 = __rdtsc();
+   do {
+      QueryPerformanceCounter(&q1);
+   } while (q1.QuadPart - q0.QuadPart < f.QuadPart / 500); /* 2 ms */
+   const uint64_t t1 = __rdtsc();
+   hz = (t1 - t0) * (uint64_t)f.QuadPart / (uint64_t)(q1.QuadPart - q0.QuadPart);
+#elif defined(_WIN32)
+   LARGE_INTEGER f;
+   QueryPerformanceFrequency(&f);
+   hz = (uint64_t)f.QuadPart;
+#else
+   hz = 1000000000ull;
+#endif
+   return hz;
+}
+
+static void
+npt_ring_request_notify_locked(struct npt_ring *ring);
+
+/* Caller holds ring->lock, after publishing the tail.  The host parks only
+ * after the ring's idle timeout without work, and it saw this ring's
+ * previous submit no earlier than that submit was made, so it can be
+ * parked only if this submit follows the previous one by at least the idle
+ * timeout: ring exactly then.  One doorbell per idle gap, and nothing here
+ * depends on host-written state reaching this side in time. */
+static inline void
+npt_ring_doorbell_locked(struct npt_ring *ring)
+{
+   const uint64_t now = npt_ring_ticks();
+   if (now - ring->doorbell_last_submit >= ring->doorbell_idle_ticks)
+      npt_ring_request_notify_locked(ring);
+   ring->doorbell_last_submit = now;
+}
+
+/* Caller holds ring->lock.  Defer the doorbell to unlock: the escape
+ * ioctl behind npt_ring_notify (and the renderer CS it takes) must not
+ * run under the ring lock on the submit fast path, where waiters spin.
+ * The profile count stays here -- it equals doorbells delivered, since
+ * each pending transition fires exactly one notify (flush or unlock),
+ * and ring->profile is only written under the lock. */
+static void
+npt_ring_request_notify_locked(struct npt_ring *ring)
+{
+   if (ring->notify_pending)
+      return;
+   ring->notify_pending = true;
+   npt_profile_record_notify(&ring->profile);
+}
+
+/* Caller holds ring->lock.  A parked host advances head only after
+ * the doorbell, so deliver a deferred one before any lock-held wait
+ * on host progress. */
+static void
+npt_ring_flush_notify_locked(struct npt_ring *ring)
+{
+   if (ring->notify_pending) {
+      ring->notify_pending = false;
+      npt_ring_notify(ring);
+   }
+}
+
+/* Drop ring->lock, then deliver any deferred doorbell.  Late delivery
+ * is safe: the host re-reads the tail before it parks and takes
+ * ring->mutex to do so, so a doorbell that lands after its decision
+ * still finds it in the wait. */
+static void
+npt_ring_unlock_and_notify(struct npt_ring *ring)
+{
+   const bool notify = ring->notify_pending;
+   ring->notify_pending = false;
+   npt_ring_lock_release(&ring->lock);
+   if (notify)
+      npt_ring_notify(ring);
+}
+
+/* ---------- per-thread staging (npt_ring.h, "Per-thread staging") ---------- */
+
+static NPT_TLS struct npt_ring_stage *npt_tl_stage;
+
+static tss_t npt_stage_key;
+static bool npt_stage_key_ok;
+static _Atomic int npt_stage_key_state;
+
+static void
+npt_ring_stage_flush_locked(struct npt_ring_stage *stage);
+
+static bool
+npt_ring_submit_locked(struct npt_ring *ring, const void *data,
+                       uint32_t size);
+
+/* Thread exit: publish what the thread still holds and hand the stage
+ * over for adoption -- or free it, when the ring went first. */
+static void
+npt_ring_stage_thread_exit(void *data)
+{
+   struct npt_ring_stage *stage = data;
+   npt_ring_lock_acquire(&stage->lock);
+   if (stage->ring) {
+      npt_ring_stage_flush_locked(stage);
+      stage->live = false;
+      npt_ring_lock_release(&stage->lock);
+   } else {
+      npt_ring_lock_release(&stage->lock);
+      free(stage);
+   }
+   npt_tl_stage = NULL;
+}
+
+/* Dynamic unload of the driver: the stage key's destructor is code in this
+ * DLL, and the loader does not drop it with the image -- process exit
+ * would call it after FreeLibrary.  Freeing the key runs the destructor
+ * for every thread's stage now, while the code is still mapped. */
+void
+npt_ring_unload(void)
+{
+   if (!npt_stage_key_ok)
+      return;
+   npt_stage_key_ok = false;
+   tss_delete(npt_stage_key);
+}
+
+static inline npt_ring_stage_ref
+npt_ring_stage_ref_pack(const struct npt_ring_stage *stage, uint64_t epoch)
+{
+   return ((uint64_t)(stage->index + 1) << 48) | epoch;
+}
+
+static inline uint64_t
+npt_ring_stage_ref_epoch(npt_ring_stage_ref ref)
+{
+   return ref & ((1ull << 48) - 1);
+}
+
+static struct npt_ring_stage *
+npt_ring_stage_at(struct npt_ring *ring, uint32_t index)
+{
+   if (index >= atomic_load_explicit(&ring->stage_count, memory_order_acquire))
+      return NULL;
+   return atomic_load_explicit(&ring->stages[index], memory_order_acquire);
+}
+
+static ATTRIBUTE_NOINLINE struct npt_ring_stage *
+npt_ring_stage_get_slow(struct npt_ring *ring, struct npt_ring_stage *stage)
+{
+   if (!ring->staging)
+      return NULL;
+   if (stage) {
+      /* A thread stages on one ring only. */
+      if (stage->ring)
+         return NULL;
+      /* Left over from a destroyed ring: the destroy left it to us. */
+      free(stage);
+      npt_tl_stage = NULL;
+      stage = NULL;
+   }
+
+   NPT_CALL_ONCE(npt_stage_key_state,
+                 npt_stage_key_ok =
+                    tss_create(&npt_stage_key, npt_ring_stage_thread_exit) ==
+                    thrd_success);
+
+   mtx_lock(&ring->stages_mutex);
+   const uint32_t count =
+      atomic_load_explicit(&ring->stage_count, memory_order_relaxed);
+   /* Adopt the stage of a thread that has exited: its index (and so the
+    * bit readers may still hold for it) and epoch carry on, which keeps
+    * every reference to it conservative. */
+   for (uint32_t i = 0; i < count && !stage; i++) {
+      struct npt_ring_stage *old =
+         atomic_load_explicit(&ring->stages[i], memory_order_relaxed);
+      npt_ring_lock_acquire(&old->lock);
+      if (!old->live) {
+         old->live = true;
+         old->last_ref = 0;
+         stage = old;
+      }
+      npt_ring_lock_release(&old->lock);
+   }
+   if (!stage && count < NPT_RING_STAGE_MAX) {
+      stage = malloc(sizeof(*stage));
+      if (stage) {
+         npt_ring_lock_init(&stage->lock);
+         stage->ring = ring;
+         stage->index = count;
+         atomic_store_explicit(&stage->used, 0, memory_order_relaxed);
+         atomic_store_explicit(&stage->epoch, 0, memory_order_relaxed);
+         stage->live = true;
+         stage->last_ref = 0;
+         stage->desc_batch_off = NPT_DESC_BATCH_OFF_NONE;
+         npt_desc_copy_iv_reset(&stage->desc_iv);
+         atomic_store_explicit(&ring->stages[count], stage,
+                               memory_order_release);
+         atomic_store_explicit(&ring->stage_count, count + 1,
+                               memory_order_release);
+      }
+   }
+   mtx_unlock(&ring->stages_mutex);
+
+   if (stage) {
+      npt_tl_stage = stage;
+      if (npt_stage_key_ok)
+         tss_set(npt_stage_key, stage);
+   }
+   return stage;
+}
+
+/* The calling thread's stage on `ring`, created on first use; NULL when
+ * the ring does not stage or the thread cannot get one. */
+static inline struct npt_ring_stage *
+npt_ring_stage_get(struct npt_ring *ring)
+{
+   struct npt_ring_stage *stage = npt_tl_stage;
+   if (likely(stage && stage->ring == ring))
+      return stage;
+   return npt_ring_stage_get_slow(ring, stage);
+}
+
+/* Caller holds stage->lock. */
+static void
+npt_ring_stage_flush_locked(struct npt_ring_stage *stage)
+{
+   const uint32_t used =
+      atomic_load_explicit(&stage->used, memory_order_relaxed);
+   if (!used)
+      return;
+   struct npt_ring *ring = stage->ring;
+   if (ring) {
+      npt_ring_lock_acquire(&ring->lock);
+      npt_ring_submit_locked(ring, stage->buf, used);
+      npt_profile_record_stage_flush(&ring->profile, used);
+      npt_ring_unlock_and_notify(ring);
+   }
+   atomic_store_explicit(&stage->used, 0, memory_order_relaxed);
+   stage->desc_batch_off = NPT_DESC_BATCH_OFF_NONE;
+   npt_desc_copy_iv_reset(&stage->desc_iv);
+   /* Release: a thread that sees the new epoch appends behind the bytes
+    * just published (ring positions are handed out under ring->lock). */
+   atomic_store_explicit(&stage->epoch,
+                         atomic_load_explicit(&stage->epoch,
+                                              memory_order_relaxed) + 1,
+                         memory_order_release);
+}
+
+/* Stage the command; false when it must go straight to the ring. */
+static bool
+npt_ring_stage_append(struct npt_ring *ring, const void *data, uint32_t size)
+{
+   if (size > NPT_RING_STAGE_SIZE)
+      return false;
+   struct npt_ring_stage *stage = npt_ring_stage_get(ring);
+   if (!stage)
+      return false;
+   npt_ring_lock_acquire(&stage->lock);
+   if (unlikely(!stage->ring)) {
+      npt_ring_lock_release(&stage->lock);
+      return false;
+   }
+   uint32_t used = atomic_load_explicit(&stage->used, memory_order_relaxed);
+   if (used + size > NPT_RING_STAGE_SIZE) {
+      npt_ring_stage_flush_locked(stage);
+      used = 0;
+   }
+   memcpy(stage->buf + used, data, size);
+   atomic_store_explicit(&stage->used, used + size, memory_order_release);
+   stage->desc_batch_off = NPT_DESC_BATCH_OFF_NONE;
+   npt_desc_copy_iv_reset(&stage->desc_iv);
+   stage->last_ref = npt_ring_stage_ref_pack(
+      stage, atomic_load_explicit(&stage->epoch, memory_order_relaxed));
+   npt_ring_lock_release(&stage->lock);
+   return true;
+}
+
+/* Profile-only slot key: one count per batch the staging path created,
+ * so a profile window can derive entries per batch without host-side
+ * instrumentation.  Never sent on the wire. */
+#define NPT_DESC_BATCH_CREATED_CMD_TYPE \
+   NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_DESC, 0x8000u)
+
+/* Stage the entry into a DESC_BATCH; false when it must go through the
+ * regular per-call submit.  See npt_ring.h. */
+bool
+npt_ring_stage_append_desc(struct npt_ring *ring, uint32_t kind,
+                           uint64_t device_id, uint32_t heap_type,
+                           uint32_t merge_inc,
+                           const void *entry, uint32_t entry_size)
+{
+   const uint64_t t0 = npt_profile.enabled ? npt_profile_now_ns() : 0;
+   if (kind == NPT_DESC_BATCH_COPY_SIMPLE &&
+       entry_size == sizeof(struct npt_desc_copy_entry)) {
+      /* The host replays a batch as one CopyDescriptors call, so every
+       * entry's ranges must be bounded and internally disjoint.  An
+       * unknown increment or a self-overlapping copy stays per-call. */
+      const struct npt_desc_copy_entry *e = entry;
+      if (!merge_inc)
+         return false;
+      const uint64_t dh = e->dst + (uint64_t)e->num * merge_inc;
+      const uint64_t sh = e->src + (uint64_t)e->num * merge_inc;
+      if (sh > e->dst && e->src < dh)
+         return false;
+   }
+   struct npt_ring_stage *stage = npt_ring_stage_get(ring);
+   if (!stage)
+      return false;
+   npt_ring_lock_acquire(&stage->lock);
+   if (unlikely(!stage->ring)) {
+      npt_ring_lock_release(&stage->lock);
+      return false;
+   }
+   uint32_t used = atomic_load_explicit(&stage->used, memory_order_relaxed);
+   bool created = false;
+   bool done =
+      stage->desc_batch_off != NPT_DESC_BATCH_OFF_NONE &&
+      npt_desc_stage_extend(stage->buf, &used, NPT_RING_STAGE_SIZE,
+                            stage->desc_batch_off, kind, device_id,
+                            heap_type, merge_inc, entry, entry_size,
+                            &stage->desc_iv);
+   if (!done) {
+      if (used + sizeof(struct npt_cmd_desc_batch) + entry_size >
+          NPT_RING_STAGE_SIZE) {
+         npt_ring_stage_flush_locked(stage);
+         used = 0;
+      }
+      done = npt_desc_stage_begin(stage->buf, &used, NPT_RING_STAGE_SIZE,
+                                  kind, device_id, heap_type, entry,
+                                  entry_size, &stage->desc_batch_off);
+      if (done && kind == NPT_DESC_BATCH_COPY_SIMPLE &&
+          entry_size == sizeof(struct npt_desc_copy_entry))
+         npt_desc_copy_iv_set(&stage->desc_iv, entry, merge_inc);
+      else
+         npt_desc_copy_iv_reset(&stage->desc_iv);
+      created = done;
+   }
+   if (done) {
+      atomic_store_explicit(&stage->used, used, memory_order_release);
+      stage->last_ref = npt_ring_stage_ref_pack(
+         stage, atomic_load_explicit(&stage->epoch, memory_order_relaxed));
+   }
+   npt_ring_lock_release(&stage->lock);
+   if (done && t0) {
+      const uint64_t submit_ns = npt_profile_now_ns() - t0;
+      const uint32_t wire_type =
+         NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_DESC,
+                                NPT_TRANSPORT_DESC_BATCH);
+      npt_profile_record_submit(&ring->profile, wire_type, entry_size,
+                                submit_ns, 0, false, false);
+      if (created)
+         npt_profile_record_submit(&ring->profile,
+                                   NPT_DESC_BATCH_CREATED_CMD_TYPE,
+                                   entry_size, 0, 0, false, false);
+      npt_profile_record_thread_submit_ns(submit_ns);
+      npt_profile_maybe_dump(&ring->profile);
+   }
+   return done;
+}
+
+/* Publish the calling thread's own stage on `ring` -- before every
+ * immediate submit, so the thread's wire stream stays in program order. */
+static void
+npt_ring_stage_flush_self(struct npt_ring *ring)
+{
+   struct npt_ring_stage *stage = npt_tl_stage;
+   if (!stage || stage->ring != ring ||
+       !atomic_load_explicit(&stage->used, memory_order_relaxed))
+      return;
+   npt_ring_lock_acquire(&stage->lock);
+   npt_ring_stage_flush_locked(stage);
+   npt_ring_lock_release(&stage->lock);
+}
+
+static void
+npt_ring_stage_flush(struct npt_ring_stage *stage)
+{
+   if (!atomic_load_explicit(&stage->used, memory_order_acquire))
+      return;
+   npt_ring_lock_acquire(&stage->lock);
+   npt_ring_stage_flush_locked(stage);
+   npt_ring_lock_release(&stage->lock);
+}
+
+uint32_t
+npt_ring_stage_self_index(struct npt_ring *ring)
+{
+   struct npt_ring_stage *stage = npt_ring_stage_get(ring);
+   return stage ? stage->index + 1 : 0;
+}
+
+npt_ring_stage_ref
+npt_ring_stage_last_ref(struct npt_ring *ring)
+{
+   struct npt_ring_stage *stage = npt_tl_stage;
+   return stage && stage->ring == ring ? stage->last_ref : 0;
+}
+
+void
+npt_ring_stage_ensure_flushed(struct npt_ring *ring, npt_ring_stage_ref ref)
+{
+   const uint32_t index = npt_ring_stage_ref_index(ref);
+   if (!index)
+      return;
+   struct npt_ring_stage *stage = npt_ring_stage_at(ring, index - 1);
+   if (!stage || stage == npt_tl_stage)
+      return;
+   if (atomic_load_explicit(&stage->epoch, memory_order_acquire) >
+       npt_ring_stage_ref_epoch(ref))
+      return;
+   npt_ring_lock_acquire(&stage->lock);
+   if (atomic_load_explicit(&stage->epoch, memory_order_relaxed) <=
+       npt_ring_stage_ref_epoch(ref))
+      npt_ring_stage_flush_locked(stage);
+   npt_ring_lock_release(&stage->lock);
+}
+
+void
+npt_ring_stage_flush_index(struct npt_ring *ring, uint32_t index)
+{
+   if (!index)
+      return;
+   struct npt_ring_stage *stage = npt_ring_stage_at(ring, index - 1);
+   if (stage && stage != npt_tl_stage)
+      npt_ring_stage_flush(stage);
+}
+
+void
+npt_ring_stage_flush_mask(struct npt_ring *ring, uint64_t mask)
+{
+   for (uint32_t i = 0; mask; i++, mask >>= 1) {
+      if (!(mask & 1))
+         continue;
+      struct npt_ring_stage *stage = npt_ring_stage_at(ring, i);
+      if (stage && stage != npt_tl_stage)
+         npt_ring_stage_flush(stage);
+   }
+}
+
+void
+npt_ring_stage_flush_all(struct npt_ring *ring)
+{
+   const uint32_t count =
+      atomic_load_explicit(&ring->stage_count, memory_order_acquire);
+   for (uint32_t i = 0; i < count; i++) {
+      struct npt_ring_stage *stage =
+         atomic_load_explicit(&ring->stages[i], memory_order_acquire);
+      if (stage)
+         npt_ring_stage_flush(stage);
+   }
+}
+
+/* Ring teardown: detach every stage; a stage whose thread is gone is
+ * freed here, a live one by its thread at exit.  Whatever is still
+ * staged is dropped with the ring. */
+static void
+npt_ring_stages_destroy(struct npt_ring *ring)
+{
+   mtx_lock(&ring->stages_mutex);
+   const uint32_t count =
+      atomic_load_explicit(&ring->stage_count, memory_order_relaxed);
+   for (uint32_t i = 0; i < count; i++) {
+      struct npt_ring_stage *stage =
+         atomic_load_explicit(&ring->stages[i], memory_order_relaxed);
+      npt_ring_lock_acquire(&stage->lock);
+      stage->ring = NULL;
+      atomic_store_explicit(&stage->used, 0, memory_order_relaxed);
+      const bool live = stage->live;
+      npt_ring_lock_release(&stage->lock);
+      if (!live)
+         free(stage);
+      atomic_store_explicit(&ring->stages[i], NULL, memory_order_relaxed);
+   }
+   atomic_store_explicit(&ring->stage_count, 0, memory_order_relaxed);
+   mtx_unlock(&ring->stages_mutex);
+   mtx_destroy(&ring->stages_mutex);
+}
+
+static bool
+npt_ring_wait_space(struct npt_ring *ring, uint32_t size)
+{
+   assert(size <= ring->buffer_size);
+
+   if (likely(npt_ring_has_space(ring, size)))
+      return true;
+
+   /* Full ring + parked host can only converge if the host wakes. */
+   npt_ring_flush_notify_locked(ring);
+
+   /* Wait with adaptive backoff -- raw thrd_yield burns CPU when the
+    * host falls behind. */
+   uint32_t iter = 0;
+   while (!npt_ring_has_space(ring, size)) {
+      if (npt_ring_load_status(ring) & NPT_RING_STATUS_FATAL_BIT)
+         return false;
+      if (ring->renderer && npt_renderer_is_lost(ring->renderer))
+         return false;
+      if (iter && (iter & 0x7fff) == 0) {
+         const uint32_t head =
+            atomic_load_explicit(ring->head, memory_order_acquire);
+         const uint32_t tail =
+            atomic_load_explicit(ring->tail, memory_order_acquire);
+         npt_log("wait_space: ring %llu size=%u head=%u tail=%u cur=%u iter=%u",
+                 (unsigned long long)ring->id, size, head, tail, ring->cur, iter);
+      }
+      npt_ring_relax(ring, &iter);
+   }
+
+   npt_profile_record_full_wait(&ring->profile, iter);
+   return true;
+}
+
+/* Wrap-aware write of `size` bytes from `data` starting at `cur`.
+ * Does NOT advance ring->cur. */
+static void
+npt_ring_write_buffer_at(struct npt_ring *ring, uint32_t cur,
+                         const void *data, uint32_t size)
+{
+   const uint32_t offset = cur & ring->buffer_mask;
+
+   if (offset + size <= ring->buffer_size) {
+      memcpy((uint8_t *)ring->buffer + offset, data, size);
+   } else {
+      const uint32_t s = ring->buffer_size - offset;
+      memcpy((uint8_t *)ring->buffer + offset, data, s);
+      memcpy(ring->buffer, (const uint8_t *)data + s, size - s);
+   }
+}
+
+static void
+npt_ring_write_buffer(struct npt_ring *ring,
+                      const void *data, uint32_t size)
+{
+   npt_ring_write_buffer_at(ring, ring->cur, data, size);
+   ring->cur += size;
+}
+
+/* Caller holds ring->lock. */
+static bool
+npt_ring_submit_locked(struct npt_ring *ring,
+                       const void *data, uint32_t size)
+{
+   if (!npt_ring_wait_space(ring, size))
+      return false;
+   npt_ring_write_buffer(ring, data, size);
+   npt_ring_store_tail(ring);
+
+   const uint32_t status = npt_ring_load_status(ring);
+   if (unlikely(status & NPT_RING_STATUS_FATAL_BIT)) {
+      npt_log("ring fatal error (ring %llu status=0x%x head=%u tail=%u cur=%u is_tls=%d)",
+              (unsigned long long)ring->id, status,
+              atomic_load_explicit(ring->head, memory_order_relaxed),
+              atomic_load_explicit(ring->tail, memory_order_relaxed),
+              ring->cur, (int)ring->is_tls_ring);
+      return false;
+   }
+
+   npt_ring_doorbell_locked(ring);
+
+   return true;
+}
+
+static bool
+npt_ring_submit_dispatch_locked(struct npt_ring *ring, const void *data,
+                                uint32_t size);
+
+void
+npt_ring_send_com_release(struct npt_device *dev, uint64_t host_id)
+{
+   if (!dev || !dev->ring || !host_id)
+      return;
+
+   struct npt_ring *ring = npt_tls_peek_ring(dev);
+   if (!ring)
+      ring = dev->ring;
+
+   /* The last release follows every use of the object in program order,
+    * but a use another thread staged (a list recorded on one thread and
+    * released from another) is not on the ring yet, and the release
+    * would decode ahead of it.  Publish every stage first; the ring
+    * snapshot below is the multi-ring equivalent. */
+   npt_ring_stage_flush_all(ring);
+
+   /* Every other ring's published position rides with the release
+    * (struct npt_cmd_com_release): this thread reads those tails
+    * exactly, the host would read them through its cache with a lag. */
+   struct npt_ring_edge stack_edges[32];
+   struct npt_ring_edge *edges = stack_edges;
+   uint32_t cap = sizeof(stack_edges) / sizeof(stack_edges[0]);
+   uint32_t n = npt_tls_snapshot_ring_tails(dev, ring->id, edges, cap);
+   while (n > cap) {
+      if (edges != stack_edges)
+         free(edges);
+      cap = n;
+      edges = malloc(cap * sizeof(*edges));
+      if (!edges)
+         return;
+      n = npt_tls_snapshot_ring_tails(dev, ring->id, edges, cap);
+   }
+
+   struct npt_cmd_com_release header;
+   memset(&header, 0, sizeof(header));
+   header.header.cmd_type =
+      NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_COM,
+                             NPT_TRANSPORT_COM_RELEASE);
+   header.header.cmd_size =
+      sizeof(header) + n * sizeof(struct npt_cmd_com_release_wait);
+   header.header.object_id = host_id;
+
+   struct npt_cmd_com_release_wait stack_waits[32];
+   struct npt_cmd_com_release_wait *waits = stack_waits;
+   if (n > sizeof(stack_waits) / sizeof(stack_waits[0])) {
+      waits = malloc(n * sizeof(*waits));
+      if (!waits) {
+         if (edges != stack_edges)
+            free(edges);
+         return;
+      }
+   }
+   for (uint32_t i = 0; i < n; i++) {
+      waits[i].ring_id = edges[i].ring_id;
+      waits[i].seqno = edges[i].seqno;
+      waits[i].pad = 0;
+   }
+   npt_ring_submit_raw_with_payload(ring, &header, sizeof(header), waits,
+                                    n * sizeof(*waits), n * sizeof(*waits));
+   if (waits != stack_waits)
+      free(waits);
+   if (edges != stack_edges)
+      free(edges);
+}
+
+void
+npt_ring_send_com_release_immediate(struct npt_device *dev, uint64_t host_id)
+{
+   if (!dev || !dev->ring || !host_id)
+      return;
+
+   struct npt_ring *ring = npt_tls_peek_ring(dev);
+   if (!ring)
+      ring = dev->ring;
+
+   struct npt_cmd_com_release header;
+   memset(&header, 0, sizeof(header));
+   header.header.cmd_type =
+      NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_COM,
+                             NPT_TRANSPORT_COM_RELEASE);
+   header.header.cmd_size = sizeof(header);
+   header.header.object_id = host_id;
+   npt_ring_submit_raw_with_payload(ring, &header, sizeof(header), NULL, 0, 0);
+}
+
+static inline uint64_t
+npt_ring_edge_pack(uint64_t ring_id, uint32_t seqno)
+{
+   assert(ring_id && ring_id <= UINT32_MAX);
+   return (ring_id << 32) | seqno;
+}
+
+/* Lock-free pre-check: true when `ring` was already ordered after
+ * target_id at or beyond seqno. */
+static bool
+npt_ring_edge_covered(const struct npt_ring *ring, uint64_t target_id,
+                      uint32_t seqno)
+{
+   for (uint32_t i = 0; i < NPT_RING_EDGE_SEEN_SLOTS; i++) {
+      const uint64_t e =
+         atomic_load_explicit(&ring->edge_seen[i], memory_order_relaxed);
+      if ((e >> 32) != target_id)
+         continue;
+      return (int32_t)((uint32_t)e - seqno) >= 0;
+   }
+   return false;
+}
+
+/* Caller holds ring->lock. */
+static void
+npt_ring_edge_note_locked(struct npt_ring *ring, uint64_t target_id,
+                          uint32_t seqno)
+{
+   const uint64_t packed = npt_ring_edge_pack(target_id, seqno);
+   for (uint32_t i = 0; i < NPT_RING_EDGE_SEEN_SLOTS; i++) {
+      if ((atomic_load_explicit(&ring->edge_seen[i], memory_order_relaxed) >>
+           32) == target_id) {
+         atomic_store_explicit(&ring->edge_seen[i], packed,
+                               memory_order_relaxed);
+         return;
+      }
+   }
+   /* Evict round-robin: a lost entry only costs a redundant edge. */
+   const uint32_t i = ring->edge_seen_next++ % NPT_RING_EDGE_SEEN_SLOTS;
+   atomic_store_explicit(&ring->edge_seen[i], packed, memory_order_relaxed);
+}
+
+/* Caller holds ring->lock. */
+static void
+npt_ring_order_after_locked(struct npt_ring *ring, uint64_t target_id,
+                            uint32_t seqno)
+{
+   if (target_id == ring->id || npt_ring_edge_covered(ring, target_id, seqno))
+      return;
+
+   struct npt_cmd_wait_peer_ring cmd;
+   memset(&cmd, 0, sizeof(cmd));
+   cmd.header.cmd_type =
+      NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_RING,
+                             NPT_TRANSPORT_RING_WAIT_PEER);
+   cmd.header.cmd_size = sizeof(cmd);
+   cmd.ring_id = target_id;
+   cmd.seqno = seqno;
+   if (npt_ring_submit_locked(ring, &cmd, sizeof(cmd)))
+      npt_ring_edge_note_locked(ring, target_id, seqno);
+}
+
+void
+npt_ring_order_after(struct npt_ring *ring, uint64_t target_id,
+                     uint32_t target_seqno)
+{
+   if (!ring || target_id == ring->id ||
+       npt_ring_edge_covered(ring, target_id, target_seqno))
+      return;
+   npt_ring_lock_acquire(&ring->lock);
+   npt_ring_order_after_locked(ring, target_id, target_seqno);
+   npt_ring_unlock_and_notify(ring);
+}
+
+void
+npt_ring_order_after_ring(struct npt_ring *ring, const struct npt_ring *target,
+                          uint32_t target_seqno)
+{
+   if (target)
+      npt_ring_order_after(ring, target->id, target_seqno);
+}
+
+void
+npt_ring_order_after_edges(struct npt_ring *ring,
+                           const struct npt_ring_edge *edges, uint32_t count)
+{
+   if (!ring || !count)
+      return;
+   bool any = false;
+   for (uint32_t i = 0; i < count && !any; i++) {
+      any = edges[i].ring_id != ring->id &&
+            !npt_ring_edge_covered(ring, edges[i].ring_id, edges[i].seqno);
+   }
+   if (!any)
+      return;
+   npt_ring_lock_acquire(&ring->lock);
+   for (uint32_t i = 0; i < count; i++)
+      npt_ring_order_after_locked(ring, edges[i].ring_id, edges[i].seqno);
+   npt_ring_unlock_and_notify(ring);
+}
+
+void
+npt_ring_order_after_all(struct npt_ring *ring)
+{
+   if (!ring || !ring->device)
+      return;
+
+   struct npt_ring_edge stack_edges[32];
+   struct npt_ring_edge *edges = stack_edges;
+   uint32_t cap = sizeof(stack_edges) / sizeof(stack_edges[0]);
+   uint32_t n = npt_tls_snapshot_ring_tails(ring->device, ring->id, edges, cap);
+   while (n > cap) {
+      /* More rings than the stack buffer holds: size to the count and
+       * snapshot again. */
+      if (edges != stack_edges)
+         free(edges);
+      cap = n;
+      edges = malloc(cap * sizeof(*edges));
+      if (!edges)
+         return;
+      n = npt_tls_snapshot_ring_tails(ring->device, ring->id, edges, cap);
+   }
+   npt_ring_order_after_edges(ring, edges, n);
+   if (edges != stack_edges)
+      free(edges);
+}
+
+NPT_TLS uint64_t npt_ring_kick_count;
+
+static void
+npt_ring_notify(struct npt_ring *ring)
+{
+   npt_ring_kick_count++;
+   volatile uint32_t *doorbell = ring->renderer->doorbell;
+   if (doorbell && ring->id < NPT_DOORBELL_MAX_RINGS) {
+      atomic_thread_fence(memory_order_seq_cst);
+      *doorbell = (uint32_t)ring->id;
+      return;
+   }
+   struct npt_cmd_notify_ring cmd;
+   memset(&cmd, 0, sizeof(cmd));
+   cmd.header.cmd_type = NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_RING,
+                                                NPT_TRANSPORT_RING_NOTIFY);
+   cmd.header.cmd_size = sizeof(cmd);
+   cmd.ring_id = ring->id;
+
+   npt_renderer_submit_cmd(ring->renderer, &cmd, sizeof(cmd));
+}
+
+static inline bool
+npt_ring_seqno_status(const struct npt_ring *ring, uint32_t seqno)
+{
+   /* The int32 wrap-safe comparison is only valid for a half-counter
+    * (~2GB).  A long-lived slot tracker can hold a pending_seqno the
+    * ring has long since pumped past, so the gap exceeds INT32_MAX
+    * and the comparison wraps to "not reached".  Use the physical
+    * invariant (head lags the write pointer by at most buffer_size):
+    * if the unsigned distance from seqno to cur is one buffer's
+    * worth, head has unconditionally passed it. */
+   /* Relaxed read of a non-atomic field: volatile suppresses MSVC's
+    * load-hoisting without requiring full atomic semantics. */
+   const uint32_t cur = *(const volatile uint32_t *)&ring->cur;
+   if ((uint32_t)(cur - seqno) >= ring->buffer_size)
+      return true;
+   return (int32_t)(npt_ring_load_head(ring) - seqno) >= 0;
+}
+
+bool
+npt_ring_seqno_passed(const struct npt_ring *ring, uint32_t seqno)
+{
+   return npt_ring_seqno_status(ring, seqno);
+}
+
+uint32_t
+npt_ring_wait_seqno(struct npt_ring *ring, uint32_t seqno)
+{
+   /* Each yield is a kernel scheduler slice for virtio-gpu page
+    * bookkeeping that reconciles the guest VMA with the host memfd
+    * pages -- without that, reads after head-advance can see stale
+    * bytes. */
+   uint32_t iter = 0;
+   while (!npt_ring_seqno_status(ring, seqno)) {
+      if (npt_ring_load_status(ring) & NPT_RING_STATUS_FATAL_BIT)
+         return iter;
+      if (ring->renderer && npt_renderer_is_lost(ring->renderer))
+         return iter;
+      /* Log once per ~32k iters so a wedged caller's target seqno is
+       * recoverable from the log alongside the ring's own watchdog. */
+      if (iter && (iter & 0x7fff) == 0) {
+         const uint32_t head =
+            atomic_load_explicit(ring->head, memory_order_acquire);
+         const uint32_t tail =
+            atomic_load_explicit(ring->tail, memory_order_acquire);
+         npt_log("wait_seqno: ring %llu target=%u head=%u tail=%u cur=%u iter=%u",
+                 (unsigned long long)ring->id, seqno, head, tail, ring->cur, iter);
+      }
+      npt_ring_relax(ring, &iter);
+   }
+   return iter;
+}
+
+/* Wait for the host to consume past the last EXECUTE on this ring
+ * (i.e. done reading upload_shmem).  Caller holds ring->lock. */
+static void
+npt_ring_wait_upload_drained_locked(struct npt_ring *ring)
+{
+   npt_ring_flush_notify_locked(ring);
+   npt_ring_wait_seqno(ring, ring->upload_horizon_seqno);
+}
+
+/* Caller holds ring->lock.  *out_fresh = a new upload_shmem was
+ * just created => caller must roundtrip before the host consumes
+ * its res_id (same reason as the reply-pool fresh flag). */
+static bool
+npt_ring_upload_reserve_locked(struct npt_ring *ring, uint32_t size,
+                               uint32_t *out_offset, bool *out_fresh)
+{
+   const uint32_t aligned = (size + 7u) & ~7u;
+   *out_fresh = false;
+
+   if (!ring->upload_shmem || aligned > ring->upload_size) {
+      if (ring->upload_shmem) {
+         npt_ring_wait_upload_drained_locked(ring);
+         npt_renderer_shmem_unref(ring->renderer, ring->upload_shmem);
+         ring->upload_shmem = NULL;
+      }
+      uint32_t new_size = ring->upload_size ? ring->upload_size
+                                            : NPT_RING_UPLOAD_INITIAL_SIZE;
+      while (new_size < aligned)
+         new_size <<= 1;
+      ring->upload_shmem = npt_renderer_shmem_create(ring->renderer, new_size);
+      if (!ring->upload_shmem) {
+         ring->upload_size = 0;
+         ring->upload_used = 0;
+         return false;
+      }
+      ring->upload_size = new_size;
+      ring->upload_used = 0;
+      *out_fresh = true;
+   } else if (ring->upload_used + aligned > ring->upload_size) {
+      /* Wrap: wait for indirect commands to retire, then reset. */
+      npt_ring_wait_upload_drained_locked(ring);
+      ring->upload_used = 0;
+   }
+
+   *out_offset = ring->upload_used;
+   ring->upload_used += aligned;
+   return true;
+}
+
+/*
+ * SUBMIT goes via the sync path so it blocks until QEMU has handed
+ * the command to the render server -- which, because the virtqueue
+ * preserves order, happens only after any preceding
+ * RESOURCE_CREATE_BLOB has reached the resource table.  Takes no ring
+ * lock: the wait it pairs with does.
+ *
+ * The submit must be synchronous: the wait must already be satisfied
+ * when the host ring thread reaches it.  An asynchronous submit lets
+ * the ring thread genuinely block in WAIT_VIRTQUEUE_SEQNO -- blocking
+ * EVERY client of that ring -- while the packet carrying the seqno
+ * queues behind the KMD scheduler's bounded set of running commands,
+ * whose completions can themselves need the ring to advance.  Where the
+ * transport already orders the create, the whole roundtrip is skipped
+ * instead (shmem_create_host_visible).
+ */
+static uint64_t
+npt_ring_roundtrip_submit(struct npt_ring *ring)
+{
+   /* acq_rel: a thread minting a later seqno is thereby ordered after
+    * this thread's create submission, which the out-of-order wait
+    * argument in npt_ring_ensure_shmem_visible relies on. */
+   const uint64_t seqno =
+      atomic_fetch_add_explicit(&ring->roundtrip_next, 1,
+                                memory_order_acq_rel) + 1;
+
+   struct npt_cmd_submit_virtqueue_seqno submit_cmd;
+   memset(&submit_cmd, 0, sizeof(submit_cmd));
+   submit_cmd.header.cmd_type =
+      NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_RING,
+                             NPT_TRANSPORT_RING_SUBMIT_VQ_SEQNO);
+   submit_cmd.header.cmd_size = sizeof(submit_cmd);
+   submit_cmd.ring_id = ring->id;
+   submit_cmd.seqno = seqno;
+   npt_renderer_submit_cmd_sync(ring->renderer, &submit_cmd,
+                                sizeof(submit_cmd));
+   return seqno;
+}
+
+/*
+ * WAIT goes on the ring so the ring thread stops before processing the
+ * EXECUTE / SET_REPLY_STREAM that references the fresh res_id.  Caller
+ * holds ring->lock.
+ */
+static void
+npt_ring_roundtrip_wait_locked(struct npt_ring *ring, uint64_t seqno)
+{
+   npt_profile_record_roundtrip(&ring->profile);
+
+   struct npt_cmd_wait_virtqueue_seqno wait_cmd;
+   memset(&wait_cmd, 0, sizeof(wait_cmd));
+   wait_cmd.header.cmd_type =
+      NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_RING,
+                             NPT_TRANSPORT_RING_WAIT_VQ_SEQNO);
+   wait_cmd.header.cmd_size = sizeof(wait_cmd);
+   wait_cmd.ring_id = ring->id;
+   wait_cmd.seqno = seqno;
+   npt_ring_submit_locked(ring, &wait_cmd, sizeof(wait_cmd));
+}
+
+/* A transport that publishes the create to the host before shmem_create
+ * returns has already established what the roundtrip establishes. */
+static inline bool
+npt_ring_needs_create_roundtrip(const struct npt_ring *ring)
+{
+   return !ring->renderer->shmem_create_host_visible;
+}
+
+/* Caller holds ring->lock (upload-shmem growth, mid-reservation). */
+static void
+npt_ring_roundtrip_locked(struct npt_ring *ring)
+{
+   if (!npt_ring_needs_create_roundtrip(ring))
+      return;
+   npt_ring_roundtrip_wait_locked(ring, npt_ring_roundtrip_submit(ring));
+}
+
+/*
+ * Indirect EXECUTE_COMMAND_STREAM: copy bytes to upload_shmem and
+ * place a small reference in the ring.  On fresh upload_shmem, force
+ * a virtqueue-seqno roundtrip so the ring thread sees the
+ * RESOURCE_CREATE_BLOB before it reads our res_id.  Caller holds
+ * ring->lock.
+ */
+static bool
+npt_ring_submit_indirect_locked(struct npt_ring *ring, const void *data,
+                                uint32_t size)
+{
+   uint32_t offset = 0;
+   bool upload_fresh = false;
+   if (!npt_ring_upload_reserve_locked(ring, size, &offset, &upload_fresh))
+      return false;
+
+   memcpy((uint8_t *)ring->upload_shmem->mmap_ptr + offset, data, size);
+
+   if (upload_fresh)
+      npt_ring_roundtrip_locked(ring);
+
+   struct npt_cmd_execute_command_stream cmd;
+   memset(&cmd, 0, sizeof(cmd));
+   cmd.header.cmd_type =
+      NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_RESOURCE,
+                             NPT_TRANSPORT_RESOURCE_EXECUTE_CMD_STREAM);
+   cmd.header.cmd_size = sizeof(cmd);
+   cmd.res_id = ring->upload_shmem->res_id;
+   cmd.offset = offset;
+   cmd.size = size;
+
+   if (!npt_ring_submit_locked(ring, &cmd, sizeof(cmd)))
+      return false;
+
+   /* Once head passes here, bytes through offset+size are reusable. */
+   ring->upload_horizon_seqno = ring->cur;
+   return true;
+}
+
+/* Caller holds ring->lock. */
+static bool
+npt_ring_submit_dispatch_locked(struct npt_ring *ring, const void *data,
+                                uint32_t size)
+{
+   if (size > ring->direct_size)
+      return npt_ring_submit_indirect_locked(ring, data, size);
+   return npt_ring_submit_locked(ring, data, size);
+}
+
+bool
+npt_ring_submit_raw(struct npt_ring *ring, const void *data, uint32_t size)
+{
+   return npt_ring_submit_raw_seqno(ring, data, size, NULL);
+}
+
+/* Direct path twin of npt_ring_submit_locked that takes
+ * [header || payload || padding]. */
+static bool
+npt_ring_submit_locked_split(struct npt_ring *ring,
+                             const void *header, uint32_t header_size,
+                             const void *payload, uint32_t payload_size,
+                             uint32_t payload_padded_size)
+{
+   const uint32_t total = header_size + payload_padded_size;
+   if (!npt_ring_wait_space(ring, total))
+      return false;
+   const uint32_t cur = ring->cur;
+   npt_ring_write_buffer_at(ring, cur,               header,  header_size);
+   if (payload_size)
+      npt_ring_write_buffer_at(ring, cur + header_size, payload, payload_size);
+   ring->cur = cur + total;
+   npt_ring_store_tail(ring);
+
+   const uint32_t status = npt_ring_load_status(ring);
+   if (unlikely(status & NPT_RING_STATUS_FATAL_BIT)) {
+      npt_log("ring fatal error (ring %llu status=0x%x head=%u tail=%u cur=%u is_tls=%d)",
+              (unsigned long long)ring->id, status,
+              atomic_load_explicit(ring->head, memory_order_relaxed),
+              atomic_load_explicit(ring->tail, memory_order_relaxed),
+              ring->cur, (int)ring->is_tls_ring);
+      return false;
+   }
+   npt_ring_doorbell_locked(ring);
+   return true;
+}
+
+/* Indirect path twin of npt_ring_submit_indirect_locked that takes
+ * [header || payload || padding] -- skips the caller-side concatenation
+ * copy. */
+static bool
+npt_ring_submit_indirect_locked_split(struct npt_ring *ring,
+                                      const void *header, uint32_t header_size,
+                                      const void *payload, uint32_t payload_size,
+                                      uint32_t payload_padded_size)
+{
+   const uint32_t total = header_size + payload_padded_size;
+   uint32_t offset = 0;
+   bool upload_fresh = false;
+   if (!npt_ring_upload_reserve_locked(ring, total, &offset, &upload_fresh))
+      return false;
+
+   uint8_t *dst = (uint8_t *)ring->upload_shmem->mmap_ptr + offset;
+   memcpy(dst,               header,  header_size);
+   if (payload_size)
+      memcpy(dst + header_size, payload, payload_size);
+
+   if (upload_fresh)
+      npt_ring_roundtrip_locked(ring);
+
+   struct npt_cmd_execute_command_stream cmd;
+   memset(&cmd, 0, sizeof(cmd));
+   cmd.header.cmd_type =
+      NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_RESOURCE,
+                             NPT_TRANSPORT_RESOURCE_EXECUTE_CMD_STREAM);
+   cmd.header.cmd_size = sizeof(cmd);
+   cmd.res_id = ring->upload_shmem->res_id;
+   cmd.offset = offset;
+   cmd.size = total;
+
+   if (!npt_ring_submit_locked(ring, &cmd, sizeof(cmd)))
+      return false;
+
+   ring->upload_horizon_seqno = ring->cur;
+   return true;
+}
+
+bool
+npt_ring_submit_raw_with_payload(struct npt_ring *ring,
+                                 const void *header, uint32_t header_size,
+                                 const void *payload, uint32_t payload_size,
+                                 uint32_t payload_padded_size)
+{
+   if (!ring || !header || !header_size)
+      return false;
+   if (payload_size && !payload)
+      return false;
+   if (payload_size > payload_padded_size)
+      return false;
+
+   const uint32_t total = header_size + payload_padded_size;
+   npt_ring_stage_flush_self(ring);
+   npt_ring_lock_acquire(&ring->lock);
+   bool ok;
+   if (total > ring->direct_size) {
+      ok = npt_ring_submit_indirect_locked_split(ring, header, header_size,
+                                                 payload, payload_size,
+                                                 payload_padded_size);
+   } else {
+      ok = npt_ring_submit_locked_split(ring, header, header_size,
+                                        payload, payload_size,
+                                        payload_padded_size);
+   }
+   npt_ring_unlock_and_notify(ring);
+   return ok;
+}
+
+void
+npt_ring_ensure_shmem_visible(struct npt_ring *ring,
+                              struct npt_renderer_shmem *shmem)
+{
+   if (!ring || !shmem || !npt_ring_needs_create_roundtrip(ring) ||
+       atomic_load_explicit(&shmem->visible_ring, memory_order_acquire) ==
+          ring->id)
+      return;
+   /* Mint and submit outside ring->lock -- every recording thread takes
+    * that lock for every wire command, and the submit is a kernel
+    * transition.  Seqnos can then enter the ring out of order, which is
+    * sound: a seqno is minted only after its own resource create is
+    * queued on the FIFO control queue, so the host observing ANY seqno
+    * >= mine proves my create reached the resource table. */
+   npt_ring_stage_flush_self(ring);
+   const uint64_t seqno = npt_ring_roundtrip_submit(ring);
+   npt_ring_lock_acquire(&ring->lock);
+   npt_ring_roundtrip_wait_locked(ring, seqno);
+   /* Under the lock, after the WAIT: a thread that sees this id takes
+    * the lock later and so lands behind the WAIT. */
+   atomic_store_explicit(&shmem->visible_ring, ring->id, memory_order_release);
+   npt_ring_unlock_and_notify(ring);
+}
+
+bool
+npt_ring_submit_raw_seqno(struct npt_ring *ring, const void *data,
+                          uint32_t size, uint32_t *out_seqno)
+{
+   if (!ring || !data || !size)
+      return false;
+
+   npt_ring_stage_flush_self(ring);
+   npt_ring_lock_acquire(&ring->lock);
+   const bool ok = npt_ring_submit_dispatch_locked(ring, data, size);
+   if (out_seqno)
+      *out_seqno = ring->cur;
+   npt_ring_unlock_and_notify(ring);
+   return ok;
+}
+
+struct npt_cs_encoder *
+npt_ring_submit_command_init(struct npt_ring *ring,
+                             struct npt_ring_submit_command *submit,
+                             void *cmd_data, size_t cmd_size,
+                             size_t reply_size)
+{
+   (void)ring;
+   submit->cmd_data = cmd_data;
+   submit->cmd_size = cmd_size;
+   submit->reply_size = reply_size;
+   submit->enc.cur = (uint8_t *)cmd_data;
+   submit->enc.end = (uint8_t *)cmd_data + cmd_size;
+   memset(&submit->dec, 0, sizeof(submit->dec));
+   submit->reply_shmem = NULL;
+   submit->reply_offset = 0;
+   submit->seqno = 0;
+   submit->prof_cmd_type = 0;
+   submit->staged = false;
+   return &submit->enc;
+}
+
+void
+npt_ring_submit_command(struct npt_ring *ring,
+                        struct npt_ring_submit_command *submit)
+{
+   if (!submit->cmd_size || !submit->cmd_data)
+      return;
+
+   /* prof_cmd_type stashes cmd_type so get_command_reply can attribute
+    * reply_ns -- sync thunks free cmd_data before the reply arrives. */
+   struct npt_profile_submit_state prof;
+   npt_profile_submit_begin(submit, ring->direct_size, &prof);
+
+   if (submit->staged && !submit->reply_size && ring->staging &&
+       npt_ring_stage_append(ring, submit->cmd_data,
+                             (uint32_t)submit->cmd_size)) {
+      npt_profile_submit_finalize(&ring->profile, &prof);
+      return;
+   }
+
+   /* Immediate: behind everything this thread has staged. */
+   npt_ring_stage_flush_self(ring);
+
+   /* Reply window must be carved BEFORE ring->lock: the pool's growth
+    * path takes its own lock and may call shmem_create. */
+   if (submit->reply_size) {
+      size_t off = 0;
+      submit->reply_shmem = npt_shmem_pool_alloc(
+         ring->renderer, &ring->reply_pool, submit->reply_size, &off);
+      if (!submit->reply_shmem) {
+         npt_log("submit_command: reply pool alloc failed (%zu bytes)",
+                 submit->reply_size);
+         return;
+      }
+      submit->reply_offset = (uint32_t)off;
+      /* The host must know the window's res_id before the ring thread
+       * decodes SET_REPLY_STREAM, or the ring goes fatal. */
+      npt_ring_ensure_shmem_visible(ring, submit->reply_shmem);
+   }
+
+   npt_ring_lock_acquire(&ring->lock);
+
+   if (submit->reply_size) {
+      struct npt_cmd_set_reply_stream set_cmd;
+      memset(&set_cmd, 0, sizeof(set_cmd));
+      set_cmd.header.cmd_type =
+         NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_CORE,
+                                NPT_TRANSPORT_CORE_SET_REPLY_STREAM);
+      set_cmd.header.cmd_size = sizeof(set_cmd);
+      set_cmd.res_id = submit->reply_shmem->res_id;
+      set_cmd.offset = submit->reply_offset;
+      set_cmd.size = (uint32_t)submit->reply_size;
+      npt_ring_submit_locked(ring, &set_cmd, sizeof(set_cmd));
+   }
+
+   /* SET_REPLY + (EXECUTE_)CMD stay back-to-back under ring->lock,
+    * so the host writes its reply into our window before any peer
+    * SET_REPLY can re-target the stream. */
+   if (!npt_ring_submit_dispatch_locked(ring, submit->cmd_data,
+                                        (uint32_t)submit->cmd_size)) {
+      npt_ring_unlock_and_notify(ring);
+      if (submit->reply_shmem) {
+         npt_renderer_shmem_unref(ring->renderer, submit->reply_shmem);
+         submit->reply_shmem = NULL;
+      }
+      return;
+   }
+
+   submit->seqno = ring->cur;
+
+   npt_ring_unlock_and_notify(ring);
+
+   npt_profile_submit_finalize(&ring->profile, &prof);
+}
+
+struct npt_cs_decoder *
+npt_ring_get_command_reply(struct npt_ring *ring,
+                           struct npt_ring_submit_command *submit)
+{
+   if (!submit->reply_size)
+      return NULL;
+
+   if (!submit->reply_shmem)
+      return NULL;
+
+   const bool prof_enabled = npt_profile_enabled();
+   const uint64_t prof_t0 = prof_enabled ? npt_profile_now_ns() : 0;
+   const bool prof_was_ready =
+      prof_enabled && npt_ring_seqno_status(ring, submit->seqno);
+   const uint32_t wait_iters = npt_ring_wait_seqno(ring, submit->seqno);
+   if (prof_enabled) {
+      const uint64_t prof_wait_ns = npt_profile_now_ns() - prof_t0;
+      ring->profile.total_reply_ns += prof_wait_ns;
+      if (!prof_was_ready)
+         npt_profile_record_reply_wait(&ring->profile, wait_iters);
+      /* prof_cmd_type was captured at submit; sync thunks free
+       * cmd_data before this runs (would be UAF). */
+      npt_profile_record_reply_ns(submit->prof_cmd_type, prof_wait_ns);
+      npt_profile_record_thread_reply_ns(prof_wait_ns);
+   }
+   if (npt_ring_load_status(ring) & NPT_RING_STATUS_FATAL_BIT) {
+      npt_log("ring fatal while waiting for reply");
+      return NULL;
+   }
+   if (ring->renderer && npt_renderer_is_lost(ring->renderer))
+      return NULL;
+
+   const uint8_t *reply_base = (const uint8_t *)submit->reply_shmem->mmap_ptr
+                               + submit->reply_offset;
+   submit->dec.cur = reply_base;
+   submit->dec.end = reply_base + submit->reply_size;
+   return &submit->dec;
+}
+
+void
+npt_ring_free_command_reply(struct npt_ring *ring,
+                            struct npt_ring_submit_command *submit)
+{
+   npt_cs_decoder_fini_temp_pool(&submit->dec);
+   submit->dec.cur = NULL;
+   submit->dec.end = NULL;
+
+   if (submit->reply_shmem) {
+      npt_renderer_shmem_unref(ring->renderer, submit->reply_shmem);
+      submit->reply_shmem = NULL;
+   }
+}
+
+struct npt_ring *
+npt_ring_create(struct npt_device *device,
+                const struct npt_ring_layout *layout,
+                uint64_t ring_id,
+                bool is_tls_ring)
+{
+   struct npt_ring *ring = npt_alloc(sizeof(*ring));
+   if (!ring)
+      return NULL;
+
+   struct npt_renderer *renderer = device->renderer;
+   ring->id = ring_id;
+   ring->renderer = renderer;
+   ring->device = device;
+   ring->is_tls_ring = is_tls_ring;
+   list_inithead(&ring->instance_head);
+
+   ring->shmem = npt_renderer_shmem_create(renderer, layout->shmem_size);
+   if (!ring->shmem) {
+      free(ring);
+      return NULL;
+   }
+
+   uint8_t *base = ring->shmem->mmap_ptr;
+   ring->head = (volatile atomic_uint *)(base + layout->head_offset);
+   ring->tail = (volatile atomic_uint *)(base + layout->tail_offset);
+   ring->status = (volatile atomic_uint *)(base + layout->status_offset);
+   /* Host writes the backend workaround-flags word here once at ring create. */
+   ring->wa_word = (const volatile atomic_uint *)(base + NPT_RING_WORKAROUND_OFFSET);
+   ring->buffer = base + layout->buffer_offset;
+   ring->extra = base + layout->extra_offset;
+
+   ring->buffer_size = layout->buffer_size;
+   ring->buffer_mask = layout->buffer_size - 1;
+   ring->cur = 0;
+   ring->direct_size = layout->buffer_size >> NPT_RING_DIRECT_ORDER;
+   assert(ring->direct_size);
+
+   atomic_store_explicit((volatile atomic_uint *)ring->head, 0, memory_order_relaxed);
+   atomic_store_explicit(ring->tail, 0, memory_order_relaxed);
+   atomic_store_explicit(ring->status, 0, memory_order_relaxed);
+
+   npt_ring_lock_init(&ring->lock);
+   mtx_init(&ring->stages_mutex, mtx_plain);
+
+   for (uint32_t i = 0; i < NPT_RING_EDGE_SEEN_SLOTS; i++)
+      atomic_store_explicit(&ring->edge_seen[i], 0, memory_order_relaxed);
+   ring->edge_seen_next = 0;
+
+   npt_shmem_pool_init(&ring->reply_pool, NPT_RING_REPLY_POOL_MIN_SIZE);
+
+   ring->upload_shmem = NULL;
+   ring->upload_size = 0;
+   ring->upload_used = 0;
+   ring->upload_horizon_seqno = 0;
+
+   npt_profile_register_ring(ring);
+
+   struct npt_cmd_create_ring create_cmd;
+   memset(&create_cmd, 0, sizeof(create_cmd));
+   create_cmd.header.cmd_type = NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_RING,
+                                                       NPT_TRANSPORT_RING_CREATE);
+   create_cmd.header.cmd_size = sizeof(create_cmd);
+   create_cmd.ring_id = ring_id;
+   create_cmd.res_id = ring->shmem->res_id;
+   create_cmd.head_offset = layout->head_offset;
+   create_cmd.tail_offset = layout->tail_offset;
+   create_cmd.status_offset = layout->status_offset;
+   create_cmd.workaround_offset = NPT_RING_WORKAROUND_OFFSET;
+   create_cmd.buffer_offset = layout->buffer_offset;
+   create_cmd.buffer_size = layout->buffer_size;
+   create_cmd.extra_offset = layout->extra_offset;
+   create_cmd.extra_size = layout->extra_size;
+   create_cmd.idle_timeout = is_tls_ring
+                                ? NPT_TLS_RING_IDLE_TIMEOUT_NS
+                                : NPT_RING_IDLE_TIMEOUT_NS;
+   /* 10% early: a tick-rate error may cost a doorbell, never miss one. */
+   ring->doorbell_idle_ticks =
+      create_cmd.idle_timeout / 1000 * npt_ring_tick_hz() / 1000000 * 9 / 10;
+   ring->doorbell_last_submit = 0;
+   /* Monitor every ring so the guest watchdog covers each one. */
+   create_cmd.monitor_report_period_us = NPT_RING_WATCHDOG_REPORT_PERIOD_US;
+
+   /* Forward priority so the host doesn't starve under elevated
+    * guest foreground load.  Win32 needs a different API. */
+#if !defined(_WIN32)
+   errno = 0;
+   const int prio = getpriority(PRIO_PROCESS, 0);
+   if (!(prio == -1 && errno)) {
+      create_cmd.priority_valid = 1;
+      create_cmd.priority = prio;
+   }
+#endif
+
+   /* TLS rings use SYNC so the ring thread is polling before the
+    * caller can submit; primary stays async (device init masks the
+    * latency). */
+   if (is_tls_ring)
+      npt_renderer_submit_cmd_sync(renderer, &create_cmd, sizeof(create_cmd));
+   else
+      npt_renderer_submit_cmd(renderer, &create_cmd, sizeof(create_cmd));
+
+   return ring;
+}
+
+void
+npt_ring_destroy(struct npt_ring *ring)
+{
+   if (!ring)
+      return;
+
+   /*
+    * DESTROY_RING is synchronous via the renderer (not the ring) so
+    * a ring stop-command isn't asked to wait on its own thread.  The
+    * sync ensures the host has stopped reading the shmem before we
+    * unref it.
+    */
+   if (ring->shmem) {
+      struct npt_cmd_destroy_ring cmd;
+      memset(&cmd, 0, sizeof(cmd));
+      cmd.header.cmd_type = NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_RING,
+                                                   NPT_TRANSPORT_RING_DESTROY);
+      cmd.header.cmd_size = sizeof(cmd);
+      cmd.ring_id = ring->id;
+      npt_renderer_submit_cmd_sync(ring->renderer, &cmd, sizeof(cmd));
+
+      npt_renderer_shmem_unref(ring->renderer, ring->shmem);
+   }
+   if (ring->upload_shmem)
+      npt_renderer_shmem_unref(ring->renderer, ring->upload_shmem);
+   npt_shmem_pool_fini(ring->renderer, &ring->reply_pool);
+   npt_profile_unregister_ring(ring);
+   npt_ring_stages_destroy(ring);
+   free(ring);
+}

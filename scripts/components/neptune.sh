@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the x86-64 and ARM64 Wine drivers and unixlibs from the same Mesa tree.
+# Build the x86-64 and ARM64 Wine drivers and unixlibs from Neptune and the official Mesa utility library.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/lib/common.sh"
 
@@ -17,19 +17,18 @@ ngx_expected_exports() {
 }
 
 NAME=neptune
-SRC="$ROOT/../virtio-win-mesa"
+source "$ROOT/scripts/lib/mesa-source.sh"
+NEPTUNE_SRC="$ROOT/runtime/neptune"
 OUTDIR="$OUT/$NAME"
 DOCKERFILE="$ROOT/scripts/containers/neptune.Dockerfile"
-git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1 || die "missing virtio-win-mesa checkout"
-SOURCE_INPUT="$(git_state_digest "$SRC")"
-SOURCE_COMMIT="$(git -C "$SRC" rev-parse HEAD)"
+SOURCE_INPUT="$(cd "$NEPTUNE_SRC" && find . -type f ! -name '.DS_Store' ! -name '*.pyc' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')"
 read -r TOOLCHAIN_URL TOOLCHAIN_SHA < <(python3 - "$ROOT/deps.lock.json" <<'PY'
 import json, sys
 tool = json.load(open(sys.argv[1]))['neptune_toolchain']
 print(tool['url'], tool['sha256'])
 PY
 )
-NGX_CERT="$SRC/src/virtio/neptune/ngx/signing/brinewell-ngx-v1.pem"
+NGX_CERT="$NEPTUNE_SRC/ngx/signing/brinewell-ngx-v1.pem"
 NGX_SIGNING_DIR="${BRINEWELL_NGX_SIGNING_DIR:-$HOME/.config/brinewell-signing/ngx-v1}"
 NGX_SIGN_RECIPE=1
 NGX_CERT_SHA256="$(openssl x509 -in "$NGX_CERT" -outform DER | shasum -a 256 | awk '{print $1}')"
@@ -53,13 +52,14 @@ if [[ "$NGX_SIGN_MODE" == signed ]]; then
         || die "$NGX_SIGNING_DIR/private.pem has insecure permissions $key_perm (want 600)"
     NGX_SIGNER_VERSION="$(osslsigncode --version | head -1)"
 fi
-INPUT="$(input_digest "$NAME" source "$SOURCE_INPUT" \
+INPUT="$(input_digest "$NAME" source "$SOURCE_INPUT" mesa "$MESA_SHA256" \
     recipe "$(sha256_file "$0")" builder "$(sha256_file "$DOCKERFILE")" \
     toolchain "$TOOLCHAIN_SHA" target x86_64-and-arm64-wine \
     ngx_sign_mode "$NGX_SIGN_MODE" ngx_cert "$NGX_CERT_SHA256" \
     ngx_sign_recipe "$NGX_SIGN_RECIPE" ngx_signer "$NGX_SIGNER_VERSION")"
 if component_should_reuse "$NAME" "$INPUT" "$OUTDIR/root.tar"; then exit 0; fi
 
+ensure_mesa_source
 require_builder
 ARCHIVE="$CACHE/${TOOLCHAIN_URL##*/}"
 fetch_verified "$TOOLCHAIN_URL" "$ARCHIVE" "$TOOLCHAIN_SHA"
@@ -74,10 +74,9 @@ if ! builder image exists "$IMAGE"; then
 fi
 
 rm -rf "$OUTDIR"
-mkdir -p "$OUTDIR/src" "$OUTDIR/root/usr/lib/brinewell/neptune"
-rsync -a --exclude .git "$SRC/" "$OUTDIR/src/"
+mkdir -p "$OUTDIR/root/usr/lib/brinewell/neptune"
 builder run --rm -i \
-    -v "$OUTDIR/src:/src:ro" -v "$TOOLCHAIN:/toolchain:ro" \
+    -v "$NEPTUNE_SRC:/neptune:ro" -v "$MESA_SRC:/project/subprojects/mesa:ro" -v "$TOOLCHAIN:/toolchain:ro" \
     -v "$OUTDIR:/out:rw" "$IMAGE" bash -s <<'BUILD'
 set -euo pipefail
 export PATH="/toolchain/bin:$PATH"
@@ -96,6 +95,7 @@ ngx_expected_exports() {
 # Stage the build on the guest-local disk: virtio-fs timestamp conversion can
 # transiently report host times a few milliseconds ahead, which meson rejects
 # as clock skew. /out is only used for the finished payload.
+cp -a /neptune/. /project/
 payload=/out/root/usr/lib/brinewell/neptune
 build_wine() {
     local pe_target="$1" arch="$2" unix_cc="$3" unix_target="$4"
@@ -117,29 +117,38 @@ endian = 'little'
 [properties]
 needs_exe_wrapper = true
 CROSS
-    meson setup "$build" /src --cross-file /tmp/windows.cross \
+    if [[ $pe_target == arm64ec ]]; then
+        # llvm-mingw advertises both x86-64 and Arm64EC. Mesa's utility code
+        # recognizes the Microsoft Arm64EC spelling for the native ISA.
+        cat >> /tmp/windows.cross <<'CROSS'
+[built-in options]
+c_args = ['-I/project/subprojects/mesa/src', '-include', '/project/llvm-mingw-arm64ec.h']
+cpp_args = ['-I/project/subprojects/mesa/src', '-include', '/project/llvm-mingw-arm64ec.h']
+CROSS
+    fi
+    meson setup "$build" /project --wrap-mode=nodownload --cross-file /tmp/windows.cross \
     --buildtype=release -Db_ndebug=true \
-    -Dneptune=true -Dnpt_wine=true -Dnpt_umd=off \
-    -Dplatforms=windows -Dgallium-drivers=[] -Dvulkan-drivers=[] \
-    -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
-    -Degl=disabled -Dgbm=disabled -Dglx=disabled -Dglvnd=disabled \
-    -Dllvm=disabled -Dbuild-tests=false -Dvideo-codecs= -Dtools= \
-    -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
-    -Dshader-cache=disabled -Dxmlconfig=disabled -Dexpat=disabled \
-    -Dzstd=disabled -Dzlib=disabled -Ddisplay-info=disabled
+    -Dnpt_wine=true -Dnpt_umd=off \
+    -Dmesa:platforms=windows -Dmesa:gallium-drivers=[] -Dmesa:vulkan-drivers=[] \
+    -Dmesa:opengl=false -Dmesa:gles1=disabled -Dmesa:gles2=disabled \
+    -Dmesa:egl=disabled -Dmesa:gbm=disabled -Dmesa:glx=disabled -Dmesa:glvnd=disabled \
+    -Dmesa:llvm=disabled -Dmesa:build-tests=false -Dmesa:video-codecs= -Dmesa:tools= \
+    -Dmesa:valgrind=disabled -Dmesa:libunwind=disabled -Dmesa:lmsensors=disabled \
+    -Dmesa:shader-cache=disabled -Dmesa:xmlconfig=disabled -Dmesa:expat=disabled \
+    -Dmesa:zstd=disabled -Dmesa:zlib=disabled -Dmesa:display-info=disabled
     local -a ninja_targets=(
-        src/virtio/neptune/d3d11.dll src/virtio/neptune/d3d12.dll
-        src/virtio/neptune/dxgi.dll src/virtio/neptune/d3d10core.dll
-        src/virtio/neptune/nptunix/nptunix.dll)
+        d3d11.dll d3d12.dll
+        dxgi.dll d3d10core.dll
+        nptunix/nptunix.dll)
     # The opt-in NGX shims are x86-64 PE only; arm64ec targets do not exist.
     if [[ $pe_target == x86_64 ]]; then
-        ninja_targets+=(src/virtio/neptune/nvngx.dll
-            src/virtio/neptune/nvapi64.dll)
+        ninja_targets+=(nvngx.dll
+            nvapi64.dll)
     fi
     ninja -C "$build" -j3 "${ninja_targets[@]}"
     mkdir -p "$payload/$arch-windows" "$payload/$arch-unix"
-    cp "$build/src/virtio/neptune/"{d3d11,d3d12,dxgi,d3d10core}.dll \
-        "$build/src/virtio/neptune/nptunix/nptunix.dll" "$payload/$arch-windows/"
+    cp "$build/"{d3d11,d3d12,dxgi,d3d10core}.dll \
+        "$build/nptunix/nptunix.dll" "$payload/$arch-windows/"
     local dll expected
     for dll in d3d10core d3d11; do
         llvm-readobj --coff-exports "$payload/$arch-windows/$dll.dll" | awk '
@@ -178,7 +187,7 @@ CROSS
         return 1
     fi
     if [[ $pe_target == x86_64 ]]; then
-        cp "$build/src/virtio/neptune/"{nvngx,nvapi64}.dll \
+        cp "$build/"{nvngx,nvapi64}.dll \
             "$payload/$arch-windows/"
         llvm-readobj --coff-exports "$payload/$arch-windows/nvngx.dll" \
             | awk '$1 == "Name:" { print $2 }' | LC_ALL=C sort > /tmp/nvngx-exports.txt
@@ -217,14 +226,14 @@ CROSS
         done
     fi
 
-    local unix=/src/src/virtio/neptune/nptunix
+    local unix=/project/nptunix
     local unix_flags
     unix_flags=$(PKG_CONFIG_LIBDIR="/usr/lib/$unix_target/pkgconfig:/usr/share/pkgconfig" \
         pkg-config --cflags --libs xcb xcb-dri3 xcb-present libdrm)
     local -a flags
     read -r -a flags <<< "$unix_flags"
     "$unix_cc" -std=gnu11 -O2 -fPIC -shared \
-        -I/src/include "$unix/npt_unix.c" "$unix/npt_unix_wsi.c" \
+        -I/project/subprojects/mesa/include "$unix/npt_unix.c" "$unix/npt_unix_wsi.c" \
         "$unix/npt_unix_virtgpu.c" "$unix/npt_display_drm.c" \
         -Wl,-soname,nptunix.so -Wl,--no-undefined \
         "${flags[@]}" -pthread -o "$payload/$arch-unix/nptunix.so"
@@ -282,7 +291,7 @@ if [[ "$NGX_SIGN_MODE" == signed ]]; then
     trap - EXIT
 fi
 
-python3 - "$OUTDIR/root/usr/lib/brinewell/neptune" "$SOURCE_COMMIT" "$SOURCE_INPUT" "$TOOLCHAIN_SHA" "$INPUT" "$NGX_SIGN_MODE" "$NGX_CERT_SHA256" <<'PY'
+python3 - "$OUTDIR/root/usr/lib/brinewell/neptune" "$MESA_COMMIT" "$SOURCE_INPUT" "$TOOLCHAIN_SHA" "$INPUT" "$NGX_SIGN_MODE" "$NGX_CERT_SHA256" <<'PY'
 import hashlib, json, struct, sys
 from pathlib import Path
 root = Path(sys.argv[1])
@@ -306,6 +315,7 @@ for arch, elf_machine in [('x86_64', 62), ('aarch64', 183)]:
     assert data[:6] == b'\x7fELF\x02\x01' and struct.unpack_from('<H', data, 18)[0] == elf_machine, relative
     files[relative] = hashlib.sha256(data).hexdigest()
 manifest = {'schema': 1, 'source_commit': sys.argv[2], 'source_sha256': sys.argv[3],
+            'mesa_commit': sys.argv[2], 'neptune_sha256': sys.argv[3],
             'toolchain_sha256': sys.argv[4], 'build_input': sys.argv[5],
             'ngx_signing': {'mode': sys.argv[6], 'cert_sha256': sys.argv[7]}, 'files': files}
 (root / 'payload.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')

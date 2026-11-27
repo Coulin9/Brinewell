@@ -362,7 +362,7 @@ macOS host (Apple Silicon)                         SteamOS guest (ARM64)
 │      ├─ virtio-gpu ─ virglrenderer      │virtio  │  Neptune payload · MangoApp      │
 │      │   ├─ Venus → KosmicKrisp         │        │ Steam → Proton + FEX             │
 │      │   └─ Neptune render workers      │        │  └─ Neptune d3d11/d3d12/dxgi DLLs│
-│      │       ├─ d3dmetal-native (x86-64)│        │     (from virtio-win-mesa)       │
+│      │       ├─ d3dmetal-native (x86-64)│        │     (from runtime/neptune)       │
 │      │       │   └─ D3DMetal.framework  │        └──────────────────────────────────┘
 │      │       └─ Mullion (arm64)         │
 │      └─ gvproxy (network)               │
@@ -391,6 +391,10 @@ bounded CPU frame pool backed by IOSurface.
 Pinned third-party sources and releases in [`deps.lock.json`](deps.lock.json) are
 downloaded on demand and verified by SHA-256.
 
+Host KosmicKrisp and guest Venus/Zink build from the same official Mesa source
+tree at `.build/out/kosmicrisp/src/`. Neptune's guest code lives in
+[`runtime/neptune/`](runtime/neptune/) and uses that Mesa release for its build.
+
 ### Workspace layout
 
 Brinewell builds several components from sibling checkouts on the `steamos-d3dmetal`
@@ -401,7 +405,6 @@ workspace/
 ├── Brinewell/         this repository
 ├── libkrun/           https://github.com/Coulin9/libkrun
 ├── virglrenderer/     https://github.com/Coulin9/virglrenderer
-├── virtio-win-mesa/   https://github.com/Coulin9/mesa
 ├── d3dmetal-native/   https://github.com/Coulin9/d3dmetal-native
 ├── Mullion/           https://github.com/Coulin9/mullion
 ├── neptune-protocol/  https://github.com/Coulin9/neptune-protocol (protocol generator, optional)
@@ -412,7 +415,6 @@ workspace/
 mkdir workspace && cd workspace
 git clone https://github.com/Coulin9/libkrun.git -b steamos-d3dmetal
 git clone https://github.com/Coulin9/virglrenderer.git -b steamos-d3dmetal
-git clone https://github.com/Coulin9/mesa.git virtio-win-mesa -b steamos-d3dmetal
 git clone https://github.com/Coulin9/d3dmetal-native.git -b steamos-d3dmetal
 git clone https://github.com/Coulin9/mullion.git Mullion -b steamos-d3dmetal
 git clone https://github.com/Coulin9/Brinewell.git -b steamos-d3dmetal
@@ -458,14 +460,14 @@ contains `payload.json`, so a Neptune change applies on the next game launch.
 | gvproxy | v0.8.9 + `runtime/network` egress policy | `gvproxy` |
 | macmon | vladkens/macmon v0.11.0 release | host telemetry sampler |
 | initramfs | busybox-static, dosfstools, e2fsprogs, btrfs-progs + `runtime/initramfs/init` | `initramfs.cpio.gz` |
-| mesa | `../virtio-win-mesa` (Mesa 26.3 base, `-Dneptune=false`) | guest Mesa in layer |
+| mesa | same official Mesa release as KosmicKrisp | guest Venus and Zink in the layer |
 | agent | `runtime/guest/agent` | `brinewell-agent` |
 | uu-runtime | pinned FEX + dedicated network tools | UU runtime in layer |
 | fex-eac | StonkGuy/FEX `eac-2610.5`, Steam mode, tuned for `apple-m1` | EAC-capable FEX for Steam's FEX-Emu tool |
 | mangoapp | MangoHud v0.8.4 + `runtime/patches/mangohud` | guest `mangoapp` |
 | guest-integration | `runtime/guest/rootfs` | units/scripts in layer |
 | neptune-probe | `runtime/guest/tools`, static aarch64 | `brinewell-api-probe`, `brinewell-gpu-probe` |
-| neptune | `../virtio-win-mesa`, pinned llvm-mingw + x86-64 Linux cross toolchain | x86-64 Wine DLLs, `nptunix.so`, `payload.json` |
+| neptune | `runtime/neptune/`, official Mesa, pinned llvm-mingw and Linux toolchains | x86-64 and ARM64EC Wine DLLs, x86-64 and AArch64 `nptunix.so`, `payload.json` |
 | layer | guest artifacts above | `brinewell-layer.img` (EROFS, lz4) |
 | swift | `Sources/` | `Brinewell`, `brinewell-vm`, `brinewell-diagnostics` |
 

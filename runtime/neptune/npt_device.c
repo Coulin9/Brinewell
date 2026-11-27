@@ -1,0 +1,784 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "npt_device.h"
+#include "npt_com.h"
+#include "npt_dispatch.h"
+#include "npt_env.h"
+#include "npt_event.h"
+#include "npt_tls.h"
+#include "npt_workaround.h"
+#include "npt_ring.h"
+
+#include <inttypes.h>
+#include <string.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+#if defined(__WINE__)
+#include "nptunix/npt_unixlib.h"
+#endif
+
+/* A query feedback slot waiting for reuse (dev->feedback_free). */
+struct npt_feedback_free_slot {
+   struct list_head head;
+   struct npt_renderer_shmem *shmem;
+   uint32_t offset;
+   uint32_t slot_size;
+   uint32_t free_seqno;
+};
+
+static inline uint32_t
+npt_wrapper_cache_hash(uint64_t host_id)
+{
+   return (uint32_t)((host_id * 0x9E3779B97F4A7C15ull) >> 32) &
+          (NPT_WRAPPER_CACHE_BUCKETS - 1);
+}
+
+static void
+npt_wrapper_cache_init(struct npt_wrapper_cache *c)
+{
+   memset(c, 0, sizeof(*c));
+   mtx_init(&c->mutex, mtx_plain);
+}
+
+static void
+npt_wrapper_cache_fini(struct npt_wrapper_cache *c)
+{
+   /* The device-destroy drain should have emptied every chain; free
+    * defensively in case of a teardown race. */
+   for (uint32_t i = 0; i < NPT_WRAPPER_CACHE_BUCKETS; i++) {
+      struct npt_wrapper_cache_entry *e = c->buckets[i];
+      while (e) {
+         struct npt_wrapper_cache_entry *next = e->next;
+         free(e);
+         e = next;
+      }
+      c->buckets[i] = NULL;
+   }
+   c->count = 0;
+   mtx_destroy(&c->mutex);
+}
+
+/* Take a public ref on a cached wrapper.  A wrapper whose public count
+ * has drained stays live while private holds remain (children holding
+ * their parent, or a Release that has not yet dropped its self hold),
+ * and is handed out again: first a private hold, taken only from a
+ * nonzero count not marked NPT_PRIV_REF_DYING, then the public ref, so
+ * the private hold becomes the 0->1 self hold npt_com_default_addref
+ * would take.  Once a final release has brought priv_ref to zero, or
+ * npt_com_destroy has marked it, the wrapper is never handed out again.
+ * The cache mutex, which npt_com_destroy's cache_remove also takes,
+ * keeps the wrapper from being freed meanwhile.  NULL = caller treats
+ * as cache miss. */
+static void *
+npt_wrapper_cache_try_acquire_locked(void *wrapper)
+{
+   struct npt_com_base *com = wrapper;
+   uint32_t pub = atomic_load(&com->base.pub_ref);
+   while (pub != 0) {
+      if (atomic_compare_exchange_weak(&com->base.pub_ref, &pub, pub + 1))
+         return com;
+   }
+   uint32_t priv = atomic_load(&com->base.priv_ref);
+   do {
+      if (priv == 0 || (priv & NPT_PRIV_REF_DYING))
+         return NULL;
+   } while (!atomic_compare_exchange_weak(&com->base.priv_ref, &priv,
+                                          priv + 1));
+   if (atomic_fetch_add(&com->base.pub_ref, 1) != 0) {
+      /* A concurrent 0->1 AddRef took the self hold, so this private
+       * hold is surplus.  That caller reached the wrapper through a
+       * child's hold on it, which keeps the count above zero here. */
+      atomic_fetch_sub(&com->base.priv_ref, 1);
+   }
+   return com;
+}
+
+void *
+npt_device_wrapper_cache_lookup(struct npt_device *dev, uint64_t host_id)
+{
+   if (!host_id)
+      return NULL;
+
+   struct npt_wrapper_cache *c = &dev->wrapper_cache;
+   const uint32_t h = npt_wrapper_cache_hash(host_id);
+   void *result = NULL;
+
+   /* The pub_ref bump must happen under the mutex; otherwise a
+    * concurrent destroyer could evict and free between unlock and
+    * bump. */
+   mtx_lock(&c->mutex);
+   for (struct npt_wrapper_cache_entry *e = c->buckets[h]; e; e = e->next) {
+      if (e->host_id == host_id) {
+         result = npt_wrapper_cache_try_acquire_locked(e->wrapper);
+         break;
+      }
+   }
+   mtx_unlock(&c->mutex);
+
+   return result;
+}
+
+void *
+npt_device_wrapper_cache_insert_if_absent(struct npt_device *dev,
+                                          uint64_t host_id,
+                                          void *new_wrapper,
+                                          bool *retry_needed)
+{
+   if (retry_needed)
+      *retry_needed = false;
+   if (!host_id || !new_wrapper)
+      return NULL;
+
+   struct npt_wrapper_cache *c = &dev->wrapper_cache;
+   const uint32_t h = npt_wrapper_cache_hash(host_id);
+   void *winner = NULL;
+
+   struct npt_wrapper_cache_entry *fresh = malloc(sizeof(*fresh));
+   if (!fresh) {
+      npt_log("wrapper_cache_insert_if_absent: OOM (host_id=0x%" PRIx64 ")",
+              host_id);
+      return NULL;
+   }
+
+   mtx_lock(&c->mutex);
+   struct npt_wrapper_cache_entry *existing = NULL;
+   for (struct npt_wrapper_cache_entry *e = c->buckets[h]; e; e = e->next) {
+      if (e->host_id == host_id) {
+         existing = e;
+         break;
+      }
+   }
+   bool inserted = false;
+   if (existing) {
+      if (existing->wrapper != new_wrapper) {
+         winner = npt_wrapper_cache_try_acquire_locked(existing->wrapper);
+         /* NULL = mid-destruction: don't overwrite, caller retries. */
+         if (!winner && retry_needed)
+            *retry_needed = true;
+      }
+   } else {
+      fresh->host_id = host_id;
+      fresh->wrapper = new_wrapper;
+      fresh->next = c->buckets[h];
+      c->buckets[h] = fresh;
+      c->count++;
+      inserted = true;
+   }
+   mtx_unlock(&c->mutex);
+
+   if (!inserted)
+      free(fresh);
+   return winner;
+}
+
+void
+npt_device_wrapper_cache_remove(struct npt_device *dev, uint64_t host_id)
+{
+   if (!host_id)
+      return;
+
+   struct npt_wrapper_cache *c = &dev->wrapper_cache;
+   const uint32_t h = npt_wrapper_cache_hash(host_id);
+   struct npt_wrapper_cache_entry *removed = NULL;
+
+   mtx_lock(&c->mutex);
+   for (struct npt_wrapper_cache_entry **link = &c->buckets[h]; *link;
+        link = &(*link)->next) {
+      if ((*link)->host_id == host_id) {
+         removed = *link;
+         *link = removed->next;
+         c->count--;
+         break;
+      }
+   }
+   mtx_unlock(&c->mutex);
+
+   free(removed);
+}
+
+bool
+npt_device_wrapper_cache_is_live(struct npt_device *dev,
+                                 uint64_t host_id, const void *wrapper)
+{
+   if (!dev || !host_id || !wrapper)
+      return false;
+   struct npt_wrapper_cache *c = &dev->wrapper_cache;
+   const uint32_t h = npt_wrapper_cache_hash(host_id);
+   bool live = false;
+   mtx_lock(&c->mutex);
+   for (struct npt_wrapper_cache_entry *e = c->buckets[h]; e; e = e->next) {
+      if (e->host_id == host_id && e->wrapper == wrapper) {
+         live = true;
+         break;
+      }
+   }
+   mtx_unlock(&c->mutex);
+   return live;
+}
+
+void
+npt_device_wrapper_cache_foreach(struct npt_device *dev,
+                                 npt_wrapper_cache_iter_fn cb,
+                                 void *user_data)
+{
+   if (!cb)
+      return;
+
+   struct npt_wrapper_cache *c = &dev->wrapper_cache;
+
+   /* Snapshot so the callback can safely call cache_remove without
+    * invalidating our iterator. */
+   mtx_lock(&c->mutex);
+   const uint32_t cap = c->count;
+   struct {
+      uint64_t host_id;
+      void *wrapper;
+   } *snapshot = cap ? malloc(sizeof(*snapshot) * cap) : NULL;
+   uint32_t n = 0;
+   if (snapshot) {
+      for (uint32_t i = 0; i < NPT_WRAPPER_CACHE_BUCKETS; i++) {
+         for (struct npt_wrapper_cache_entry *e = c->buckets[i];
+              e && n < cap; e = e->next) {
+            snapshot[n].host_id = e->host_id;
+            snapshot[n].wrapper = e->wrapper;
+            n++;
+         }
+      }
+   }
+   mtx_unlock(&c->mutex);
+
+   if (!snapshot)
+      return;
+   for (uint32_t i = 0; i < n; i++)
+      cb(snapshot[i].host_id, snapshot[i].wrapper, user_data);
+   free(snapshot);
+}
+
+void
+npt_device_backbuffer_format_add(struct npt_device *dev, uint64_t host_id,
+                                 DXGI_FORMAT format)
+{
+   if (!dev || !host_id || format == DXGI_FORMAT_UNKNOWN)
+      return;
+   struct npt_bb_format_entry *e = malloc(sizeof(*e));
+   if (!e)
+      return;
+   e->host_id = host_id;
+   e->format = format;
+   mtx_lock(&dev->bb_format_mutex);
+   list_addtail(&e->head, &dev->bb_formats);
+   mtx_unlock(&dev->bb_format_mutex);
+}
+
+DXGI_FORMAT
+npt_device_backbuffer_format(struct npt_device *dev, uint64_t host_id)
+{
+   if (!dev || !host_id)
+      return DXGI_FORMAT_UNKNOWN;
+   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+   mtx_lock(&dev->bb_format_mutex);
+   list_for_each_entry(struct npt_bb_format_entry, e, &dev->bb_formats,
+                       head) {
+      if (e->host_id == host_id) {
+         format = e->format;
+         break;
+      }
+   }
+   mtx_unlock(&dev->bb_format_mutex);
+   return format;
+}
+
+#if !defined(__WINE__)
+static struct npt_device *g_npt_device;
+static mtx_t g_npt_device_mutex;
+static _Atomic int g_npt_device_mutex_inited;
+static uint32_t g_npt_device_use_count;  /* protected by g_npt_device_mutex */
+#endif
+
+/* The host backend's workaround flags, read from the primary ring blob and
+ * cached on the first read that sees NPT_WA_FLAGS_PRESENT.  Every consumer is a
+ * device-level DDI, so it runs after D3D11CreateDevice has blocked for its reply
+ * on the primary ring, and the host writes the word before it creates the ring
+ * thread that serves that reply -- the flags are always present by the first
+ * read that matters, and the zero return is only defence in depth.
+ *
+ * The Wine path passes prebuilt DXBC and never calls this, so it returns 0
+ * there. */
+uint32_t
+npt_host_workaround_flags(void)
+{
+   static atomic_uint cached = 0;
+   uint32_t c = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (c & NPT_WA_FLAGS_PRESENT)
+      return c & ~(uint32_t)NPT_WA_FLAGS_PRESENT;
+#if !defined(__WINE__)
+   struct npt_device *dev = g_npt_device;
+   if (dev && dev->ring && dev->ring->wa_word) {
+      uint32_t w = atomic_load_explicit(dev->ring->wa_word, memory_order_acquire);
+      if (w & NPT_WA_FLAGS_PRESENT) {
+         atomic_store_explicit(&cached, w, memory_order_relaxed);
+         return w & ~(uint32_t)NPT_WA_FLAGS_PRESENT;
+      }
+   }
+#endif
+   return 0;
+}
+
+static void npt_device_destroy(struct npt_device *dev);
+
+struct npt_device *
+npt_device_create(void)
+{
+   struct npt_device *dev = npt_alloc(sizeof(*dev));
+   if (!dev)
+      return NULL;
+
+   /* virtgpu inside a VM, vtest otherwise.  NPT_DEBUG=force_vtest skips
+    * the virtgpu probe so the guest can be tested over a local
+    * virgl_test_server (Neptune capset) Unix socket even when a
+    * /dev/dri/renderDxxx is present. */
+   if (!NPT_DEBUG(FORCE_VTEST))
+      dev->renderer = npt_renderer_create_virtgpu();
+   if (!dev->renderer)
+      dev->renderer = npt_renderer_create_vtest();
+   if (!dev->renderer) {
+      npt_log("failed to create renderer");
+      free(dev);
+      return NULL;
+   }
+
+   atomic_store(&dev->next_ring_id, 1);
+   npt_wrapper_cache_init(&dev->wrapper_cache);
+
+   mtx_init(&dev->tls_rings_mutex, mtx_plain);
+   list_inithead(&dev->tls_rings);
+   npt_tls_once_init();
+
+   mtx_init(&dev->instance_rings_mutex, mtx_plain);
+   list_inithead(&dev->instance_rings);
+   atomic_store_explicit(&dev->dc_sc_ring, (struct npt_ring *)NULL,
+                         memory_order_relaxed);
+   atomic_store_explicit(&dev->dc_sc_ring_refs, 0, memory_order_relaxed);
+   atomic_store_explicit(&dev->pipeline_library_ring, NULL,
+                         memory_order_relaxed);
+
+   /* Cached so per-call sites can branch without re-reading the env. */
+   dev->multi_ring_enabled = NPT_PERF(MULTI_RING);
+
+   struct npt_ring_layout layout;
+   const uint32_t primary_size = dev->multi_ring_enabled
+      ? NPT_RING_BUFFER_SIZE_MULTI
+      : NPT_RING_BUFFER_SIZE_SINGLE;
+   npt_ring_get_layout(primary_size, 0, &layout);
+
+   uint64_t ring_id = atomic_fetch_add(&dev->next_ring_id, 1);
+   dev->ring = npt_ring_create(dev, &layout, ring_id, false /* primary */);
+   if (!dev->ring) {
+      npt_log("failed to create ring");
+      mtx_destroy(&dev->instance_rings_mutex);
+      mtx_destroy(&dev->tls_rings_mutex);
+      npt_wrapper_cache_fini(&dev->wrapper_cache);
+      npt_renderer_destroy(dev->renderer);
+      free(dev);
+      return NULL;
+   }
+   /* One ring for the device: recording threads stage into it
+    * (npt_ring.h, "Per-thread staging"). */
+   dev->ring->staging = !dev->multi_ring_enabled;
+
+   npt_shmem_pool_init(&dev->data_pool, NPT_DATA_SHMEM_MIN_ALLOC);
+   npt_shmem_pool_init(&dev->map_pool,  NPT_MAP_POOL_INITIAL_SIZE);
+
+   /* Feedback pool is brought up on first CreateQuery / CreateFence. */
+   mtx_init(&dev->feedback_pool_init_mutex, mtx_plain);
+   atomic_store_explicit(&dev->feedback_pool_inited, false,
+                         memory_order_relaxed);
+   mtx_init(&dev->feedback_free_mutex, mtx_plain);
+   list_inithead(&dev->feedback_free);
+   dev->feedback_free_count = 0;
+
+   npt_event_init(dev);
+
+   mtx_init(&dev->bb_format_mutex, mtx_plain);
+   list_inithead(&dev->bb_formats);
+
+   npt_log("Neptune device created successfully");
+   return dev;
+}
+
+/* Drain wrappers the app forgot to Release.  An earlier wrapper's
+ * aux_destroy may release sibling wrappers (e.g. swapchain's
+ * buffer_cache holds backbuffer surface wrappers); those siblings can
+ * already be destroyed by the time the foreach snapshot reaches them.
+ * Verify the wrapper is still live in the cache before touching it.
+ * The cache is the canonical liveness tracker -- npt_com_destroy
+ * removes the entry as its first step. */
+static void
+npt_device_destroy_drain_wrapper(uint64_t host_id, void *wrapper,
+                                 void *user_data)
+{
+   struct npt_device *dev = user_data;
+   struct npt_wrapper_cache *c = &dev->wrapper_cache;
+   const uint32_t h = npt_wrapper_cache_hash(host_id);
+
+   mtx_lock(&c->mutex);
+   bool live = false;
+   for (struct npt_wrapper_cache_entry *e = c->buckets[h]; e; e = e->next) {
+      if (e->host_id == host_id && e->wrapper == wrapper) {
+         live = true;
+         break;
+      }
+   }
+   mtx_unlock(&c->mutex);
+
+   if (!live)
+      return;
+
+   struct npt_com_base *com = wrapper;
+   uint32_t pub = atomic_load(&com->base.pub_ref);
+   npt_log("device_destroy: leaked wrapper host_id=0x%" PRIx64
+           " pub_ref=%u -- forcing destroy", host_id, pub);
+   npt_com_force_destroy(com);
+}
+
+bool
+npt_device_is_shutting_down(const struct npt_device *dev)
+{
+   return dev && atomic_load_explicit(
+                    &((struct npt_device *)dev)->shutting_down,
+                    memory_order_acquire);
+}
+
+static void
+npt_device_destroy(struct npt_device *dev)
+{
+   if (!dev)
+      return;
+
+   atomic_store_explicit(&dev->shutting_down, true, memory_order_release);
+
+   /* Order: drain leaked wrappers (needs a live ring for COM_RELEASE)
+    * -> stop event waiter -> data pool -> ring -> cache -> renderer. */
+   npt_device_wrapper_cache_foreach(dev, npt_device_destroy_drain_wrapper,
+                                    dev);
+   npt_event_fini(dev);
+   npt_shmem_pool_fini(dev->renderer, &dev->data_pool);
+   npt_shmem_pool_fini(dev->renderer, &dev->map_pool);
+   list_for_each_entry_safe(struct npt_feedback_free_slot, f,
+                            &dev->feedback_free, head) {
+      npt_renderer_shmem_unref(dev->renderer, f->shmem);
+      free(f);
+   }
+   list_inithead(&dev->feedback_free);
+   mtx_destroy(&dev->feedback_free_mutex);
+   if (atomic_load_explicit(&dev->feedback_pool_inited,
+                            memory_order_acquire)) {
+      npt_shmem_pool_fini(dev->renderer, &dev->feedback_pool);
+   }
+   mtx_destroy(&dev->feedback_pool_init_mutex);
+
+   /* Tear down TLS rings before primary.  Two-stage: this destroys
+    * the ring and clears tr->ring; the tls_ring struct is freed by the
+    * thread's tss dtor. */
+   mtx_lock(&dev->tls_rings_mutex);
+   list_for_each_entry_safe(struct npt_tls_ring, tr, &dev->tls_rings,
+                            dev_head) {
+      /* Reinit so concurrent thread-exit dtors see empty and skip. */
+      list_delinit(&tr->dev_head);
+      mtx_unlock(&dev->tls_rings_mutex);
+      npt_tls_destroy_ring(tr);
+      mtx_lock(&dev->tls_rings_mutex);
+   }
+   mtx_unlock(&dev->tls_rings_mutex);
+
+   struct npt_ring *pipeline_library_ring =
+      atomic_load_explicit(&dev->pipeline_library_ring, memory_order_relaxed);
+   if (pipeline_library_ring) {
+      list_del(&pipeline_library_ring->instance_head);
+      npt_ring_destroy(pipeline_library_ring);
+   }
+   npt_ring_destroy(dev->ring);
+
+   list_for_each_entry_safe(struct npt_bb_format_entry, e,
+                            &dev->bb_formats, head) {
+      list_delinit(&e->head);
+      free(e);
+   }
+   list_inithead(&dev->bb_formats);
+   mtx_destroy(&dev->bb_format_mutex);
+
+   mtx_destroy(&dev->instance_rings_mutex);
+   mtx_destroy(&dev->tls_rings_mutex);
+   npt_wrapper_cache_fini(&dev->wrapper_cache);
+   /* The pools above handed their shmems to the reaper; retire the ones
+    * that name this renderer before it goes away. */
+   npt_renderer_shmem_reaper_drain(dev->renderer);
+   npt_renderer_destroy(dev->renderer);
+   free(dev);
+}
+
+#if defined(__WINE__)
+
+/* Wine PE build: the singleton state lives in the nptunix.so unixlib
+ * (loaded once per Wine process) so d3d11.dll and dxgi.dll share a
+ * single host context.  Without this every PE DLL would open its own
+ * vtest connection, get its own forked virgl_render_server, and any
+ * COM object created via dxgi.dll would be unknown to d3d11.dll's
+ * context when forwarded across (e.g. an IDXGIAdapter handed to
+ * D3D11CreateDevice). */
+
+struct npt_device *
+npt_device_acquire(void)
+{
+   if (npt_unixlib_ensure_init() != 0)
+      return NULL;
+
+   struct npt_unix_singleton_acquire_params ap = { 0 };
+   npt_wine_unix_call(npt_unix_singleton_acquire, &ap);
+
+   if (!ap.won_creation)
+      return (struct npt_device *)ap.device_out;
+
+   /* Elected to create.  Concurrent acquirers sleep until publish. */
+   struct npt_device *dev = npt_device_create();
+
+   struct npt_unix_singleton_publish_params pp = {
+      .device = dev,
+      .success = dev ? 1u : 0u,
+   };
+   npt_wine_unix_call(npt_unix_singleton_publish, &pp);
+
+   return dev;
+}
+
+void
+npt_device_release(void)
+{
+   if (npt_unixlib_ensure_init() != 0)
+      return;
+
+   struct npt_unix_singleton_release_params rp = { 0 };
+   npt_wine_unix_call(npt_unix_singleton_release, &rp);
+
+   /* Destroy outside the unixlib lock: device_destroy walks the cache
+    * and tears down threads. */
+   if (rp.device_out)
+      npt_device_destroy((struct npt_device *)rp.device_out);
+}
+
+#else /* !__WINE__ */
+
+struct npt_device *
+npt_device_acquire(void)
+{
+   NPT_CALL_ONCE(g_npt_device_mutex_inited,
+                 mtx_init(&g_npt_device_mutex, mtx_plain));
+
+   mtx_lock(&g_npt_device_mutex);
+   if (!g_npt_device) {
+      g_npt_device = npt_device_create();
+      if (!g_npt_device) {
+         mtx_unlock(&g_npt_device_mutex);
+         return NULL;
+      }
+   }
+   g_npt_device_use_count++;
+   struct npt_device *dev = g_npt_device;
+   mtx_unlock(&g_npt_device_mutex);
+   return dev;
+}
+
+void
+npt_device_release(void)
+{
+   /* Defensive: release without a matching acquire would be a bug. */
+   if (atomic_load(&g_npt_device_mutex_inited) != 2)
+      return;
+
+   mtx_lock(&g_npt_device_mutex);
+   if (g_npt_device_use_count == 0) {
+      mtx_unlock(&g_npt_device_mutex);
+      return;
+   }
+   struct npt_device *to_destroy = NULL;
+   if (--g_npt_device_use_count == 0) {
+      to_destroy = g_npt_device;
+      g_npt_device = NULL;
+   }
+   mtx_unlock(&g_npt_device_mutex);
+
+   /* Destroy outside the singleton mutex: device_destroy walks the
+    * cache and tears down threads -- holding the mutex would deadlock
+    * a concurrent acquire mid-teardown. */
+   if (to_destroy)
+      npt_device_destroy(to_destroy);
+}
+
+#endif /* __WINE__ */
+
+struct npt_renderer_shmem *
+npt_device_alloc_data(struct npt_device *dev, size_t size, size_t *out_offset)
+{
+   return npt_shmem_pool_alloc(dev->renderer, &dev->data_pool,
+                               size, out_offset);
+}
+
+/* Bounds the shmem refs the free list can pin; past it a released slot is
+ * dropped instead of kept. */
+#define NPT_FEEDBACK_FREE_MAX 4096u
+
+void
+npt_device_free_feedback_slot(struct npt_device *dev,
+                              struct npt_renderer_shmem *shmem,
+                              uint32_t offset, uint32_t slot_size,
+                              uint32_t free_seqno)
+{
+   if (!dev || !shmem)
+      return;
+   slot_size = (slot_size + NPT_FEEDBACK_SLOT_ALIGN - 1u) &
+               ~(NPT_FEEDBACK_SLOT_ALIGN - 1u);
+   struct npt_feedback_free_slot *f = NULL;
+   if (!atomic_load_explicit(&dev->shutting_down, memory_order_acquire))
+      f = malloc(sizeof(*f));
+   if (!f) {
+      npt_renderer_shmem_unref(dev->renderer, shmem);
+      return;
+   }
+   f->shmem = shmem;
+   f->offset = offset;
+   f->slot_size = slot_size;
+   f->free_seqno = free_seqno;
+   mtx_lock(&dev->feedback_free_mutex);
+   if (dev->feedback_free_count >= NPT_FEEDBACK_FREE_MAX) {
+      mtx_unlock(&dev->feedback_free_mutex);
+      npt_renderer_shmem_unref(dev->renderer, shmem);
+      free(f);
+      return;
+   }
+   list_addtail(&f->head, &dev->feedback_free);
+   dev->feedback_free_count++;
+   mtx_unlock(&dev->feedback_free_mutex);
+}
+
+/* Oldest free slot of this size whose unregister the host has run, or
+ * NULL.  Every slot on the list was freed through dev->ring, whose
+ * seqnos only grow, so the oldest entry of a size is the first one that
+ * can be ready. */
+static struct npt_feedback_free_slot *
+npt_device_take_free_feedback_slot(struct npt_device *dev, uint32_t slot_size)
+{
+   struct npt_feedback_free_slot *found = NULL;
+   mtx_lock(&dev->feedback_free_mutex);
+   list_for_each_entry(struct npt_feedback_free_slot, f,
+                       &dev->feedback_free, head) {
+      if (f->slot_size != slot_size)
+         continue;
+      if (npt_ring_seqno_passed(dev->ring, f->free_seqno)) {
+         list_del(&f->head);
+         dev->feedback_free_count--;
+         found = f;
+      }
+      break;
+   }
+   mtx_unlock(&dev->feedback_free_mutex);
+   return found;
+}
+
+struct npt_renderer_shmem *
+npt_device_alloc_feedback_slot(struct npt_device *dev,
+                               uint32_t slot_size,
+                               uint32_t *out_offset)
+{
+   if (!slot_size)
+      return NULL;
+   slot_size = (slot_size + NPT_FEEDBACK_SLOT_ALIGN - 1u) &
+               ~(NPT_FEEDBACK_SLOT_ALIGN - 1u);
+
+   struct npt_feedback_free_slot *reuse =
+      npt_device_take_free_feedback_slot(dev, slot_size);
+   if (reuse) {
+      struct npt_renderer_shmem *shmem = reuse->shmem;
+      const uint32_t off = reuse->offset;
+      free(reuse);
+      /* The host already knows this shmem; zero the slot like a fresh
+       * allocation so no state of the previous query is visible. */
+      memset((uint8_t *)shmem->mmap_ptr + off, 0, slot_size);
+      if (out_offset)
+         *out_offset = off;
+      return shmem;
+   }
+
+   if (!atomic_load_explicit(&dev->feedback_pool_inited,
+                             memory_order_acquire)) {
+      mtx_lock(&dev->feedback_pool_init_mutex);
+      if (!atomic_load_explicit(&dev->feedback_pool_inited,
+                                memory_order_relaxed)) {
+         npt_shmem_pool_init(&dev->feedback_pool,
+                             NPT_FEEDBACK_POOL_INITIAL_SIZE);
+         atomic_store_explicit(&dev->feedback_pool_inited, true,
+                               memory_order_release);
+      }
+      mtx_unlock(&dev->feedback_pool_init_mutex);
+   }
+
+   size_t off = 0;
+   struct npt_renderer_shmem *shmem =
+      npt_shmem_pool_alloc(dev->renderer, &dev->feedback_pool,
+                           slot_size, &off);
+   if (!shmem)
+      return NULL;
+   /* The shmem pool returns whatever bytes were last written; zero
+    * before either side races a read. */
+   void *base = (uint8_t *)shmem->mmap_ptr + off;
+   memset(base, 0, slot_size);
+   if (out_offset)
+      *out_offset = (uint32_t)off;
+   return shmem;
+}
+
+struct npt_ring *
+npt_device_method_ring(struct npt_device *dev)
+{
+   if (!dev)
+      return NULL;
+   struct npt_ring *r =
+      atomic_load_explicit(&dev->dc_sc_ring, memory_order_acquire);
+   return r ? r : dev->ring;
+}
+
+struct npt_ring *
+npt_device_get_pipeline_library_ring(struct npt_device *dev)
+{
+   struct npt_ring *ring =
+      atomic_load_explicit(&dev->pipeline_library_ring, memory_order_acquire);
+   if (!ring) {
+      mtx_lock(&dev->instance_rings_mutex);
+      ring = atomic_load_explicit(&dev->pipeline_library_ring,
+                                  memory_order_relaxed);
+      if (!ring) {
+         struct npt_ring_layout layout;
+         npt_ring_get_layout(NPT_DC_SC_RING_BUFFER_SIZE, sizeof(uint32_t),
+                             &layout);
+         const uint64_t ring_id = atomic_fetch_add(&dev->next_ring_id, 1);
+         ring = npt_ring_create(dev, &layout, ring_id, false);
+         if (ring) {
+            list_addtail(&ring->instance_head, &dev->instance_rings);
+            atomic_store_explicit(&dev->pipeline_library_ring, ring,
+                                  memory_order_release);
+         }
+      }
+      mtx_unlock(&dev->instance_rings_mutex);
+   }
+   if (!ring)
+      return dev->ring;
+
+   npt_ring_stage_flush_all(dev->ring);
+   npt_ring_order_after_ring(ring, dev->ring, npt_ring_seqno_now(dev->ring));
+   return ring;
+}

@@ -1,0 +1,5 @@
+LIBRARY d3d10core.dll
+EXPORTS
+    D3D10CoreCreateDevice   @1
+    D3D10CoreGetVersion     @2
+    D3D10CoreRegisterLayers @3

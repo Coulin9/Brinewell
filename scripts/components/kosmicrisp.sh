@@ -2,36 +2,29 @@
 # Build Mesa's KosmicKrisp Vulkan driver for macOS.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/lib/common.sh"
+source "$ROOT/scripts/lib/mesa-source.sh"
 
 NAME=kosmicrisp
 OUTDIR="$OUT/$NAME"
-read -r TAG URL SHA < <(python3 - "$ROOT/deps.lock.json" <<'LOCK'
-import json, sys
-with open(sys.argv[1]) as f:
-    release = json.load(f)["kosmickrisp"]
-print(release["tag"], release["url"], release["sha256"])
-LOCK
-)
+ensure_mesa_source
 ensure_meson
 ensure_brew ninja cmake pkg-config llvm libclc spirv-llvm-translator spirv-tools spirv-headers
 LLVM_PREFIX="$(brew --prefix llvm)"
 LIBCLC_PREFIX="$(brew --prefix libclc)"
 export PKG_CONFIG_PATH="$LIBCLC_PREFIX/lib/pkgconfig:$LIBCLC_PREFIX/share/pkgconfig:${PKG_CONFIG_PATH:-}"
-INPUT="$(input_digest "$NAME" tag "$TAG" source "$SHA" recipe "$(sha256_file "$0")" \
+INPUT="$(input_digest "$NAME" tag "$MESA_TAG" source "$MESA_SHA256" recipe "$(sha256_file "$0")" \
     meson "$(meson --version)" llvm "$("$LLVM_PREFIX/bin/llvm-config" --version)" target macos-kosmickrisp)"
 if component_should_reuse "$NAME" "$INPUT" "$OUTDIR/libvulkan_kosmickrisp.dylib" "$OUTDIR/libSPIRV-Tools.dylib"; then exit 0; fi
 
-ARCHIVE="$CACHE/$TAG.tar.xz"
-fetch_verified "$URL" "$ARCHIVE" "$SHA"
-rm -rf "$OUTDIR"
-mkdir -p "$OUTDIR/src" "$OUTDIR/toolbin"
+rm -rf "$OUTDIR/build" "$OUTDIR/prefix" "$OUTDIR/toolbin"
+rm -f "$OUTDIR/libvulkan_kosmickrisp.dylib" "$OUTDIR/libSPIRV-Tools.dylib"
+mkdir -p "$OUTDIR/toolbin"
 ln -sf "$LLVM_PREFIX/bin/llvm-config" "$OUTDIR/toolbin/llvm-config"
 export PATH="$OUTDIR/toolbin:$PATH"
-tar -xf "$ARCHIVE" --strip-components=1 -C "$OUTDIR/src"
 export PYTHONDONTWRITEBYTECODE=1
 export MACOSX_DEPLOYMENT_TARGET=26.0
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-meson setup "$OUTDIR/build" "$OUTDIR/src" \
+meson setup "$OUTDIR/build" "$MESA_SRC" \
     --prefix="$OUTDIR/prefix" --libdir=lib --buildtype=release --wrap-mode=nodownload -Db_ndebug=true \
     -Dplatforms=macos -Dvulkan-drivers=kosmickrisp \
     -Dgallium-drivers= -Dopengl=false -Dzstd=disabled -Dxmlconfig=disabled

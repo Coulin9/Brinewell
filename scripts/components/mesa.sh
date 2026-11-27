@@ -1,18 +1,15 @@
 #!/bin/bash
 # Build the minimal aarch64 guest Mesa (zink + virtio Vulkan) for SteamOS.
-#
-# The source is the project's virtio-win-mesa checkout, which tracks upstream
-# Mesa and carries the Neptune guest driver plus this product's backports.  The
-# Neptune driver is built with -Dneptune=true for the Wine payload; the guest
-# layer here runs the venus/zink stack, so it stays off.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/lib/common.sh"
+source "$ROOT/scripts/lib/mesa-source.sh"
 
 NAME=mesa
-SRC="${BRINEWELL_MESA_SRC:-$ROOT/../virtio-win-mesa}"
 OUTDIR="$OUT/$NAME"
-git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1 || die "missing Mesa checkout: ${SRC#"$ROOT/.."}"
-INPUT="$(input_digest "$NAME" source "$(git_state_digest "$SRC")" image "$BUILDER_IMAGE" i386_dockerfile "$(sha256_file "$ROOT/scripts/containers/mesa-i386.Dockerfile")" config zink-virtio-aarch64-wayland-glvnd-i686 xattr_policy stripped-v1 neptune off)"
+ensure_mesa_source
+INPUT="$(input_digest "$NAME" source "$MESA_SHA256" recipe "$(sha256_file "$0")" image "$BUILDER_IMAGE" \
+    guest_dockerfile "$(sha256_file "$ROOT/scripts/containers/guest.Dockerfile")" \
+    i386_dockerfile "$(sha256_file "$ROOT/scripts/containers/mesa-i386.Dockerfile")")"
 if component_should_reuse "$NAME" "$INPUT" "$OUTDIR/root.tar"; then exit 0; fi
 
 require_builder
@@ -21,10 +18,13 @@ ensure_builder_image "$BUILDER_IMAGE_TAG" "$ROOT/scripts/containers/guest.Docker
 I386_BUILDER_IMAGE=brinewell-mesa-i386-builder
 ensure_builder_image "$I386_BUILDER_IMAGE" "$ROOT/scripts/containers/mesa-i386.Dockerfile" "$ROOT/scripts/containers"
 rm -rf "$OUTDIR"
-mkdir -p "$OUTDIR/root" "$OUTDIR/src"
-rsync -a --exclude .git "$SRC/" "$OUTDIR/src/"
+mkdir -p "$OUTDIR/root"
+# Meson downloads wrap dependencies under subprojects. Give the two builds
+# their own writable dependency directory over the read-only Mesa mount.
+cp -R "$MESA_SRC/subprojects" "$OUTDIR/subprojects"
 builder run --rm \
-    -v "$OUTDIR/src:/src:rw" \
+    -e PYTHONDONTWRITEBYTECODE=1 \
+    -v "$MESA_SRC:/src:ro" -v "$OUTDIR/subprojects:/src/subprojects:rw" \
     -v "$OUTDIR/root:/out:rw" \
     "$BUILDER_IMAGE_TAG" \
     bash -lc '
@@ -36,23 +36,11 @@ meson setup /build /src \
     -Dvulkan-drivers=virtio -Dglx=dri -Degl=enabled -Dgbm=enabled -Dglvnd=enabled \
     -Dllvm=disabled -Dzstd=enabled -Dbuild-tests=false \
     -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
-    -Dvideo-codecs= -Dtools= -Dneptune=false
+    -Dvideo-codecs= -Dtools= -Dvulkan-manifest-per-architecture=true
 ninja -C /build -j6
 DESTDIR=/out ninja -C /build install
 '
-if [[ ! -f "$OUTDIR/root/usr/share/vulkan/icd.d/virtio_icd.aarch64.json" ]]; then
-    mkdir -p "$OUTDIR/root/usr/share/vulkan/icd.d"
-    cat > "$OUTDIR/root/usr/share/vulkan/icd.d/virtio_icd.aarch64.json" <<'JSON'
-{
-    "ICD": {
-        "api_version": "1.4.363",
-        "library_arch": "64",
-        "library_path": "/usr/lib/libvulkan_virtio.so"
-    },
-    "file_format_version": "1.0.1"
-}
-JSON
-fi
+[[ -f "$OUTDIR/root/usr/share/vulkan/icd.d/virtio_icd.aarch64.json" ]] || die "missing arm64 Vulkan ICD manifest"
 cat > "$OUTDIR/i686-cross.txt" <<'CROSS'
 [binaries]
 c = 'i686-linux-gnu-gcc'
@@ -74,7 +62,8 @@ c_args = ['-march=i686']
 cpp_args = ['-march=i686']
 CROSS
 builder run --rm \
-    -v "$OUTDIR/src:/src:rw" \
+    -e PYTHONDONTWRITEBYTECODE=1 \
+    -v "$MESA_SRC:/src:ro" -v "$OUTDIR/subprojects:/src/subprojects:rw" \
     -v "$OUTDIR/root:/out:rw" \
     -v "$OUTDIR/i686-cross.txt:/cross.txt:ro" \
     "$I386_BUILDER_IMAGE" bash -lc '
@@ -86,7 +75,7 @@ meson setup /build-i686 /src --cross-file /cross.txt \
     -Ddisplay-info=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
     -Dzlib=enabled -Dzstd=enabled -Dexpat=enabled -Dbuild-tests=false \
     -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled -Dtools= \
-    -Dvideo-codecs= -Dneptune=false -Dvulkan-manifest-per-architecture=true
+    -Dvideo-codecs= -Dvulkan-manifest-per-architecture=true
 ninja -C /build-i686 -j6 src/virtio/vulkan/libvulkan_virtio.so src/virtio/vulkan/virtio_icd.i686.json
 lib=/build-i686/src/virtio/vulkan/libvulkan_virtio.so
 manifest=/build-i686/src/virtio/vulkan/virtio_icd.i686.json

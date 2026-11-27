@@ -1,0 +1,92 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef NPT_OBJECT_H
+#define NPT_OBJECT_H
+
+#include "npt_common.h"
+
+struct npt_device;
+struct npt_com_base;
+struct npt_ring;
+
+/*
+ * Base bookkeeping embedded in every guest COM wrapper (via npt_com_base,
+ * which prepends lpVtbl for COM ABI).  `id` is the guest-minted id the
+ * host registered the object under; the guest sends it as the wire
+ * object_id and the host looks the object up by it.
+ *
+ * Dual refcount: pub_ref is what AddRef/Release expose to the app;
+ * priv_ref is the runtime's internal hold (in-flight RPCs, parent
+ * coupling).  Destruction only happens when both reach zero.  A child
+ * wrapper holds a priv_ref on its parent for the child's entire wrapper
+ * lifetime, including while pub_ref is zero but private holds keep it alive.
+ * The wrapper cache hands such a wrapper out again (pub_ref 0->1) as long
+ * as priv_ref is nonzero and not marked NPT_PRIV_REF_DYING.
+ */
+struct npt_object {
+   uint64_t id;
+   _Atomic uint32_t pub_ref;
+   _Atomic uint32_t priv_ref;
+   struct npt_device *device;
+   struct npt_com_base *parent;
+   /* Non-NULL for single-threaded-per-instance interfaces (DC*, SC*)
+    * to keep host dispatch serial across guest threads; NULL for
+    * thread-safe-by-contract interfaces, which fall through to the
+    * caller's TLS ring. */
+   struct npt_ring *instance_ring;
+   /* Number of npt_device_acquire refs inherited by this wrapper.
+    * Each top-level entry point bumps this on the returned wrapper
+    * (whether freshly created or cache-hit) and npt_com_destroy
+    * issues exactly this many releases. */
+   _Atomic uint32_t device_ref_holds;
+
+   /* Per-object wire ordering across TLS rings.  Interfaces whose calls
+    * are sequential by API contract but may legally migrate threads
+    * BETWEEN calls (D3D12 command lists: single-threaded recording, no
+    * thread affinity) set ring_ordered at wrapper construction.  When a
+    * flagged object's next call lands on a different ring than its
+    * previous one, npt_com_self_ring orders the new ring after the
+    * previous one on the host, so it decodes this object's commands in
+    * call order.  Without this, a recording handoff split a list's
+    * commands across two rings with no ordering, and the host draws the
+    * result out of order. */
+   bool ring_ordered;
+   _Atomic uint64_t order_ring_id;
+   /* Single-ring model: the staging index (npt_ring_stage_self_index)
+    * of the thread that last submitted on this object, so a call from
+    * another thread first publishes what that thread still holds. */
+   _Atomic uint32_t stage_index;
+   /* instance_ring is this object's PRIVATE ring (not the shared DC/SC
+    * ring): npt_com_destroy destroys it instead of unrefing the shared
+    * ring.  Set only by npt_com_pin_queue_ring. */
+   bool private_instance_ring;
+};
+
+/* Added to priv_ref for the duration of npt_com_destroy, so no count it
+ * passes through reads as zero (re-entering destruction) or as a live
+ * wrapper the cache could hand out again. */
+#define NPT_PRIV_REF_DYING 0x80000000u
+
+static inline void
+npt_object_init(struct npt_object *obj, uint64_t host_id,
+                struct npt_device *device)
+{
+   obj->id = host_id;
+   /* Release publishes a fully-initialised refcount to a concurrent
+    * cache-lookup observer; ARM64 needs the explicit barrier. */
+   atomic_store_explicit(&obj->pub_ref, 1, memory_order_release);
+   atomic_store_explicit(&obj->priv_ref, 0, memory_order_relaxed);
+   obj->device = device;
+   obj->parent = NULL;
+   obj->instance_ring = NULL;
+   atomic_store_explicit(&obj->device_ref_holds, 0, memory_order_relaxed);
+   obj->ring_ordered = false;
+   obj->private_instance_ring = false;
+   atomic_store_explicit(&obj->order_ring_id, 0, memory_order_relaxed);
+   atomic_store_explicit(&obj->stage_index, 0, memory_order_relaxed);
+}
+
+#endif /* NPT_OBJECT_H */

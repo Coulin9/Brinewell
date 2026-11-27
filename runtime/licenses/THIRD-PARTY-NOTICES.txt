@@ -24,7 +24,7 @@ busybox-static 1.37.0 - GPL-2.0 - https://busybox.net/
 dosfstools 4.2 - GPL-3.0-or-later - https://github.com/dosfstools/dosfstools
 e2fsprogs 1.47.2 - GPL-2.0 - https://e2fsprogs.sourceforge.net/
 btrfs-progs 6.14 - GPL-2.0 - https://btrfs.readthedocs.io/
-Mesa / virglrenderer / libkrun sources are built from their repositories.
-KosmicKrisp is built from the unmodified official Mesa release pinned in Brinewell's deps.lock.json.
+virglrenderer and libkrun are built from their repositories.
+KosmicKrisp, Venus and Zink are built from the unmodified official Mesa release pinned in Brinewell's deps.lock.json.
   Source archives: https://archive.mesa3d.org/
-  SPIRV-Tools is bundled with it.
+  SPIRV-Tools is bundled with KosmicKrisp.

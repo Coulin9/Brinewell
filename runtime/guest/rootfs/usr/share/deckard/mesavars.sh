@@ -2,10 +2,9 @@
 # Derived from Valve Corporation's deckard-steamvr-session (MIT)
 # brinewell: replaces the Frame's /usr/share/deckard/mesavars.sh
 # (EnvironmentFile of gamescope-session.service and steam.service).
-# The VM has no Adreno: Vulkan is Mesa Venus (libvulkan_virtio.so, added by the
-# brinewell layer from guest/mesa) over virtio-gpu to the host's MoltenVK, and GL
-# is zink on top of that Vulkan device (guest/mesa's patched build, over the
-# stock GL files). Values from guest/mesa.
+# The Brinewell layer provides Venus (libvulkan_virtio.so) and Zink from the
+# official Mesa release. Venus forwards Vulkan commands over virtio-gpu to
+# KosmicKrisp in the macOS VM host. Zink implements GL on that Vulkan device.
 #
 # Dropped from stock: VRCOMPOSITOR_TU_DEBUG (Turnip-only, for the SteamVR
 # compositor, which is masked in the VM). No VK_ICD_FILENAMES/VK_DRIVER_FILES:
