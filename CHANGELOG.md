@@ -1,5 +1,28 @@
 # 更新日志
 
+## 0.3.0
+
+### 新功能
+
+- **DLSS 转 MetalFX 超分辨率**：默认启用 D3D12 和 D3D11 NGX 支持，NGX 核心经过签名。
+- **原生 HDR / EDR 输出**：支持 10 位 PQ/HLG 扫描输出、HDR EDID、Gamescope 与 Venus WSI HDR，
+  并实时同步 Mac 显示器峰值亮度。
+- **自动选择图形后端**：默认按游戏选择，使用随附的离线 Steam 图形索引并在需要时回退到探测；
+  为《荒野大镖客：救赎 2》默认启用 DX12 配置，在 Venus 下跳过《毁灭战士：永恒》启动器。
+- **两步引导**：自动设置 Apple D3DMetal；设置中可管理来宾 SSH 和 sudo 密码。
+- **共享文件夹与 Steam 存储集成**：缩短挂载路径，将 shadercache 绑定到本地 ext4，并加速、并行化
+  virtio-fs I/O。
+- **进程内虚拟机冷重启**：重启时保留窗口和磁盘锁；来宾虚拟手柄按需创建。
+
+### 图形与兼容性
+
+- 默认启用 32 位 x86 Venus ICD 和 FEX GL thunk；Neptune 载荷包含 `d3d10core.dll`；
+  Proton 11 和 Proton Experimental 重定向到 x86-64 版本。
+- KosmicKrisp、Venus 和 Zink 统一使用官方 Mesa 26.3.1 源码，Neptune 源码由 Brinewell 管理；
+  KosmicKrisp 支持非实体多边形模式、几何着色器和静态 wideLines driconf，Venus 在 macOS
+  虚拟机进程中原生渲染。
+- 最低系统要求更新为 macOS 26.0。
+
 ## 0.2.0
 
 ### 新名称与图标
